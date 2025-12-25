@@ -267,7 +267,9 @@ class LiveRunner:
         atr_ts_mult = float(getattr(config, "ATR_TS_MULT", 4.0))
 
         # Текущий сигнал стратегии (по полной истории df_mtf)
+        logger.debug("[RUNNER] calling strategy for %s, len(df_mtf)=%d", symbol, len(df_mtf))
         signal = signal_from_indicators(df_mtf)
+        logger.debug("[RUNNER] strategy returned signal=%r for %s", signal, symbol)
 
         # --- оценка текущей equity и обновление пика ---
         equity = 0.0

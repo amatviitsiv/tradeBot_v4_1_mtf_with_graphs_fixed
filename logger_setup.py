@@ -6,7 +6,7 @@ from logging.handlers import RotatingFileHandler
 def setup_logging(
     log_dir: str = "logs",
     log_file: str = "live.log",
-    level: int = logging.INFO,
+    level: int = logging.DEBUG,
 ) -> None:
     """Global logging initialization for the whole project.
 
