@@ -213,11 +213,11 @@ class LiveRunner:
 
             if df_1h_ind.index.has_duplicates:
                 logger.warning("[MTF] duplicate HTF index detected, cleaning (symbol=%s)", symbol)
-                df_1h_ind = df_1h_ind[~df_1h_ind.index.duplicated(keep="last")]
+                df_1h_ind = df_1h_ind[~df_1h_ind.index.duplicated(keep="last")].sort_index()
 
             if df_15_idx.index.has_duplicates:
                 logger.warning("[MTF] duplicate LTF index detected, cleaning (symbol=%s)", symbol)
-                df_15_idx = df_15_idx[~df_15_idx.index.duplicated(keep="last")]
+                df_15_idx = df_15_idx[~df_15_idx.index.duplicated(keep="last")].sort_index()
 
             df_1h_sync = df_1h_ind.reindex(df_15_idx.index, method="pad")
 
