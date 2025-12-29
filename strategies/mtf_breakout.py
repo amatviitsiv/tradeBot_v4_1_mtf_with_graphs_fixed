@@ -140,16 +140,40 @@ class MTFBreakoutStrategy(BaseStrategy):
             try:
                 close_series = df["close"].astype(float)
                 last_price = float(close_series.iloc[-1])
-                prev_price = float(close_series.iloc[-drift_lookback-1])
+                prev_price = float(close_series.iloc[-drift_lookback - 1])
                 if last_price > 0 and prev_price > 0:
                     drift = abs(last_price - prev_price) / last_price
             except Exception:
                 drift = 0.0
 
-        if drift < drift_min_pct:
+        # Адаптивный порог дрейфа: в хорошем тренде можно слегка ослабить фильтр,
+        # чтобы не выкидывать "почти достаточные" движения.
+        drift_min_eff = drift_min_pct
+        if bool(getattr(cfg, "MTF_DRIFT_ADAPTIVE_ENABLED", True)):
+            try:
+                # сильный тренд: ADX заметно выше минимума и ATR не в "супер-тихом" режиме
+                adx_min = float(getattr(cfg, "BREAKOUT_ADX_MIN", 18.0))
+                loosen_factor = float(getattr(cfg, "MTF_DRIFT_MIN_LOOSEN_FACTOR", 0.7))
+                strong_trend_adx_margin = float(getattr(cfg, "MTF_STRONG_TREND_ADX_MARGIN", 5.0))
+                # Используем уже посчитанный atr_pct_h и пороги ANTI_CHOP / HTF_VOLATILE_ATR_PCT,
+                # чтобы не раздувать сделки в экстремальном флэте.
+                min_atr_pct = float(getattr(cfg, "ANTI_CHOP_MIN_ATR_PCT", 0.0005))
+                htf_volatile_atr = float(getattr(cfg, "HTF_VOLATILE_ATR_PCT", 0.008))
+                strong_trend = (
+                        adx_h >= adx_min + strong_trend_adx_margin
+                        and atr_pct_h >= min_atr_pct * 1.5
+                        and atr_pct_h <= htf_volatile_atr
+                )
+                if strong_trend:
+                    drift_min_eff = drift_min_pct * loosen_factor
+            except Exception:
+                drift_min_eff = drift_min_pct
+
+        if drift < drift_min_eff:
             logger.debug(
-                "[MTF] skip low drift regime: drift=%.5f < drift_min=%.5f",
+                "[MTF] skip low drift regime: drift=%.5f < drift_min_eff=%.5f (base=%.5f)",
                 drift,
+                drift_min_eff,
                 drift_min_pct,
             )
             return None
