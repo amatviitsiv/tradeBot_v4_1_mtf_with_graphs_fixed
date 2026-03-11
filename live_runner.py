@@ -470,12 +470,15 @@ class LiveRunner:
                 return
 
             order_side = "BUY" if side == "long" else "SELL"
-            await self._broker.create_market_order(
+            res = await self._broker.create_market_order(
                 symbol=symbol,
                 side=order_side,
                 qty=qty,
                 reduce_only=False,
             )
+            used_qty = float(res.get("_used_qty", qty))
+            qty = used_qty
+            notional = float(qty) * float(price)
         except Exception as e:
             logger.exception("[RUNNER] failed to open %s position for %s: %s", side, symbol, e)
             try:
@@ -561,12 +564,14 @@ class LiveRunner:
         order_side = "SELL" if pos.side == "long" else "BUY"
         qty = pos.qty
         try:
-            await self._broker.create_market_order(
+            res = await self._broker.create_market_order(
                 symbol=symbol,
                 side=order_side,
                 qty=qty,
                 reduce_only=True,
             )
+            used_qty = float(res.get("_used_qty", qty))
+            qty = used_qty
         except Exception as e:
             logger.exception("[RUNNER] failed to close position for %s (%s): %s", symbol, reason, e)
             try:
@@ -646,20 +651,66 @@ class LiveRunner:
 
         order_side = "SELL" if pos.side == "long" else "BUY"
         try:
-            await self._broker.create_market_order(
+            res = await self._broker.create_market_order(
                 symbol=symbol,
                 side=order_side,
                 qty=qty_close,
                 reduce_only=True,
             )
+            used_qty = float(res.get("_used_qty", qty_close))
+            qty_close = used_qty
         except Exception as e:
             logger.exception("[RUNNER] failed to close fraction for %s (%s): %s", symbol, reason, e)
             return
 
+        # Рассчитываем реализованный PnL по частично закрытой части и пишем в state
+        try:
+            entry = float(pos.entry_price)
+            exit_price = float(price)
+            qty_val = float(qty_close)
+            side = pos.side
+            sign = 1.0 if side == "long" else -1.0
+            pnl = (exit_price - entry) * qty_val * sign
+            roe_pct = None
+            notional = float(getattr(pos, "notional", 0.0) or 0.0)
+            if notional > 0:
+                roe_pct = pnl / notional * 100.0
+
+            try:
+                self.state.add_realized_pnl(pnl)
+            except Exception:
+                logger.exception("[RUNNER] failed to update realized pnl for %s (partial)", symbol)
+
+            try:
+                self.notifier.notify_partial_close_position(
+                    symbol=symbol,
+                    side=side,
+                    qty=qty_val,
+                    entry_price=entry,
+                    exit_price=exit_price,
+                    pnl=pnl,
+                    roe_pct=roe_pct,
+                    remaining_qty=max(0.0, float(pos.qty - qty_close)),
+                    reason=reason,
+                )
+            except Exception:
+                logger.exception("[RUNNER] failed to send partial close notification for %s", symbol)
+        except Exception:
+            logger.exception("[RUNNER] failed to compute partial PnL for %s", symbol)
+
         # обновляем локальное состояние позиции
         pos.qty -= qty_close
         if pos.qty < 0:
-            pos.qty = 0
+            pos.qty = 0.0
+
+        # нормализуем оставшееся количество по шагу биржи, чтобы не оставалось "пыли"
+        try:
+            pos.qty = float(self._broker._adjust_qty(symbol, float(pos.qty)))  # noqa: SLF001
+        except Exception:
+            pass
+        if pos.qty <= 0:
+            pos.qty = 0.0
+
         pos.notional = pos.entry_price * pos.qty
         self._update_position_state(symbol, pos)
 

@@ -11,6 +11,7 @@
 import asyncio
 import logging
 import random
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Optional
 
 from binance import AsyncClient  # type: ignore
@@ -126,16 +127,52 @@ class LiveFuturesBroker:
 
     # ====== вспомогательные методы ======
 
+    def _step_precision(self, step: float) -> int:
+        """Количество знаков после запятой, которое допускает stepSize."""
+        try:
+            d = Decimal(str(step))
+        except Exception:
+            return 8
+        exp = d.as_tuple().exponent
+        return int(abs(exp)) if exp < 0 else 0
+
     def _adjust_qty(self, symbol: str, qty: float) -> float:
-        """Привести количество к шагу биржи (LOT_SIZE.stepSize), округляя вниз."""
+        """Привести количество к шагу биржи (LOT_SIZE.stepSize), округляя вниз.
+
+        Важно: делаем это через Decimal, чтобы не получить хвосты float вроде 0.0012000000000000001,
+        которые Binance иногда отклоняет как "слишком много знаков после запятой".
+        """
         info = self._symbols_info.get(symbol)
         if not info:
-            return qty
-        step = info.get("step_size") or 0.0
+            return float(qty)
+        step = float(info.get("step_size") or 0.0)
         if step <= 0:
-            return qty
-        steps = int(qty / step)
-        return steps * step
+            return float(qty)
+
+        q = Decimal(str(qty))
+        s = Decimal(str(step))
+        if q <= 0 or s <= 0:
+            return 0.0
+
+        steps = (q / s).to_integral_value(rounding=ROUND_DOWN)
+        adj = steps * s
+
+        # нормализуем до точности шага
+        prec = self._step_precision(step)
+        if prec > 0:
+            adj = adj.quantize(Decimal("1e-%d" % prec), rounding=ROUND_DOWN)
+        else:
+            adj = adj.quantize(Decimal("1"), rounding=ROUND_DOWN)
+
+        return float(adj)
+
+    def _format_qty(self, symbol: str, qty: float) -> str:
+        """Строковое представление qty строго в допустимой точности stepSize."""
+        info = self._symbols_info.get(symbol) or {}
+        step = float(info.get("step_size") or 0.0)
+        prec = self._step_precision(step) if step > 0 else 8
+        fmt = f"{{:.{prec}f}}"
+        return fmt.format(float(qty))
 
     # ====== баланс и позиции ======
 
@@ -225,7 +262,8 @@ class LiveFuturesBroker:
             "symbol": symbol,
             "side": side.upper(),
             "type": "MARKET",
-            "quantity": adj_qty,
+            "quantity": self._format_qty(symbol, adj_qty),
+            "_used_qty": adj_qty,
         }
         if reduce_only:
             params["reduceOnly"] = True

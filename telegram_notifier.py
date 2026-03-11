@@ -153,6 +153,41 @@ class TelegramNotifier:
         msg = "\n".join(msg_lines)
         self._send_raw(msg)
 
+
+    def notify_partial_close_position(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        entry_price: float,
+        exit_price: float,
+        pnl: float,
+        roe_pct: Optional[float] = None,
+        remaining_qty: Optional[float] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Уведомление о частичном закрытии позиции (например, TP1)."""
+        side_up = side.upper()
+        pnl_str = f"{pnl:.4f}"
+        sign = "+" if pnl >= 0 else ""
+        msg_lines = [
+            "*POSITION PARTIALLY CLOSED*",
+            f"Symbol: `{symbol}`",
+            f"Side: *{side_up}*",
+            f"Qty closed: `{qty}`",
+            f"Entry: `{entry_price}`",
+            f"Exit: `{exit_price}`",
+            f"PnL: `{sign}{pnl_str}`",
+        ]
+        if roe_pct is not None:
+            msg_lines.append(f"ROE: `{roe_pct:+.2f}%`")
+        if remaining_qty is not None:
+            msg_lines.append(f"Remaining qty: `{remaining_qty}`")
+        if reason:
+            msg_lines.append(f"Reason: `{reason}`")
+        msg = "\n".join(msg_lines)
+        self._send_raw(msg)
+
     def notify_order_error(self, symbol: str, side: str, qty: float, error: str) -> None:
         """Уведомление об ошибке при создании ордера."""
         side_up = side.upper()
