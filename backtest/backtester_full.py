@@ -112,7 +112,6 @@ class Backtester:
         leverage = int(getattr(cfg, "FUTURES_LEVERAGE_DEFAULT", 5))
         max_positions = int(getattr(cfg, "MAX_OPEN_POSITIONS", 3))
 
-        atr_sl_mult = float(getattr(cfg, "ATR_SL_MULT", 4.0))
         cooldown_enabled = bool(getattr(cfg, "ENTRY_COOLDOWN_AFTER_STOP_ENABLED", True))
         cooldown_bars_base = int(getattr(cfg, "ENTRY_COOLDOWN_AFTER_STOP_BARS", 0) or 0)
         cooldown_streak_threshold = int(getattr(cfg, "ENTRY_COOLDOWN_STREAK_THRESHOLD", 2) or 0)
@@ -288,6 +287,7 @@ class Backtester:
                     continue
 
                 side = "long" if signal == "buy" else "short"
+                atr_sl_mult = float(cfg.get_symbol_param(sym, "ATR_SL_MULT", getattr(cfg, "ATR_SL_MULT", 4.0)))
 
                 btc_regime_cap = int(getattr(cfg, "BTC_REGIME_MAX_SAME_SIDE_ALT_POSITIONS", 0) or 0)
                 alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
@@ -318,7 +318,7 @@ class Backtester:
                     stop_loss = price - atr_sl_mult * atr
                 else:
                     stop_loss = price + atr_sl_mult * atr
-                tp1 = calc_tp1_price(price, atr, side)
+                tp1 = calc_tp1_price(price, atr, side, sym)
 
                 positions[sym] = Position(
                     symbol=sym,

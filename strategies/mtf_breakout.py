@@ -224,8 +224,9 @@ class MTFBreakoutStrategy(BaseStrategy):
             return False, {"reason": "bad_atr", "atr_ltf": atr_ltf}
 
         vol_ema_span = int(getattr(cfg, "BREAKOUT_VOLUME_EMA_SPAN", 20))
-        min_vs_ema = float(getattr(cfg, "BREAKOUT_VOLUME_MIN_RATIO_TO_EMA", 1.10))
-        min_vs_median = float(getattr(cfg, "BREAKOUT_VOLUME_MIN_RATIO_TO_MEDIAN", 1.20))
+        symbol = self._extract_symbol(recent) or self._extract_symbol(pd.DataFrame([candle]))
+        min_vs_ema = cfg.get_symbol_param_float(symbol, "BREAKOUT_VOLUME_MIN_RATIO_TO_EMA", float(getattr(cfg, "BREAKOUT_VOLUME_MIN_RATIO_TO_EMA", 1.10)))
+        min_vs_median = cfg.get_symbol_param_float(symbol, "BREAKOUT_VOLUME_MIN_RATIO_TO_MEDIAN", float(getattr(cfg, "BREAKOUT_VOLUME_MIN_RATIO_TO_MEDIAN", 1.20)))
         min_impulse_score = float(getattr(cfg, "BREAKOUT_MIN_VOLUME_IMPULSE_SCORE", 0.55))
         strong_impulse_score = float(getattr(cfg, "BREAKOUT_STRONG_VOLUME_IMPULSE_SCORE", 0.95))
 
@@ -523,7 +524,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         # ======================================================
         # Динамический lookback на LTF в зависимости от HTF-волатильности.
         # Базовое значение берём из конфигурации, но сужаем/расширяем при высокой/низкой волатильности.
-        base_lookback = int(getattr(cfg, "MTF_LTF_LOOKBACK", getattr(cfg, "BREAKOUT_LOOKBACK", 20)))
+        base_lookback = cfg.get_symbol_param_int(symbol, "MTF_LTF_LOOKBACK", int(getattr(cfg, "MTF_LTF_LOOKBACK", getattr(cfg, "BREAKOUT_LOOKBACK", 20))))
         low_vol_pct = float(getattr(cfg, "MTF_ATR_LOW_VOL_PCT", 0.003))
         high_vol_pct = float(getattr(cfg, "MTF_ATR_HIGH_VOL_PCT", 0.015))
         lb_min = int(getattr(cfg, "MTF_LOOKBACK_MIN", 40))
@@ -554,7 +555,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         range_low = float(recent["low"].min())
 
         # Буфер по цене: BREAKOUT_BUFFER_PCT трактуем как долю (0.001 = 0.1%)
-        buf = float(getattr(cfg, "BREAKOUT_BUFFER_PCT", 0.001))
+        buf = cfg.get_symbol_param_float(symbol, "BREAKOUT_BUFFER_PCT", float(getattr(cfg, "BREAKOUT_BUFFER_PCT", 0.001)))
         long_trigger = range_high * (1.0 + buf)
         short_trigger = range_low * (1.0 - buf)
 
@@ -617,10 +618,10 @@ class MTFBreakoutStrategy(BaseStrategy):
         ):
             return None
 
-        rsi_long_min = float(getattr(cfg, "MTF_RSI_LONG_MIN", 50.0))
-        rsi_long_max = float(getattr(cfg, "MTF_RSI_LONG_MAX", 85.0))
-        rsi_short_min = float(getattr(cfg, "MTF_RSI_SHORT_MIN", 15.0))
-        rsi_short_max = float(getattr(cfg, "MTF_RSI_SHORT_MAX", 55.0))
+        rsi_long_min = cfg.get_symbol_param_float(symbol, "MTF_RSI_LONG_MIN", float(getattr(cfg, "MTF_RSI_LONG_MIN", 50.0)))
+        rsi_long_max = cfg.get_symbol_param_float(symbol, "MTF_RSI_LONG_MAX", float(getattr(cfg, "MTF_RSI_LONG_MAX", 85.0)))
+        rsi_short_min = cfg.get_symbol_param_float(symbol, "MTF_RSI_SHORT_MIN", float(getattr(cfg, "MTF_RSI_SHORT_MIN", 15.0)))
+        rsi_short_max = cfg.get_symbol_param_float(symbol, "MTF_RSI_SHORT_MAX", float(getattr(cfg, "MTF_RSI_SHORT_MAX", 55.0)))
 
         # Адаптивные RSI-диапазоны в зависимости от силы тренда (дрейфа).
         rsi_long_tighten = float(getattr(cfg, "MTF_RSI_LONG_TIGHTEN", 5.0))

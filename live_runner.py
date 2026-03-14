@@ -314,7 +314,7 @@ class LiveRunner:
         # --- базовые параметры из конфига ---
         risk_per_trade = float(getattr(config, "RISK_PER_TRADE", 0.01))
         leverage = int(getattr(config, "FUTURES_LEVERAGE_DEFAULT", 5))
-        atr_sl_mult = float(getattr(config, "ATR_SL_MULT", 4.0))
+        atr_sl_mult = float(config.get_symbol_param(symbol, "ATR_SL_MULT", getattr(config, "ATR_SL_MULT", 4.0)))
 
         # Текущий сигнал стратегии (по полной истории df_mtf)
         logger.debug("[RUNNER] calling strategy for %s, len(df_mtf)=%d", symbol, len(df_mtf))
@@ -551,7 +551,7 @@ class LiveRunner:
             stop_loss = price - atr_sl_mult * atr
         else:
             stop_loss = price + atr_sl_mult * atr
-        tp1 = calc_tp1_price(price, atr, side)
+        tp1 = calc_tp1_price(price, atr, side, symbol)
 
         pos = PositionState(
             symbol=symbol,

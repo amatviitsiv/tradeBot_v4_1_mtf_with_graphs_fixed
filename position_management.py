@@ -1,9 +1,9 @@
 import config as cfg
 
 
-def _cfg_float(name: str, default: float) -> float:
+def _cfg_float(name: str, default: float, symbol: str = "") -> float:
     try:
-        return float(getattr(cfg, name, default))
+        return float(cfg.get_symbol_param(symbol, name, getattr(cfg, name, default)))
     except Exception:
         return float(default)
 
@@ -15,8 +15,8 @@ def _cfg_int(name: str, default: int) -> int:
         return int(default)
 
 
-def calc_tp1_price(entry_price: float, atr: float, side: str) -> float:
-    tp1_mult = _cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0))
+def calc_tp1_price(entry_price: float, atr: float, side: str, symbol: str = "") -> float:
+    tp1_mult = _cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0, symbol), symbol)
     if side == "long":
         return entry_price + tp1_mult * atr
     return entry_price - tp1_mult * atr
@@ -36,10 +36,11 @@ def update_peak_price(pos, price: float) -> None:
 def maybe_move_to_break_even(pos, price: float, atr: float) -> bool:
     if atr <= 0:
         return False
-    trigger_atr = _cfg_float("POSITION_BE_TRIGGER_ATR", 0.0)
+    symbol = getattr(pos, "symbol", "")
+    trigger_atr = _cfg_float("POSITION_BE_TRIGGER_ATR", 0.0, symbol)
     if trigger_atr <= 0:
         return False
-    be_offset_atr = _cfg_float("POSITION_BE_OFFSET_ATR", 0.0)
+    be_offset_atr = _cfg_float("POSITION_BE_OFFSET_ATR", 0.0, symbol)
     moved = getattr(pos, "be_moved", False)
     if pos.side == "long":
         move_atr = (price - pos.entry_price) / atr
@@ -73,7 +74,8 @@ def should_take_tp1(pos, price: float) -> bool:
 def on_tp1_hit(pos, price: float, atr: float) -> None:
     if atr <= 0:
         atr = 0.0
-    be_offset_atr = _cfg_float("POSITION_BE_OFFSET_ATR", 0.0)
+    symbol = getattr(pos, "symbol", "")
+    be_offset_atr = _cfg_float("POSITION_BE_OFFSET_ATR", 0.0, symbol)
     if pos.side == "long":
         be_stop = pos.entry_price + be_offset_atr * atr
         if pos.stop_loss is None or be_stop > pos.stop_loss:
@@ -92,7 +94,8 @@ def on_tp1_hit(pos, price: float, atr: float) -> None:
 def maybe_activate_trailing(pos, price: float, atr: float) -> bool:
     if atr <= 0:
         return False
-    activation_atr = _cfg_float("POSITION_TRAILING_ACTIVATION_ATR", _cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0)))
+    symbol = getattr(pos, "symbol", "")
+    activation_atr = _cfg_float("POSITION_TRAILING_ACTIVATION_ATR", _cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0, symbol), symbol), symbol)
     if activation_atr <= 0:
         return False
     if getattr(pos, "trail_active", False):
@@ -113,7 +116,8 @@ def update_trailing_stop(pos, atr: float) -> bool:
     peak = getattr(pos, "peak_price", None)
     if peak is None:
         return False
-    trail_mult = _cfg_float("POSITION_TRAILING_ATR_MULT", _cfg_float("ATR_TS_MULT", 4.0))
+    symbol = getattr(pos, "symbol", "")
+    trail_mult = _cfg_float("POSITION_TRAILING_ATR_MULT", _cfg_float("ATR_TS_MULT", 4.0, symbol), symbol)
     trail_step_atr = _cfg_float("POSITION_TRAILING_STEP_ATR", 0.0)
     if pos.side == "long":
         candidate = float(peak) - trail_mult * atr

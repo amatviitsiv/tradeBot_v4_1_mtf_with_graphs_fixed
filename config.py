@@ -240,6 +240,104 @@ HTF_VOLATILE_ADX_MAX=22
 HTF_DRIFT_LOOKBACK_BARS = 16
 
 
+# ===== Symbol-specific params (Step 8) =====
+# Ключевые параметры стратегии можно переопределять по каждому символу,
+# чтобы не использовать один и тот же профиль для BTC и более волатильных альтов.
+SYMBOL_PARAM_OVERRIDES = {
+    "BTCUSDT": {
+        "BREAKOUT_BUFFER_PCT": 0.0008,
+        "MTF_LTF_LOOKBACK": 72,
+        "BREAKOUT_VOLUME_MIN_RATIO_TO_EMA": 1.05,
+        "BREAKOUT_VOLUME_MIN_RATIO_TO_MEDIAN": 1.10,
+        "MTF_RSI_LONG_MIN": 52.0,
+        "MTF_RSI_LONG_MAX": 82.0,
+        "MTF_RSI_SHORT_MIN": 18.0,
+        "MTF_RSI_SHORT_MAX": 52.0,
+        "ATR_SL_MULT": 5.5,
+        "POSITION_TP1_ATR_MULT": 7.5,
+        "POSITION_TRAILING_ATR_MULT": 4.8,
+    },
+    "ETHUSDT": {
+        "BREAKOUT_BUFFER_PCT": 0.0010,
+        "MTF_LTF_LOOKBACK": 64,
+        "BREAKOUT_VOLUME_MIN_RATIO_TO_EMA": 1.08,
+        "BREAKOUT_VOLUME_MIN_RATIO_TO_MEDIAN": 1.15,
+        "MTF_RSI_LONG_MIN": 51.0,
+        "MTF_RSI_LONG_MAX": 84.0,
+        "MTF_RSI_SHORT_MIN": 16.0,
+        "MTF_RSI_SHORT_MAX": 54.0,
+        "ATR_SL_MULT": 5.2,
+        "POSITION_TP1_ATR_MULT": 7.2,
+        "POSITION_TRAILING_ATR_MULT": 4.6,
+    },
+    "SOLUSDT": {
+        "BREAKOUT_BUFFER_PCT": 0.0013,
+        "MTF_LTF_LOOKBACK": 56,
+        "BREAKOUT_VOLUME_MIN_RATIO_TO_EMA": 1.15,
+        "BREAKOUT_VOLUME_MIN_RATIO_TO_MEDIAN": 1.25,
+        "MTF_RSI_LONG_MIN": 54.0,
+        "MTF_RSI_LONG_MAX": 86.0,
+        "MTF_RSI_SHORT_MIN": 14.0,
+        "MTF_RSI_SHORT_MAX": 53.0,
+        "ATR_SL_MULT": 5.0,
+        "POSITION_TP1_ATR_MULT": 6.8,
+        "POSITION_TRAILING_ATR_MULT": 4.3,
+    },
+    "BNBUSDT": {
+        "BREAKOUT_BUFFER_PCT": 0.0011,
+        "MTF_LTF_LOOKBACK": 62,
+        "BREAKOUT_VOLUME_MIN_RATIO_TO_EMA": 1.10,
+        "BREAKOUT_VOLUME_MIN_RATIO_TO_MEDIAN": 1.18,
+        "MTF_RSI_LONG_MIN": 52.0,
+        "MTF_RSI_LONG_MAX": 84.0,
+        "MTF_RSI_SHORT_MIN": 16.0,
+        "MTF_RSI_SHORT_MAX": 54.0,
+        "ATR_SL_MULT": 5.1,
+        "POSITION_TP1_ATR_MULT": 7.0,
+        "POSITION_TRAILING_ATR_MULT": 4.5,
+    },
+    "AVAXUSDT": {
+        "BREAKOUT_BUFFER_PCT": 0.0015,
+        "MTF_LTF_LOOKBACK": 52,
+        "BREAKOUT_VOLUME_MIN_RATIO_TO_EMA": 1.18,
+        "BREAKOUT_VOLUME_MIN_RATIO_TO_MEDIAN": 1.28,
+        "MTF_RSI_LONG_MIN": 55.0,
+        "MTF_RSI_LONG_MAX": 87.0,
+        "MTF_RSI_SHORT_MIN": 13.0,
+        "MTF_RSI_SHORT_MAX": 52.0,
+        "ATR_SL_MULT": 4.8,
+        "POSITION_TP1_ATR_MULT": 6.5,
+        "POSITION_TRAILING_ATR_MULT": 4.1,
+    },
+}
+
+
+def get_symbol_param(symbol: str, param_name: str, default=None):
+    """Возвращает параметр с учётом overrides по символу."""
+    try:
+        symbol = str(symbol or "").upper()
+        overrides = globals().get("SYMBOL_PARAM_OVERRIDES", {}) or {}
+        if symbol and symbol in overrides and param_name in overrides[symbol]:
+            return overrides[symbol][param_name]
+    except Exception:
+        pass
+    return globals().get(param_name, default)
+
+
+def get_symbol_param_float(symbol: str, param_name: str, default: float) -> float:
+    try:
+        return float(get_symbol_param(symbol, param_name, default))
+    except Exception:
+        return float(default)
+
+
+def get_symbol_param_int(symbol: str, param_name: str, default: int) -> int:
+    try:
+        return int(get_symbol_param(symbol, param_name, default))
+    except Exception:
+        return int(default)
+
+
 # ===== Фильтр “живого” HTF-тренда =====
 # Даже если EMA формально выстроены, не входим, если старший тренд уже выдыхается:
 # проверяем наклон EMA50/EMA200 и достаточную дистанцию между EMA20 и EMA50.
