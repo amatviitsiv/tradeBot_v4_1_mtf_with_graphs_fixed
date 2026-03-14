@@ -24,7 +24,7 @@ EQUITY_NOTIFY_INTERVAL = 600
 API_KEY = "cOzVm76AAqWwFe6vvHcoZ2wB1mNhJg01DJ9GpA5ZXq12nBpGmsJdwMoXTyRVA9Hw"
 API_SECRET = "O4o0oORj7wloy6DfeuWbcOVUy9SfV8z94gSyBQF63kHyQkPPJDXlZqYmuKwmKcfX"
 
-FUTURES_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
+FUTURES_SYMBOLS = ["BTCUSDT"]#["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
 # ===== СПИСОК ПАР ДЛЯ ТОРГОВЛИ =====
 
 # config.py (важные куски)
@@ -351,8 +351,8 @@ HTF_EMA20_EMA50_MIN_DIST_PCT = 0.0010    # минимальная дистанц
 # Не входим, если цена уже слишком далеко убежала от HTF EMA20/EMA50.
 # Дистанция измеряется в ATR(H1), чтобы фильтр был адаптивным к волатильности.
 HTF_OVEREXTENSION_FILTER_ENABLED = True
-HTF_MAX_DIST_FROM_EMA20_ATR = 1.6      # максимум, насколько цена может отстоять от HTF EMA20
-HTF_MAX_DIST_FROM_EMA50_ATR = 2.4      # максимум, насколько цена может отстоять от HTF EMA50
+HTF_MAX_DIST_FROM_EMA20_ATR = 2.5      # максимум, насколько цена может отстоять от HTF EMA20
+HTF_MAX_DIST_FROM_EMA50_ATR = 3.5      # максимум, насколько цена может отстоять от HTF EMA50
 
 
 # ===== Cooldown после стопа / серии неудачных входов =====
@@ -372,7 +372,7 @@ ENTRY_COOLDOWN_BAR_SECONDS = 15 * 60             # M15 = 900 секунд
 # Для альтов торгуем только в сторону старшего режима BTC.
 # LONG по альтам разрешаем только если BTC HTF bullish,
 # SHORT — только если BTC HTF bearish.
-BTC_REGIME_FILTER_ENABLED = True
+BTC_REGIME_FILTER_ENABLED = False
 BTC_REGIME_FILTER_SYMBOL = "BTCUSDT"
 BTC_REGIME_ALT_SYMBOLS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
 
