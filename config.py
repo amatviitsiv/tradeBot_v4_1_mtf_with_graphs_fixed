@@ -380,6 +380,18 @@ BTC_REGIME_ALT_SYMBOLS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
 # 0 = без ограничения.
 BTC_REGIME_MAX_SAME_SIDE_ALT_POSITIONS = 2
 
+
+# ===== Session / time filter =====
+# Не торгуем в наименее ликвидные часы.
+# Окна задаются в UTC в формате [(start_hour, end_hour), ...], где start включительно, end не включительно.
+# Пример: (6, 23) => можно торговать с 06:00:00 до 22:59:59 UTC.
+SESSION_TIME_FILTER_ENABLED = True
+SESSION_TIME_FILTER_TIMEZONE = "UTC"
+SESSION_ALLOWED_WINDOWS = [
+    (6, 23),
+]
+
+
 # ===== Ограничение торговли при глубокой просадке (DD cooldown) =====
 # Если текущая просадка от пика эквити превышает DD_COOLDOWN_PCT,
 # стратегия перестаёт открывать новые позиции на ближайшие DD_COOLDOWN_BARS баров.
