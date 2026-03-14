@@ -32,6 +32,17 @@ from strategy import signal_from_indicators
 from risk import RiskManager
 from position import PositionState
 from indicators import compute_indicators  # type: ignore
+from position_management import (
+    calc_tp1_price,
+    maybe_move_to_break_even,
+    maybe_activate_trailing,
+    on_tp1_hit,
+    should_take_tp1,
+    should_close_on_trailing,
+    tp1_fraction,
+    update_peak_price,
+    update_trailing_stop,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -304,8 +315,6 @@ class LiveRunner:
         risk_per_trade = float(getattr(config, "RISK_PER_TRADE", 0.01))
         leverage = int(getattr(config, "FUTURES_LEVERAGE_DEFAULT", 5))
         atr_sl_mult = float(getattr(config, "ATR_SL_MULT", 4.0))
-        atr_tp_mult_1 = float(getattr(config, "ATR_TP_MULT_1", 8.0))
-        atr_ts_mult = float(getattr(config, "ATR_TS_MULT", 4.0))
 
         # Текущий сигнал стратегии (по полной истории df_mtf)
         logger.debug("[RUNNER] calling strategy for %s, len(df_mtf)=%d", symbol, len(df_mtf))
@@ -375,42 +384,23 @@ class LiveRunner:
             if closed:
                 return
 
-            # Первая цель по прибыли (частичный выход + перевод в безубыток + включение трейлинга)
-            if pos.tp1 is not None and pos.qty > 0:
-                if pos.side == "long" and price >= pos.tp1:
-                    await self._close_fraction_live(symbol, pos, price, fraction=0.5, reason="tp1")
-                    pos.stop_loss = pos.entry_price
-                    new_ts = price - atr_ts_mult * atr
-                    if pos.trailing_stop is None or new_ts > pos.trailing_stop:
-                        pos.trailing_stop = new_ts
-                    pos.tp1 = None
-                    self._update_position_state(symbol, pos)
-                elif pos.side == "short" and price <= pos.tp1:
-                    await self._close_fraction_live(symbol, pos, price, fraction=0.5, reason="tp1")
-                    pos.stop_loss = pos.entry_price
-                    new_ts = price + atr_ts_mult * atr
-                    if pos.trailing_stop is None or new_ts < pos.trailing_stop:
-                        pos.trailing_stop = new_ts
-                    pos.tp1 = None
-                    self._update_position_state(symbol, pos)
+            update_peak_price(pos, price)
+            maybe_move_to_break_even(pos, price, atr)
 
-            # Трейлинговый стоп
-            if pos.trailing_stop is not None and pos.qty > 0:
-                if pos.side == "long":
-                    new_ts = price - atr_ts_mult * atr
-                    if new_ts > pos.trailing_stop:
-                        pos.trailing_stop = new_ts
-                    if price <= pos.trailing_stop:
-                        await self._close_position_live(symbol, pos, price, reason="trailing_stop")
-                        return
-                else:
-                    new_ts = price + atr_ts_mult * atr
-                    if new_ts < pos.trailing_stop:
-                        pos.trailing_stop = new_ts
-                    if price >= pos.trailing_stop:
-                        await self._close_position_live(symbol, pos, price, reason="trailing_stop")
-                        return
+            # Первая цель по прибыли: фиксируем меньшую часть раньше и оставляем хвост под тренд
+            if pos.tp1 is not None and pos.qty > 0 and should_take_tp1(pos, price):
+                await self._close_fraction_live(symbol, pos, price, fraction=tp1_fraction(), reason="tp1")
+                on_tp1_hit(pos, price, atr)
+                update_trailing_stop(pos, atr)
                 self._update_position_state(symbol, pos)
+
+            # Менее шумный трейлинг: ведём его от лучшей достигнутой цены
+            maybe_activate_trailing(pos, price, atr)
+            update_trailing_stop(pos, atr)
+            if pos.trailing_stop is not None and pos.qty > 0 and should_close_on_trailing(pos, price):
+                await self._close_position_live(symbol, pos, price, reason="trailing_stop")
+                return
+            self._update_position_state(symbol, pos)
 
             # Ограничение максимального времени жизни позиции (тайм-стоп)
             mtf_max_bars = int(getattr(config, "MTF_MAX_BARS_IN_POSITION", 0) or 0)
@@ -559,10 +549,9 @@ class LiveRunner:
 
         if side == "long":
             stop_loss = price - atr_sl_mult * atr
-            tp1 = price + atr_tp_mult_1 * atr
         else:
             stop_loss = price + atr_sl_mult * atr
-            tp1 = price - atr_tp_mult_1 * atr
+        tp1 = calc_tp1_price(price, atr, side)
 
         pos = PositionState(
             symbol=symbol,
@@ -577,6 +566,9 @@ class LiveRunner:
             tp2=None,
             peak_price=price,
             trailing_stop=None,
+            be_moved=False,
+            tp1_hit=False,
+            trail_active=False,
             pyramid_level=0,
         )
         self._positions[symbol] = pos

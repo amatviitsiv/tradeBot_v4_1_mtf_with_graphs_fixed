@@ -325,3 +325,18 @@ STRATEGY_DEBUG = _os.getenv('STRATEGY_DEBUG', '1') == '1'
 PRELOAD_HISTORY = _os.getenv('PRELOAD_HISTORY', '1') == '1'
 PRELOAD_15M_LIMIT = int(_os.getenv('PRELOAD_15M_LIMIT', '500'))
 PRELOAD_1H_LIMIT  = int(_os.getenv('PRELOAD_1H_LIMIT', '200'))
+
+
+# ===== Step 6. Улучшенное сопровождение позиции =====
+# Цель: стабильнее забирать импульс и меньше отдавать накопленную прибыль назад.
+# 1) TP1 делаем ближе, чтобы чаще фиксировать часть импульса;
+# 2) перевод в BE включаем раньше и с небольшим запасом на комиссии;
+# 3) трейлинг ведём от лучшей достигнутой цены, а не от каждого нового close.
+POSITION_MANAGEMENT_V2_ENABLED = True
+POSITION_TP1_ATR_MULT = 7.0
+POSITION_TP1_CLOSE_FRACTION = 0.40
+POSITION_BE_TRIGGER_ATR = 3.0
+POSITION_BE_OFFSET_ATR = 0.10
+POSITION_TRAILING_ACTIVATION_ATR = 7.0
+POSITION_TRAILING_ATR_MULT = 4.5
+POSITION_TRAILING_STEP_ATR = 0.25

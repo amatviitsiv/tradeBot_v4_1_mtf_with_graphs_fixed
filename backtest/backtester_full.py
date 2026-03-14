@@ -7,6 +7,17 @@ from indicators import compute_indicators
 from strategy import signal_from_indicators
 from risk import RiskManager
 from position import PositionState as Position
+from position_management import (
+    calc_tp1_price,
+    maybe_move_to_break_even,
+    maybe_activate_trailing,
+    on_tp1_hit,
+    should_take_tp1,
+    should_close_on_trailing,
+    tp1_fraction,
+    update_peak_price,
+    update_trailing_stop,
+)
 
 
 class Backtester:
@@ -102,8 +113,6 @@ class Backtester:
         max_positions = int(getattr(cfg, "MAX_OPEN_POSITIONS", 3))
 
         atr_sl_mult = float(getattr(cfg, "ATR_SL_MULT", 4.0))
-        atr_tp_mult_1 = float(getattr(cfg, "ATR_TP_MULT_1", 8.0))
-        atr_ts_mult = float(getattr(cfg, "ATR_TS_MULT", 4.0))
         cooldown_enabled = bool(getattr(cfg, "ENTRY_COOLDOWN_AFTER_STOP_ENABLED", True))
         cooldown_bars_base = int(getattr(cfg, "ENTRY_COOLDOWN_AFTER_STOP_BARS", 0) or 0)
         cooldown_streak_threshold = int(getattr(cfg, "ENTRY_COOLDOWN_STREAK_THRESHOLD", 2) or 0)
@@ -189,43 +198,23 @@ class Backtester:
                         positions[sym] = None
                         continue
 
-                # 2) Первая цель по прибыли (частичный выход + перевод в безубыток + включение трейлинга)
-                if pos.tp1 is not None:
-                    if pos.side == "long" and price >= pos.tp1:
-                        balance = self._close_fraction(balance, sym, pos, price, fraction=0.5)
-                        pos.stop_loss = pos.entry_price
-                        new_ts = price - atr_ts_mult * atr
-                        if pos.trailing_stop is None or new_ts > pos.trailing_stop:
-                            pos.trailing_stop = new_ts
-                        pos.tp1 = None
-                    elif pos.side == "short" and price <= pos.tp1:
-                        balance = self._close_fraction(balance, sym, pos, price, fraction=0.5)
-                        pos.stop_loss = pos.entry_price
-                        new_ts = price + atr_ts_mult * atr
-                        if pos.trailing_stop is None or new_ts < pos.trailing_stop:
-                            pos.trailing_stop = new_ts
-                        pos.tp1 = None
+                update_peak_price(pos, price)
+                maybe_move_to_break_even(pos, price, atr)
 
-                # 3) Трейлинг
-                if pos.trailing_stop is not None:
-                    if pos.side == "long":
-                        new_ts = price - atr_ts_mult * atr
-                        if new_ts > pos.trailing_stop:
-                            pos.trailing_stop = new_ts
-                        if price <= pos.trailing_stop:
-                            balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True)
-                            reset_stop_streak(sym, pos.side)
-                            positions[sym] = None
-                            continue
-                    else:  # short
-                        new_ts = price + atr_ts_mult * atr
-                        if new_ts < pos.trailing_stop:
-                            pos.trailing_stop = new_ts
-                        if price >= pos.trailing_stop:
-                            balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True)
-                            reset_stop_streak(sym, pos.side)
-                            positions[sym] = None
-                            continue
+                # 2) Первая цель по прибыли: частично фиксируем импульс раньше
+                if pos.tp1 is not None and should_take_tp1(pos, price):
+                    balance = self._close_fraction(balance, sym, pos, price, fraction=tp1_fraction())
+                    on_tp1_hit(pos, price, atr)
+                    update_trailing_stop(pos, atr)
+
+                # 3) Менее шумный трейлинг от лучшей достигнутой цены
+                maybe_activate_trailing(pos, price, atr)
+                update_trailing_stop(pos, atr)
+                if pos.trailing_stop is not None and should_close_on_trailing(pos, price):
+                    balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True)
+                    reset_stop_streak(sym, pos.side)
+                    positions[sym] = None
+                    continue
 
 
                 # 3.5) Ограничение максимального времени жизни позиции (тайм-стоп)
@@ -327,10 +316,9 @@ class Backtester:
 
                 if side == "long":
                     stop_loss = price - atr_sl_mult * atr
-                    tp1 = price + atr_tp_mult_1 * atr
                 else:
                     stop_loss = price + atr_sl_mult * atr
-                    tp1 = price - atr_tp_mult_1 * atr
+                tp1 = calc_tp1_price(price, atr, side)
 
                 positions[sym] = Position(
                     symbol=sym,
@@ -345,6 +333,9 @@ class Backtester:
                     tp2=None,
                     peak_price=price,
                     trailing_stop=None,
+                    be_moved=False,
+                    tp1_hit=False,
+                    trail_active=False,
                     pyramid_level=0,
                 )
                 open_count += 1
