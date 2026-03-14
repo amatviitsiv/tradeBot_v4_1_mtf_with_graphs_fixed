@@ -232,6 +232,13 @@ HTF_EMA50_MIN_SLOPE_PCT = 0.0008         # минимальный наклон E
 HTF_EMA200_MIN_SLOPE_PCT = 0.00025       # минимальный наклон EMA200 относительно текущего значения (0.025%)
 HTF_EMA20_EMA50_MIN_DIST_PCT = 0.0010    # минимальная дистанция между EMA20 и EMA50 (0.10% от цены)
 
+# ===== Фильтр перегретого движения на HTF =====
+# Не входим, если цена уже слишком далеко убежала от HTF EMA20/EMA50.
+# Дистанция измеряется в ATR(H1), чтобы фильтр был адаптивным к волатильности.
+HTF_OVEREXTENSION_FILTER_ENABLED = True
+HTF_MAX_DIST_FROM_EMA20_ATR = 1.6      # максимум, насколько цена может отстоять от HTF EMA20
+HTF_MAX_DIST_FROM_EMA50_ATR = 2.4      # максимум, насколько цена может отстоять от HTF EMA50
+
 # ===== Ограничение торговли при глубокой просадке (DD cooldown) =====
 # Если текущая просадка от пика эквити превышает DD_COOLDOWN_PCT,
 # стратегия перестаёт открывать новые позиции на ближайшие DD_COOLDOWN_BARS баров.
@@ -256,7 +263,7 @@ BINANCE_API_SECRET = _os.getenv("BINANCE_API_SECRET", "O4o0oORj7wloy6DfeuWbcOVUy
 STATE_FILE = _os.getenv("BOT_STATE_FILE", "bot_state.json")
 
 # Версия стратегии/конфига — можно использовать в логах и state
-STRATEGY_VERSION = _os.getenv("STRATEGY_VERSION", "mtf_breakout_breakout_quality_step1")
+STRATEGY_VERSION = _os.getenv("STRATEGY_VERSION", "mtf_breakout_step3_overextension")
 
 # ===== Telegram-уведомления =====
 # Если TELEGRAM_ENABLED=1 и заданы токен и chat_id, бот будет слать уведомления.

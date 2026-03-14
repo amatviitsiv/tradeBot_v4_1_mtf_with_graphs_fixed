@@ -157,6 +157,48 @@ class MTFBreakoutStrategy(BaseStrategy):
         except Exception as exc:
             return False, {"reason": "htf_vitality_exception", "error": str(exc)}
 
+
+    def _check_htf_overextension(self, close: float, ema20_h: float, ema50_h: float, atr_h: float, regime: str) -> tuple[bool, dict]:
+        """Фильтр перегретого движения на HTF.
+
+        Не входим, если цена уже слишком далеко ушла от HTF EMA20/EMA50 в ATR(H1):
+        - для bull запрещаем запоздалые покупки слишком высоко над EMA;
+        - для bear запрещаем запоздалые продажи слишком низко под EMA.
+        """
+        try:
+            if close <= 0.0 or atr_h <= 0.0:
+                return False, {"reason": "bad_close_or_atr", "close": close, "atr_h": atr_h}
+
+            max_dist_ema20_atr = float(getattr(cfg, "HTF_MAX_DIST_FROM_EMA20_ATR", 1.6))
+            max_dist_ema50_atr = float(getattr(cfg, "HTF_MAX_DIST_FROM_EMA50_ATR", 2.4))
+
+            if regime == "bull":
+                dist20_atr = (close - ema20_h) / atr_h
+                dist50_atr = (close - ema50_h) / atr_h
+            elif regime == "bear":
+                dist20_atr = (ema20_h - close) / atr_h
+                dist50_atr = (ema50_h - close) / atr_h
+            else:
+                return False, {"reason": "unknown_regime", "regime": regime}
+
+            if dist20_atr > max_dist_ema20_atr:
+                return False, {
+                    "reason": "too_far_from_htf_ema20",
+                    "dist20_atr": dist20_atr,
+                    "max": max_dist_ema20_atr,
+                }
+
+            if dist50_atr > max_dist_ema50_atr:
+                return False, {
+                    "reason": "too_far_from_htf_ema50",
+                    "dist50_atr": dist50_atr,
+                    "max": max_dist_ema50_atr,
+                }
+
+            return True, {"dist20_atr": dist20_atr, "dist50_atr": dist50_atr}
+        except Exception as exc:
+            return False, {"reason": "htf_overextension_exception", "error": str(exc)}
+
     def signal(self, df: pd.DataFrame) -> Optional[str]:
         if df is None or len(df) < 100:
             return None
@@ -231,6 +273,18 @@ class MTFBreakoutStrategy(BaseStrategy):
         # Фильтр слишком тихого рынка по HTF ATR
         if close <= 0 or atr_h <= 0:
             return None
+
+        htf_overextension_enabled = bool(getattr(cfg, "HTF_OVEREXTENSION_FILTER_ENABLED", True))
+        if htf_overextension_enabled:
+            overext_ok, overext_meta = self._check_htf_overextension(
+                close=close, ema20_h=ema20_h, ema50_h=ema50_h, atr_h=atr_h, regime=regime
+            )
+            if not overext_ok:
+                logger.debug("[MTF] skip overheated HTF move: %s", overext_meta)
+                return None
+        else:
+            overext_meta = {}
+
         atr_pct_h = atr_h / close
         min_atr_pct = float(getattr(cfg, "ANTI_CHOP_MIN_ATR_PCT", 0.0005))
         if atr_pct_h < min_atr_pct:
@@ -451,7 +505,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 quality_meta = {}
 
             logger.debug(
-                "[MTF] BUY: close=%.2f rh=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f htf_s50=%.5f htf_s200=%.5f htf_d20_50=%.5f body=%.5f uw=%.5f lw=%.5f",
+                "[MTF] BUY: close=%.2f rh=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f htf_s50=%.5f htf_s200=%.5f htf_d20_50=%.5f htf_d20_atr=%.3f htf_d50_atr=%.3f body=%.5f uw=%.5f lw=%.5f",
                 close,
                 range_high,
                 volume,
@@ -462,6 +516,8 @@ class MTFBreakoutStrategy(BaseStrategy):
                 float(vitality_meta.get("slope50", 0.0)),
                 float(vitality_meta.get("slope200", 0.0)),
                 float(vitality_meta.get("dist20_50_pct", 0.0)),
+                float(overext_meta.get("dist20_atr", 0.0)),
+                float(overext_meta.get("dist50_atr", 0.0)),
                 float(quality_meta.get("body", 0.0)),
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),
@@ -479,7 +535,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 quality_meta = {}
 
             logger.debug(
-                "[MTF] SELL: close=%.2f rl=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f htf_s50=%.5f htf_s200=%.5f htf_d20_50=%.5f body=%.5f uw=%.5f lw=%.5f",
+                "[MTF] SELL: close=%.2f rl=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f htf_s50=%.5f htf_s200=%.5f htf_d20_50=%.5f htf_d20_atr=%.3f htf_d50_atr=%.3f body=%.5f uw=%.5f lw=%.5f",
                 close,
                 range_low,
                 volume,
@@ -490,6 +546,8 @@ class MTFBreakoutStrategy(BaseStrategy):
                 float(vitality_meta.get("slope50", 0.0)),
                 float(vitality_meta.get("slope200", 0.0)),
                 float(vitality_meta.get("dist20_50_pct", 0.0)),
+                float(overext_meta.get("dist20_atr", 0.0)),
+                float(overext_meta.get("dist50_atr", 0.0)),
                 float(quality_meta.get("body", 0.0)),
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),
