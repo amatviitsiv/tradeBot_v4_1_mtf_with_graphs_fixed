@@ -239,6 +239,18 @@ HTF_OVEREXTENSION_FILTER_ENABLED = True
 HTF_MAX_DIST_FROM_EMA20_ATR = 1.6      # максимум, насколько цена может отстоять от HTF EMA20
 HTF_MAX_DIST_FROM_EMA50_ATR = 2.4      # максимум, насколько цена может отстоять от HTF EMA50
 
+
+# ===== Cooldown после стопа / серии неудачных входов =====
+# Защита от пилы: после убыточного stop-loss по конкретному symbol + direction
+# не разрешаем сразу переоткрывать ту же идею. При серии одинаковых стопов
+# можно дополнительно увеличить паузу.
+ENTRY_COOLDOWN_AFTER_STOP_ENABLED = True
+ENTRY_COOLDOWN_AFTER_STOP_BARS = 8               # базовая пауза после убыточного стопа
+ENTRY_COOLDOWN_STREAK_THRESHOLD = 2              # с какого подряд стопа считать серию
+ENTRY_COOLDOWN_STREAK_EXTRA_BARS = 8             # доп. пауза поверх базовой при серии стопов
+ENTRY_COOLDOWN_RESET_ON_NON_LOSS_EXIT = True     # сбрасывать серию после неубыточного/прибыльного выхода
+ENTRY_COOLDOWN_BAR_SECONDS = 15 * 60             # M15 = 900 секунд
+
 # ===== Ограничение торговли при глубокой просадке (DD cooldown) =====
 # Если текущая просадка от пика эквити превышает DD_COOLDOWN_PCT,
 # стратегия перестаёт открывать новые позиции на ближайшие DD_COOLDOWN_BARS баров.

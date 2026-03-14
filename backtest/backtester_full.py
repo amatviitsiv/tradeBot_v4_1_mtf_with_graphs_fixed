@@ -57,6 +57,8 @@ class Backtester:
         warmup = min(200, max_len - 1)
 
         positions: Dict[str, Optional[Position]] = {s: None for s in symbols}
+        cooldown_until_bar: Dict[str, Dict[str, int]] = {s: {"long": -1, "short": -1} for s in symbols}
+        stop_loss_streaks: Dict[str, Dict[str, int]] = {s: {"long": 0, "short": 0} for s in symbols}
         balance = self.initial_balance
         equity_curve = []
 
@@ -67,6 +69,31 @@ class Backtester:
         atr_sl_mult = float(getattr(cfg, "ATR_SL_MULT", 4.0))
         atr_tp_mult_1 = float(getattr(cfg, "ATR_TP_MULT_1", 8.0))
         atr_ts_mult = float(getattr(cfg, "ATR_TS_MULT", 4.0))
+        cooldown_enabled = bool(getattr(cfg, "ENTRY_COOLDOWN_AFTER_STOP_ENABLED", True))
+        cooldown_bars_base = int(getattr(cfg, "ENTRY_COOLDOWN_AFTER_STOP_BARS", 0) or 0)
+        cooldown_streak_threshold = int(getattr(cfg, "ENTRY_COOLDOWN_STREAK_THRESHOLD", 2) or 0)
+        cooldown_extra_bars = int(getattr(cfg, "ENTRY_COOLDOWN_STREAK_EXTRA_BARS", 0) or 0)
+        cooldown_reset_on_non_loss = bool(getattr(cfg, "ENTRY_COOLDOWN_RESET_ON_NON_LOSS_EXIT", True))
+
+
+        def register_stop_loss(sym: str, side: str, bar_index: int, pnl_after_fee: float) -> None:
+            if not cooldown_enabled:
+                return
+            if pnl_after_fee > 0:
+                if cooldown_reset_on_non_loss:
+                    stop_loss_streaks[sym][side] = 0
+                    cooldown_until_bar[sym][side] = -1
+                return
+            stop_loss_streaks[sym][side] += 1
+            bars = cooldown_bars_base
+            if cooldown_streak_threshold > 0 and stop_loss_streaks[sym][side] >= cooldown_streak_threshold:
+                bars += cooldown_extra_bars
+            cooldown_until_bar[sym][side] = bar_index + bars
+
+        def reset_stop_streak(sym: str, side: str) -> None:
+            if cooldown_reset_on_non_loss:
+                stop_loss_streaks[sym][side] = 0
+                cooldown_until_bar[sym][side] = -1
 
         # основной цикл по времени
         for i in range(warmup, max_len):
@@ -117,11 +144,13 @@ class Backtester:
                 # 1) Жёсткий SL
                 if pos.stop_loss is not None:
                     if pos.side == "long" and price <= pos.stop_loss:
-                        balance = self._close_position(balance, sym, pos, price)
+                        balance, pnl_after_fee = self._close_position(balance, sym, pos, price, return_pnl=True)
+                        register_stop_loss(sym, pos.side, i, pnl_after_fee)
                         positions[sym] = None
                         continue
                     if pos.side == "short" and price >= pos.stop_loss:
-                        balance = self._close_position(balance, sym, pos, price)
+                        balance, pnl_after_fee = self._close_position(balance, sym, pos, price, return_pnl=True)
+                        register_stop_loss(sym, pos.side, i, pnl_after_fee)
                         positions[sym] = None
                         continue
 
@@ -149,7 +178,8 @@ class Backtester:
                         if new_ts > pos.trailing_stop:
                             pos.trailing_stop = new_ts
                         if price <= pos.trailing_stop:
-                            balance = self._close_position(balance, sym, pos, price)
+                            balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True)
+                            reset_stop_streak(sym, pos.side)
                             positions[sym] = None
                             continue
                     else:  # short
@@ -157,7 +187,8 @@ class Backtester:
                         if new_ts < pos.trailing_stop:
                             pos.trailing_stop = new_ts
                         if price >= pos.trailing_stop:
-                            balance = self._close_position(balance, sym, pos, price)
+                            balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True)
+                            reset_stop_streak(sym, pos.side)
                             positions[sym] = None
                             continue
 
@@ -173,18 +204,19 @@ class Backtester:
                     except Exception:
                         age_bars = 0
                     if age_bars >= mtf_max_bars:
-                        balance = self._close_position(balance, sym, pos, price)
+                        balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True)
+                        reset_stop_streak(sym, pos.side)
                         positions[sym] = None
                         continue
 
                 # 4) Обратный сигнал стратегии полностью закрывает позицию
                 sig = signal_from_indicators(df_slice)
                 if pos.side == "long" and sig == "sell":
-                    balance = self._close_position(balance, sym, pos, price)
+                    balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True)
                     positions[sym] = None
                     continue
                 if pos.side == "short" and sig == "buy":
-                    balance = self._close_position(balance, sym, pos, price)
+                    balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True)
                     positions[sym] = None
                     continue
 
@@ -233,6 +265,9 @@ class Backtester:
 
                 side = "long" if signal == "buy" else "short"
 
+                if cooldown_enabled and i < int(cooldown_until_bar[sym].get(side, -1)):
+                    continue
+
                 # расстояние до стопа в процентах
                 stop_distance_pct = atr_sl_mult * atr / price * 100.0
                 if stop_distance_pct <= 0:
@@ -271,7 +306,7 @@ class Backtester:
                     pyramid_level=0,
                 )
                 open_count += 1
-                can_open_more = open_count < max_positions
+                can_open_more = open_count < eff_max_positions
 
         # Закрываем всё по последней цене
         last_prices: Dict[str, float] = {}
@@ -286,7 +321,7 @@ class Backtester:
             price = last_prices.get(sym)
             if price is None:
                 continue
-            balance = self._close_position(balance, sym, pos, price)
+            balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True)
 
         total_pnl = balance - self.initial_balance
         roi = total_pnl / self.initial_balance * 100.0 if self.initial_balance > 0 else 0.0
@@ -332,10 +367,10 @@ class Backtester:
         return new_balance
 
     # ------------------------------------------------------------------
-    def _close_position(self, balance: float, sym: str, pos: Position, price: float) -> float:
+    def _close_position(self, balance: float, sym: str, pos: Position, price: float, return_pnl: bool = False):
         """Полное закрытие позиции и возврат обновлённого баланса с учётом комиссии."""
         if pos.qty <= 0:
-            return balance
+            return (balance, 0.0) if return_pnl else balance
 
         if pos.side == "long":
             pnl = (price - pos.entry_price) * pos.qty
@@ -346,7 +381,8 @@ class Backtester:
         notional_exit = price * pos.qty
         fee = (notional_entry + notional_exit) * self.fee_rate
         pnl_after_fee = pnl - fee
-        return balance + pnl_after_fee
+        new_balance = balance + pnl_after_fee
+        return (new_balance, pnl_after_fee) if return_pnl else new_balance
 
     # ------------------------------------------------------------------
     def _max_drawdown(self, equity: np.ndarray) -> float:

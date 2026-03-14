@@ -64,6 +64,10 @@ class LiveRunner:
         self._last_kline_ts: Dict[str, float] = {}
         # лимит сделок в час (0 = без лимита)
         self._max_trades_per_hour: int = int(getattr(config, "MAX_TRADES_PER_HOUR", 0) or 0)
+        # cooldown после убыточных stop-loss по symbol + direction
+        self._entry_cooldowns: Dict[str, Dict[str, float]] = {}
+        self._stop_loss_streaks: Dict[str, Dict[str, int]] = {}
+        self._latest_bar_open_time_ms: Dict[str, float] = {}
     async def _init_broker(self) -> None:
         """Инициализация брокера и проверка API ключей."""
         api_key = getattr(config, "BINANCE_API_KEY", "") or getattr(config, "API_KEY", "")
@@ -249,6 +253,10 @@ class LiveRunner:
 
         i = len(df_mtf) - 1
         row = df_mtf.iloc[-1]
+        try:
+            self._latest_bar_open_time_ms[symbol] = float(row.get("open_time", 0.0) or 0.0)
+        except Exception:
+            self._latest_bar_open_time_ms[symbol] = 0.0
 
         try:
             price = float(row["close"])
@@ -398,6 +406,22 @@ class LiveRunner:
         if signal not in {"buy", "sell"}:
             return
 
+        side = "long" if signal == "buy" else "short"
+
+        # cooldown после stop-loss по тому же symbol + direction
+        if bool(getattr(config, "ENTRY_COOLDOWN_AFTER_STOP_ENABLED", True)):
+            now_ts = max(time.time(), float(self._latest_bar_open_time_ms.get(symbol, 0.0) or 0.0) / 1000.0)
+            cooldown_until = self._get_entry_cooldown_ts(symbol, side)
+            if cooldown_until > now_ts:
+                remain_sec = cooldown_until - now_ts
+                logger.info(
+                    "[RUNNER] cooldown active for %s %s: %.0fs remaining, skip entry",
+                    symbol,
+                    side,
+                    remain_sec,
+                )
+                return
+
         # если risk guard отключил торговлю — новые позиции не открываем
         if self._trading_disabled:
             logger.info("[RUNNER] trading disabled by risk guard, skip opening %s", symbol)
@@ -463,7 +487,6 @@ class LiveRunner:
             logger.info("[RUNNER] position size too small for %s (equity=%.2f, price=%.2f, atr=%.5f)", symbol, equity, price, atr)
             return
 
-        side = "long" if signal == "buy" else "short"
         try:
             if self._broker is None:
                 logger.error("[RUNNER] broker is not initialized, cannot open position for %s", symbol)
@@ -543,6 +566,61 @@ class LiveRunner:
             logger.exception("[RUNNER] failed to register trade timestamp for %s", symbol)
 
 
+
+    def _get_entry_cooldown_ts(self, symbol: str, side: str) -> float:
+        return float((self._entry_cooldowns.get(symbol) or {}).get(side, 0.0) or 0.0)
+
+    def _get_stop_streak(self, symbol: str, side: str) -> int:
+        return int((self._stop_loss_streaks.get(symbol) or {}).get(side, 0) or 0)
+
+    def _set_entry_cooldown(self, symbol: str, side: str, until_ts: float, stop_streak: int, reason: str | None = None) -> None:
+        self._entry_cooldowns.setdefault(symbol, {})[side] = float(until_ts)
+        self._stop_loss_streaks.setdefault(symbol, {})[side] = int(stop_streak)
+        try:
+            self.state.set_entry_cooldown(symbol, side, until_ts=until_ts, stop_streak=stop_streak, last_reason=reason)
+        except Exception:
+            logger.exception("[RUNNER] failed to persist entry cooldown for %s %s", symbol, side)
+
+    def _reset_entry_cooldown_streak(self, symbol: str, side: str, keep_until_ts: bool = False) -> None:
+        until_ts = self._get_entry_cooldown_ts(symbol, side) if keep_until_ts else 0.0
+        self._entry_cooldowns.setdefault(symbol, {})[side] = float(until_ts)
+        self._stop_loss_streaks.setdefault(symbol, {})[side] = 0
+        try:
+            self.state.reset_entry_cooldown_streak(symbol, side, keep_until_ts=keep_until_ts)
+        except Exception:
+            logger.exception("[RUNNER] failed to reset cooldown streak for %s %s", symbol, side)
+
+    def _register_stop_loss_cooldown(self, symbol: str, side: str, bar_open_ts_ms: float, pnl: float) -> None:
+        if not bool(getattr(config, "ENTRY_COOLDOWN_AFTER_STOP_ENABLED", True)):
+            return
+        if pnl > 0:
+            if bool(getattr(config, "ENTRY_COOLDOWN_RESET_ON_NON_LOSS_EXIT", True)):
+                self._reset_entry_cooldown_streak(symbol, side, keep_until_ts=False)
+            return
+
+        base_bars = int(getattr(config, "ENTRY_COOLDOWN_AFTER_STOP_BARS", 0) or 0)
+        streak_threshold = int(getattr(config, "ENTRY_COOLDOWN_STREAK_THRESHOLD", 2) or 0)
+        extra_bars = int(getattr(config, "ENTRY_COOLDOWN_STREAK_EXTRA_BARS", 0) or 0)
+        bar_seconds = int(getattr(config, "ENTRY_COOLDOWN_BAR_SECONDS", 15 * 60) or 15 * 60)
+        if base_bars <= 0 or bar_seconds <= 0:
+            return
+
+        new_streak = self._get_stop_streak(symbol, side) + 1
+        cooldown_bars = base_bars
+        if streak_threshold > 0 and new_streak >= streak_threshold:
+            cooldown_bars += extra_bars
+
+        until_ts = float(bar_open_ts_ms) / 1000.0 + cooldown_bars * bar_seconds
+        self._set_entry_cooldown(symbol, side, until_ts=until_ts, stop_streak=new_streak, reason="stop_loss")
+        logger.info(
+            "[RUNNER] entry cooldown set for %s %s: bars=%s streak=%s until_ts=%.0f",
+            symbol,
+            side,
+            cooldown_bars,
+            new_streak,
+            until_ts,
+        )
+
     def _update_position_state(self, symbol: str, pos: PositionState | None) -> None:
         """Сохранить позицию в локальный кэш и файл состояния."""
         if pos is None:
@@ -590,11 +668,12 @@ class LiveRunner:
         )
 
         # Telegram notification about closed position with PnL/ROE
+        pnl = 0.0
+        side = pos.side
         try:
             entry = float(pos.entry_price)
             exit_price = float(price)
             qty_val = float(qty)
-            side = pos.side
             sign = 1.0 if side == "long" else -1.0
             pnl = (exit_price - entry) * qty_val * sign
             roe_pct = None
@@ -634,6 +713,15 @@ class LiveRunner:
             )
         except Exception as e:  # pragma: no cover
             logger.exception("[RUNNER] failed to send close position notification for %s: %s", symbol, e)
+
+        try:
+            bar_open_ts_ms = float(self._latest_bar_open_time_ms.get(symbol, 0.0) or 0.0)
+            if reason == "stop_loss":
+                self._register_stop_loss_cooldown(symbol, side, bar_open_ts_ms=bar_open_ts_ms or time.time() * 1000.0, pnl=pnl)
+            elif bool(getattr(config, "ENTRY_COOLDOWN_RESET_ON_NON_LOSS_EXIT", True)):
+                self._reset_entry_cooldown_streak(symbol, side, keep_until_ts=False)
+        except Exception:
+            logger.exception("[RUNNER] failed to update cooldown state for %s", symbol)
 
         self._update_position_state(symbol, None)
 
@@ -730,6 +818,11 @@ class LiveRunner:
             saved_positions = self.state.get_positions()
             self._positions = dict(saved_positions)
             logger.info("[RUNNER] restored %s positions from state", len(self._positions))
+            for sym in self.symbols:
+                for side in ("long", "short"):
+                    cd = self.state.get_entry_cooldown(sym, side)
+                    self._entry_cooldowns.setdefault(sym, {})[side] = float(cd.get("until_ts", 0.0) or 0.0)
+                    self._stop_loss_streaks.setdefault(sym, {})[side] = int(cd.get("stop_streak", 0) or 0)
         except Exception as e:
             logger.exception("[RUNNER] failed to restore positions from state: %s", e)
             self._positions = {}
