@@ -135,6 +135,18 @@ ATR_TS_MULT = 5.0
 BREAKOUT_VOLUME_MULT = 1.5  # volume > MA(volume) * BREAKOUT_VOLUME_MULT
 BREAKOUT_ADX_MIN = 20.0      # минимальный ADX для подтверждения пробоя
 
+# ===== Улучшенный volume / momentum фильтр для breakout =====
+# Вместо грубого volume > average используем устойчивую комбинацию:
+# - volume EMA,
+# - медиану объёма,
+# - общий impulse score = volume * body * quality close.
+BREAKOUT_VOLUME_FILTER_V2_ENABLED = True
+BREAKOUT_VOLUME_EMA_SPAN = 20
+BREAKOUT_VOLUME_MIN_RATIO_TO_EMA = 1.10
+BREAKOUT_VOLUME_MIN_RATIO_TO_MEDIAN = 1.20
+BREAKOUT_MIN_VOLUME_IMPULSE_SCORE = 0.55
+BREAKOUT_STRONG_VOLUME_IMPULSE_SCORE = 0.95
+
 # ===== Качество пробойной свечи =====
 # Пробой должен подтверждаться закрытием уже закрытой свечи, а не одним касанием диапазона.
 # Дополнительно фильтруем слабые/шумовые свечи: маленькое тело, закрытие далеко от экстремума,
@@ -155,6 +167,11 @@ MTF_RSI_LONG_MIN = 50.0
 MTF_RSI_LONG_MAX = 85.0
 MTF_RSI_SHORT_MIN = 15.0
 MTF_RSI_SHORT_MAX = 55.0
+
+# Дополнительная адаптация RSI под силу объёма/импульса breakout-свечи.
+BREAKOUT_RSI_ADAPT_BY_VOLUME_ENABLED = True
+BREAKOUT_RSI_WEAK_VOLUME_TIGHTEN = 2.5
+BREAKOUT_RSI_STRONG_VOLUME_LOOSEN = 1.5
 
 # Минимальная волатильность на LTF (M15) в доле цены
 # Пример: 0.0002 = 0.02% (слишком тихий рынок не торгуем)
@@ -289,7 +306,7 @@ BINANCE_API_SECRET = _os.getenv("BINANCE_API_SECRET", "O4o0oORj7wloy6DfeuWbcOVUy
 STATE_FILE = _os.getenv("BOT_STATE_FILE", "bot_state.json")
 
 # Версия стратегии/конфига — можно использовать в логах и state
-STRATEGY_VERSION = _os.getenv("STRATEGY_VERSION", "mtf_breakout_step3_overextension")
+STRATEGY_VERSION = _os.getenv("STRATEGY_VERSION", "mtf_breakout_step7_volume_momentum")
 
 # ===== Telegram-уведомления =====
 # Если TELEGRAM_ENABLED=1 и заданы токен и chat_id, бот будет слать уведомления.

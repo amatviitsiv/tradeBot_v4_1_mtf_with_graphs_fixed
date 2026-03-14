@@ -199,6 +199,98 @@ class MTFBreakoutStrategy(BaseStrategy):
         except Exception as exc:
             return False, {"reason": "htf_overextension_exception", "error": str(exc)}
 
+    def _calc_breakout_volume_momentum(self, recent: pd.DataFrame, candle: pd.Series, atr_ltf: float, side: str) -> tuple[bool, dict]:
+        """Более устойчивый фильтр объёма/импульса для breakout.
+
+        Вместо грубого сравнения с простым средним используем комбинацию:
+        - volume EMA по окну recent;
+        - медиану объёма как более устойчивую базу;
+        - score, который учитывает и объём, и качество/импульс свечи.
+        """
+        try:
+            vol_series = recent["volume"].astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(vol_series) < 5:
+                return False, {"reason": "not_enough_volume_history", "count": int(len(vol_series))}
+
+            volume = float(candle.get("volume"))
+            open_ = float(candle.get("open"))
+            high = float(candle.get("high"))
+            low = float(candle.get("low"))
+            close = float(candle.get("close"))
+        except (TypeError, ValueError, KeyError):
+            return False, {"reason": "bad_volume_or_ohlc"}
+
+        if atr_ltf <= 0.0:
+            return False, {"reason": "bad_atr", "atr_ltf": atr_ltf}
+
+        vol_ema_span = int(getattr(cfg, "BREAKOUT_VOLUME_EMA_SPAN", 20))
+        min_vs_ema = float(getattr(cfg, "BREAKOUT_VOLUME_MIN_RATIO_TO_EMA", 1.10))
+        min_vs_median = float(getattr(cfg, "BREAKOUT_VOLUME_MIN_RATIO_TO_MEDIAN", 1.20))
+        min_impulse_score = float(getattr(cfg, "BREAKOUT_MIN_VOLUME_IMPULSE_SCORE", 0.55))
+        strong_impulse_score = float(getattr(cfg, "BREAKOUT_STRONG_VOLUME_IMPULSE_SCORE", 0.95))
+
+        vol_ema = float(vol_series.ewm(span=max(2, vol_ema_span), adjust=False).mean().iloc[-1])
+        vol_median = float(vol_series.median())
+        vol_p75 = float(vol_series.quantile(0.75))
+
+        if vol_ema <= 0.0 or vol_median <= 0.0:
+            return False, {"reason": "bad_volume_baseline", "vol_ema": vol_ema, "vol_median": vol_median}
+
+        range_ = max(high - low, 0.0)
+        body = abs(close - open_)
+        body_atr = body / atr_ltf if atr_ltf > 0 else 0.0
+        close_pos = 0.5
+        if range_ > 0:
+            close_pos = (close - low) / range_
+
+        if side == "long":
+            close_extreme_score = close_pos
+        else:
+            close_extreme_score = 1.0 - close_pos
+
+        vol_ratio_ema = volume / vol_ema
+        vol_ratio_median = volume / vol_median
+        robust_vol_ratio = min(vol_ratio_ema, vol_ratio_median)
+        impulse_score = robust_vol_ratio * body_atr * close_extreme_score
+
+        if vol_ratio_ema < min_vs_ema and vol_ratio_median < min_vs_median:
+            return False, {
+                "reason": "weak_volume",
+                "volume": volume,
+                "vol_ema": vol_ema,
+                "vol_median": vol_median,
+                "vol_p75": vol_p75,
+                "vol_ratio_ema": vol_ratio_ema,
+                "vol_ratio_median": vol_ratio_median,
+                "impulse_score": impulse_score,
+            }
+
+        if impulse_score < min_impulse_score:
+            return False, {
+                "reason": "weak_volume_impulse",
+                "volume": volume,
+                "vol_ema": vol_ema,
+                "vol_median": vol_median,
+                "vol_ratio_ema": vol_ratio_ema,
+                "vol_ratio_median": vol_ratio_median,
+                "body_atr": body_atr,
+                "close_extreme_score": close_extreme_score,
+                "impulse_score": impulse_score,
+            }
+
+        return True, {
+            "volume": volume,
+            "vol_ema": vol_ema,
+            "vol_median": vol_median,
+            "vol_p75": vol_p75,
+            "vol_ratio_ema": vol_ratio_ema,
+            "vol_ratio_median": vol_ratio_median,
+            "body_atr": body_atr,
+            "close_extreme_score": close_extreme_score,
+            "impulse_score": impulse_score,
+            "is_strong_impulse": impulse_score >= strong_impulse_score,
+        }
+
     def _extract_symbol(self, df: pd.DataFrame) -> str:
         try:
             if "symbol" in df.columns and len(df) > 0:
@@ -466,11 +558,21 @@ class MTFBreakoutStrategy(BaseStrategy):
         long_trigger = range_high * (1.0 + buf)
         short_trigger = range_low * (1.0 - buf)
 
-        # Объёмный фильтр на LTF
-        vol_ma = float(recent["volume"].mean())
-        vol_mult = float(getattr(cfg, "BREAKOUT_VOLUME_MULT", 1.5))
-        if vol_ma > 0 and volume < vol_ma * vol_mult:
-            return None
+        # Более устойчивый volume / momentum фильтр на LTF.
+        volume_filter_enabled = bool(getattr(cfg, "BREAKOUT_VOLUME_FILTER_V2_ENABLED", True))
+        if volume_filter_enabled:
+            volume_ok, volume_meta = self._calc_breakout_volume_momentum(recent=recent, candle=last, atr_ltf=atr_ltf, side="long" if regime == "bull" else "short")
+            if not volume_ok:
+                logger.debug("[MTF] skip weak breakout volume/momentum: %s", volume_meta)
+                return None
+        else:
+            volume_meta = {
+                "volume": volume,
+                "vol_ema": float(recent["volume"].astype(float).ewm(span=20, adjust=False).mean().iloc[-1]),
+                "vol_median": float(recent["volume"].median()),
+                "impulse_score": 0.0,
+                "is_strong_impulse": False,
+            }
 
         # ======================================================
         # 3) LTF ATR-фильтр + RSI-фильтр (вариант B — сбалансированный)
@@ -537,6 +639,22 @@ class MTFBreakoutStrategy(BaseStrategy):
             rsi_long_min = max(40.0, rsi_long_min - rsi_long_tighten * 0.5)
             rsi_short_max = min(60.0, rsi_short_max + rsi_short_tighten * 0.5)
 
+        # Дополнительная адаптация RSI под силу объёмного импульса пробоя.
+        # Слабый импульс -> вход требовательнее. Сильный импульс -> можно чуть смягчить.
+        if bool(getattr(cfg, "BREAKOUT_RSI_ADAPT_BY_VOLUME_ENABLED", True)):
+            weak_tighten = float(getattr(cfg, "BREAKOUT_RSI_WEAK_VOLUME_TIGHTEN", 2.5))
+            strong_loosen = float(getattr(cfg, "BREAKOUT_RSI_STRONG_VOLUME_LOOSEN", 1.5))
+            impulse_score = float(volume_meta.get("impulse_score", 0.0))
+            strong_impulse = bool(volume_meta.get("is_strong_impulse", False))
+            min_impulse_score = float(getattr(cfg, "BREAKOUT_MIN_VOLUME_IMPULSE_SCORE", 0.55))
+
+            if impulse_score < min_impulse_score * 1.15:
+                rsi_long_min += weak_tighten
+                rsi_short_max -= weak_tighten
+            elif strong_impulse:
+                rsi_long_min = max(40.0, rsi_long_min - strong_loosen)
+                rsi_short_max = min(60.0, rsi_short_max + strong_loosen)
+
         # ======================================================
         # 4) Итоговые сигналы
         # ======================================================
@@ -558,11 +676,13 @@ class MTFBreakoutStrategy(BaseStrategy):
                 quality_meta = {}
 
             logger.debug(
-                "[MTF] BUY: close=%.2f rh=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f htf_s50=%.5f htf_s200=%.5f htf_d20_50=%.5f htf_d20_atr=%.3f htf_d50_atr=%.3f body=%.5f uw=%.5f lw=%.5f",
+                "[MTF] BUY: close=%.2f rh=%.2f vol=%.0f vol_ema=%.0f vol_med=%.0f imp=%.3f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f htf_s50=%.5f htf_s200=%.5f htf_d20_50=%.5f htf_d20_atr=%.3f htf_d50_atr=%.3f body=%.5f uw=%.5f lw=%.5f",
                 close,
                 range_high,
                 volume,
-                vol_ma,
+                float(volume_meta.get("vol_ema", 0.0)),
+                float(volume_meta.get("vol_median", 0.0)),
+                float(volume_meta.get("impulse_score", 0.0)),
                 adx_h,
                 atr_pct_h,
                 rsi_ltf,
@@ -592,11 +712,13 @@ class MTFBreakoutStrategy(BaseStrategy):
                 quality_meta = {}
 
             logger.debug(
-                "[MTF] SELL: close=%.2f rl=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f htf_s50=%.5f htf_s200=%.5f htf_d20_50=%.5f htf_d20_atr=%.3f htf_d50_atr=%.3f body=%.5f uw=%.5f lw=%.5f",
+                "[MTF] SELL: close=%.2f rl=%.2f vol=%.0f vol_ema=%.0f vol_med=%.0f imp=%.3f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f htf_s50=%.5f htf_s200=%.5f htf_d20_50=%.5f htf_d20_atr=%.3f htf_d50_atr=%.3f body=%.5f uw=%.5f lw=%.5f",
                 close,
                 range_low,
                 volume,
-                vol_ma,
+                float(volume_meta.get("vol_ema", 0.0)),
+                float(volume_meta.get("vol_median", 0.0)),
+                float(volume_meta.get("impulse_score", 0.0)),
                 adx_h,
                 atr_pct_h,
                 rsi_ltf,
