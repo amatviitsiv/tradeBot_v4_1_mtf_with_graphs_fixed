@@ -32,6 +32,39 @@ class Backtester:
         self.fee_rate = float(getattr(cfg, "FUTURES_FEE_RATE", 0.0004))
 
     # ------------------------------------------------------------------
+    def _attach_btc_regime_columns(self, out: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+        btc_symbol = str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
+        btc_df = out.get(btc_symbol)
+        htf_cols = ["HTF_SMA_TREND", "HTF_EMA20", "HTF_EMA50", "HTF_EMA200", "HTF_ATR", "HTF_ADX", "HTF_RSI"]
+        if btc_df is None or btc_df.empty or "open_time" not in btc_df.columns:
+            for sym, df in out.items():
+                for col in htf_cols:
+                    df[f"BTC_{col}"] = pd.NA
+            return out
+
+        btc_sync_base = btc_df.copy()
+        btc_sync_base = btc_sync_base.sort_values("open_time").drop_duplicates(subset=["open_time"], keep="last")
+        btc_sync_base = btc_sync_base.set_index("open_time")
+
+        for sym, df in out.items():
+            if "open_time" not in df.columns:
+                for col in htf_cols:
+                    df[f"BTC_{col}"] = pd.NA
+                continue
+            idx_df = df.sort_values("open_time").drop_duplicates(subset=["open_time"], keep="last").set_index("open_time")
+            btc_sync = btc_sync_base.reindex(idx_df.index, method="pad")
+            for col in htf_cols:
+                out_col = f"BTC_{col}"
+                idx_df[out_col] = btc_sync[col] if col in btc_sync.columns else pd.NA
+            idx_df["symbol"] = sym
+            out[sym] = idx_df.reset_index()
+        return out
+
+    def _count_same_side_alt_positions(self, positions: Dict[str, Optional[Position]], side: str) -> int:
+        alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+        return sum(1 for sym, pos in positions.items() if pos is not None and sym in alt_symbols and pos.side == side)
+
+    # ------------------------------------------------------------------
     def _prepare(self) -> Dict[str, pd.DataFrame]:
         out: Dict[str, pd.DataFrame] = {}
         for sym, df in self.raw_data.items():
@@ -43,8 +76,10 @@ class Backtester:
                 for col in ["open", "high", "low", "close", "volume"]:
                     df2[col] = df2[col].astype(float)
                 df = df2[["open", "high", "low", "close", "volume"]].copy()
-            out[sym] = compute_indicators(df)
-        return out
+            prepared = compute_indicators(df)
+            prepared["symbol"] = sym
+            out[sym] = prepared
+        return self._attach_btc_regime_columns(out)
 
     # ------------------------------------------------------------------
     def run(self) -> Dict[str, float]:
@@ -264,6 +299,13 @@ class Backtester:
                     continue
 
                 side = "long" if signal == "buy" else "short"
+
+                btc_regime_cap = int(getattr(cfg, "BTC_REGIME_MAX_SAME_SIDE_ALT_POSITIONS", 0) or 0)
+                alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+                if btc_regime_cap > 0 and sym in alt_symbols:
+                    same_side_alt_count = self._count_same_side_alt_positions(positions, side)
+                    if same_side_alt_count >= btc_regime_cap:
+                        continue
 
                 if cooldown_enabled and i < int(cooldown_until_bar[sym].get(side, -1)):
                     continue

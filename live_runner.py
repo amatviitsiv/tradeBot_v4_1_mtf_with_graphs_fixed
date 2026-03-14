@@ -182,6 +182,37 @@ class LiveRunner:
         self._data_1h[symbol] = df
 
 
+    def _attach_btc_regime_columns(self, df_15_idx: pd.DataFrame) -> pd.DataFrame:
+        btc_symbol = str(getattr(config, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
+        df_btc_1h = self._data_1h.get(btc_symbol)
+        htf_cols = ["SMA_TREND", "EMA20", "EMA50", "EMA200", "ATR", "ADX", "RSI"]
+
+        if df_btc_1h is None or df_btc_1h.empty:
+            for col in htf_cols:
+                df_15_idx[f"BTC_HTF_{col}"] = pd.NA
+            return df_15_idx
+
+        try:
+            df_btc_1h_ind = compute_indicators(df_btc_1h.copy())
+            if "open_time" not in df_btc_1h_ind.columns:
+                raise ValueError("BTC HTF open_time missing")
+            df_btc_1h_ind = df_btc_1h_ind.set_index("open_time")
+            if df_btc_1h_ind.index.has_duplicates:
+                df_btc_1h_ind = df_btc_1h_ind[~df_btc_1h_ind.index.duplicated(keep="last")].sort_index()
+            df_btc_sync = df_btc_1h_ind.reindex(df_15_idx.index, method="pad")
+            for col in htf_cols:
+                out_col = f"BTC_HTF_{col}"
+                df_15_idx[out_col] = df_btc_sync[col] if col in df_btc_sync.columns else pd.NA
+        except Exception as e:
+            logger.exception("[RUNNER] failed to attach BTC regime columns: %s", e)
+            for col in htf_cols:
+                df_15_idx[f"BTC_HTF_{col}"] = pd.NA
+        return df_15_idx
+
+    def _count_same_side_alt_positions(self, side: str) -> int:
+        alt_symbols = set(getattr(config, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+        return sum(1 for sym, pos in self._positions.items() if pos is not None and sym in alt_symbols and pos.side == side)
+
     async def _run_strategy_if_ready(self, symbol: str) -> None:
         """Запускается при закрытии M15 свечи.
 
@@ -241,7 +272,9 @@ class LiveRunner:
                 else:
                     df_15_idx[hcol] = pd.NA
 
+            df_15_idx = self._attach_btc_regime_columns(df_15_idx)
             df_mtf = df_15_idx.reset_index()
+            df_mtf["symbol"] = symbol
             # считаем LTF-индикаторы (ATR/RSI и др.)
             df_mtf = compute_indicators(df_mtf)
         except Exception as e:
@@ -453,6 +486,20 @@ class LiveRunner:
                     symbol,
                     now_ts - last_open,
                     min_reopen,
+                )
+                return
+
+        btc_regime_cap = int(getattr(config, "BTC_REGIME_MAX_SAME_SIDE_ALT_POSITIONS", 0) or 0)
+        alt_symbols = set(getattr(config, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+        if btc_regime_cap > 0 and symbol in alt_symbols:
+            same_side_alt_count = self._count_same_side_alt_positions(side)
+            if same_side_alt_count >= btc_regime_cap:
+                logger.info(
+                    "[RUNNER] BTC regime alt cap reached for %s side=%s: %s/%s",
+                    symbol,
+                    side,
+                    same_side_alt_count,
+                    btc_regime_cap,
                 )
                 return
 

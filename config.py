@@ -251,6 +251,20 @@ ENTRY_COOLDOWN_STREAK_EXTRA_BARS = 8             # доп. пауза повер
 ENTRY_COOLDOWN_RESET_ON_NON_LOSS_EXIT = True     # сбрасывать серию после неубыточного/прибыльного выхода
 ENTRY_COOLDOWN_BAR_SECONDS = 15 * 60             # M15 = 900 секунд
 
+
+
+# ===== BTC regime filter для альтов =====
+# Для альтов торгуем только в сторону старшего режима BTC.
+# LONG по альтам разрешаем только если BTC HTF bullish,
+# SHORT — только если BTC HTF bearish.
+BTC_REGIME_FILTER_ENABLED = True
+BTC_REGIME_FILTER_SYMBOL = "BTCUSDT"
+BTC_REGIME_ALT_SYMBOLS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
+
+# Доп. ограничение: сколько однонаправленных альт-сделок можно держать одновременно.
+# 0 = без ограничения.
+BTC_REGIME_MAX_SAME_SIDE_ALT_POSITIONS = 2
+
 # ===== Ограничение торговли при глубокой просадке (DD cooldown) =====
 # Если текущая просадка от пика эквити превышает DD_COOLDOWN_PCT,
 # стратегия перестаёт открывать новые позиции на ближайшие DD_COOLDOWN_BARS баров.

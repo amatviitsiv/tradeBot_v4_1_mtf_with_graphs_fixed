@@ -199,6 +199,57 @@ class MTFBreakoutStrategy(BaseStrategy):
         except Exception as exc:
             return False, {"reason": "htf_overextension_exception", "error": str(exc)}
 
+    def _extract_symbol(self, df: pd.DataFrame) -> str:
+        try:
+            if "symbol" in df.columns and len(df) > 0:
+                return str(df["symbol"].iloc[-1])
+        except Exception:
+            pass
+        return ""
+
+    def _resolve_regime_from_values(self, ema20: float, ema50: float, ema200: float) -> str:
+        if ema20 > ema50 > ema200:
+            return "bull"
+        if ema20 < ema50 < ema200:
+            return "bear"
+        return "none"
+
+    def _check_btc_regime_filter(self, df: pd.DataFrame, symbol: str, side: str) -> tuple[bool, dict]:
+        enabled = bool(getattr(cfg, "BTC_REGIME_FILTER_ENABLED", True))
+        if not enabled:
+            return True, {"enabled": False}
+
+        btc_symbol = str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
+        alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+        if not symbol or symbol == btc_symbol or symbol not in alt_symbols:
+            return True, {"enabled": True, "skipped": True}
+
+        needed = ["BTC_HTF_EMA20", "BTC_HTF_EMA50", "BTC_HTF_EMA200"]
+        if not all(c in df.columns for c in needed):
+            return False, {"reason": "missing_btc_htf_cols"}
+
+        try:
+            ema20 = float(df["BTC_HTF_EMA20"].iloc[-1])
+            ema50 = float(df["BTC_HTF_EMA50"].iloc[-1])
+            ema200 = float(df["BTC_HTF_EMA200"].iloc[-1])
+        except Exception:
+            return False, {"reason": "bad_btc_htf_values"}
+
+        import math
+        if any(math.isnan(x) for x in [ema20, ema50, ema200]):
+            return False, {"reason": "nan_btc_htf_values"}
+
+        btc_regime = self._resolve_regime_from_values(ema20, ema50, ema200)
+        expected = "bull" if side == "long" else "bear"
+        ok = btc_regime == expected
+        return ok, {
+            "btc_regime": btc_regime,
+            "expected": expected,
+            "btc_ema20": ema20,
+            "btc_ema50": ema50,
+            "btc_ema200": ema200,
+        }
+
     def signal(self, df: pd.DataFrame) -> Optional[str]:
         if df is None or len(df) < 100:
             return None
@@ -250,14 +301,12 @@ class MTFBreakoutStrategy(BaseStrategy):
         # ======================================================
         # 1) HTF-тренд (строгий вариант C)
         # ======================================================
-        regime = "none"
-        if ema20_h > ema50_h > ema200_h:
-            regime = "bull"
-        elif ema20_h < ema50_h < ema200_h:
-            regime = "bear"
+        regime = self._resolve_regime_from_values(ema20_h, ema50_h, ema200_h)
 
         if regime == "none":
             return None
+
+        symbol = self._extract_symbol(df)
 
         # Фильтр «живого» HTF-тренда: не входим, если EMA уже выстроены,
         # но наклон и дистанция между ними указывают на выдыхающийся тренд.
@@ -496,6 +545,10 @@ class MTFBreakoutStrategy(BaseStrategy):
 
         # LONG: H1 bull-тренд + подтверждённое закрытие M15 выше диапазона
         if regime == "bull" and close > long_trigger and rsi_long_min <= rsi_ltf <= rsi_long_max:
+            btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="long")
+            if not btc_ok:
+                logger.debug("[MTF] skip BUY by BTC regime filter: %s", btc_meta)
+                return None
             if breakout_quality_enabled:
                 quality_ok, quality_meta = self._calc_breakout_candle_quality(last, atr_ltf, side="long")
                 if not quality_ok:
@@ -526,6 +579,10 @@ class MTFBreakoutStrategy(BaseStrategy):
 
         # SHORT: H1 bear-тренд + подтверждённое закрытие M15 ниже диапазона
         if regime == "bear" and close < short_trigger and rsi_short_min <= rsi_ltf <= rsi_short_max:
+            btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="short")
+            if not btc_ok:
+                logger.debug("[MTF] skip SELL by BTC regime filter: %s", btc_meta)
+                return None
             if breakout_quality_enabled:
                 quality_ok, quality_meta = self._calc_breakout_candle_quality(last, atr_ltf, side="short")
                 if not quality_ok:
