@@ -102,6 +102,61 @@ class MTFBreakoutStrategy(BaseStrategy):
             "lower_wick": lower_wick,
         }
 
+    def _check_htf_trend_vitality(self, df: pd.DataFrame, regime: str, close: float) -> tuple[bool, dict]:
+        """Фильтр «живого» тренда на HTF.
+
+        Проверяем, что старший тренд не стал слишком плоским:
+        - EMA50 и EMA200 должны сохранять направленный наклон;
+        - между EMA20 и EMA50 должна оставаться заметная дистанция.
+        """
+        try:
+            lookback = int(getattr(cfg, "HTF_EMA_SLOPE_LOOKBACK_BARS", 8))
+            min_slope_ema50 = float(getattr(cfg, "HTF_EMA50_MIN_SLOPE_PCT", 0.0008))
+            min_slope_ema200 = float(getattr(cfg, "HTF_EMA200_MIN_SLOPE_PCT", 0.00025))
+            min_dist_pct = float(getattr(cfg, "HTF_EMA20_EMA50_MIN_DIST_PCT", 0.0010))
+
+            if len(df) < lookback + 1 or close <= 0:
+                return False, {"reason": "not_enough_htf_history", "lookback": lookback}
+
+            ema20_now = float(df["HTF_EMA20"].iloc[-1])
+            ema50_now = float(df["HTF_EMA50"].iloc[-1])
+            ema200_now = float(df["HTF_EMA200"].iloc[-1])
+            ema50_prev = float(df["HTF_EMA50"].iloc[-lookback - 1])
+            ema200_prev = float(df["HTF_EMA200"].iloc[-lookback - 1])
+
+            if any(np.isnan(x) for x in [ema20_now, ema50_now, ema200_now, ema50_prev, ema200_prev]):
+                return False, {"reason": "nan_in_htf_ema"}
+
+            slope50 = (ema50_now - ema50_prev) / abs(ema50_now) if ema50_now else 0.0
+            slope200 = (ema200_now - ema200_prev) / abs(ema200_now) if ema200_now else 0.0
+            dist20_50_pct = abs(ema20_now - ema50_now) / close
+
+            if regime == "bull":
+                if slope50 < min_slope_ema50:
+                    return False, {"reason": "ema50_flat_bull", "slope50": slope50, "min": min_slope_ema50}
+                if slope200 < min_slope_ema200:
+                    return False, {"reason": "ema200_flat_bull", "slope200": slope200, "min": min_slope_ema200}
+            elif regime == "bear":
+                if slope50 > -min_slope_ema50:
+                    return False, {"reason": "ema50_flat_bear", "slope50": slope50, "max": -min_slope_ema50}
+                if slope200 > -min_slope_ema200:
+                    return False, {"reason": "ema200_flat_bear", "slope200": slope200, "max": -min_slope_ema200}
+
+            if dist20_50_pct < min_dist_pct:
+                return False, {
+                    "reason": "ema20_ema50_too_close",
+                    "dist20_50_pct": dist20_50_pct,
+                    "min": min_dist_pct,
+                }
+
+            return True, {
+                "slope50": slope50,
+                "slope200": slope200,
+                "dist20_50_pct": dist20_50_pct,
+            }
+        except Exception as exc:
+            return False, {"reason": "htf_vitality_exception", "error": str(exc)}
+
     def signal(self, df: pd.DataFrame) -> Optional[str]:
         if df is None or len(df) < 100:
             return None
@@ -161,6 +216,17 @@ class MTFBreakoutStrategy(BaseStrategy):
 
         if regime == "none":
             return None
+
+        # Фильтр «живого» HTF-тренда: не входим, если EMA уже выстроены,
+        # но наклон и дистанция между ними указывают на выдыхающийся тренд.
+        htf_vitality_enabled = bool(getattr(cfg, "HTF_TREND_VITALITY_ENABLED", True))
+        if htf_vitality_enabled:
+            vitality_ok, vitality_meta = self._check_htf_trend_vitality(df, regime=regime, close=close)
+            if not vitality_ok:
+                logger.debug("[MTF] skip flat HTF trend: %s", vitality_meta)
+                return None
+        else:
+            vitality_meta = {}
 
         # Фильтр слишком тихого рынка по HTF ATR
         if close <= 0 or atr_h <= 0:
@@ -385,7 +451,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 quality_meta = {}
 
             logger.debug(
-                "[MTF] BUY: close=%.2f rh=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f body=%.5f uw=%.5f lw=%.5f",
+                "[MTF] BUY: close=%.2f rh=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f htf_s50=%.5f htf_s200=%.5f htf_d20_50=%.5f body=%.5f uw=%.5f lw=%.5f",
                 close,
                 range_high,
                 volume,
@@ -393,6 +459,9 @@ class MTFBreakoutStrategy(BaseStrategy):
                 adx_h,
                 atr_pct_h,
                 rsi_ltf,
+                float(vitality_meta.get("slope50", 0.0)),
+                float(vitality_meta.get("slope200", 0.0)),
+                float(vitality_meta.get("dist20_50_pct", 0.0)),
                 float(quality_meta.get("body", 0.0)),
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),
@@ -410,7 +479,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 quality_meta = {}
 
             logger.debug(
-                "[MTF] SELL: close=%.2f rl=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f body=%.5f uw=%.5f lw=%.5f",
+                "[MTF] SELL: close=%.2f rl=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f htf_s50=%.5f htf_s200=%.5f htf_d20_50=%.5f body=%.5f uw=%.5f lw=%.5f",
                 close,
                 range_low,
                 volume,
@@ -418,6 +487,9 @@ class MTFBreakoutStrategy(BaseStrategy):
                 adx_h,
                 atr_pct_h,
                 rsi_ltf,
+                float(vitality_meta.get("slope50", 0.0)),
+                float(vitality_meta.get("slope200", 0.0)),
+                float(vitality_meta.get("dist20_50_pct", 0.0)),
                 float(quality_meta.get("body", 0.0)),
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),
