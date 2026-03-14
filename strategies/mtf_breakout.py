@@ -23,6 +23,85 @@ class MTFBreakoutStrategy(BaseStrategy):
 
     name: str = "mtf_breakout"
 
+    def _calc_breakout_candle_quality(self, candle: pd.Series, atr_ltf: float, side: str) -> tuple[bool, dict]:
+        """Проверка качества пробойной свечи.
+
+        Идея:
+        - тело должно быть достаточно большим относительно ATR;
+        - закрытие должно быть возле экстремума свечи;
+        - не входим по свече, где сигнал сформирован одним длинным фитилём.
+        """
+        try:
+            open_ = float(candle.get("open"))
+            high = float(candle.get("high"))
+            low = float(candle.get("low"))
+            close = float(candle.get("close"))
+        except (TypeError, ValueError):
+            return False, {"reason": "bad_ohlc"}
+
+        candle_range = max(high - low, 0.0)
+        body = abs(close - open_)
+        if candle_range <= 0.0 or atr_ltf <= 0.0:
+            return False, {"reason": "bad_range"}
+
+        upper_wick = max(0.0, high - max(open_, close))
+        lower_wick = max(0.0, min(open_, close) - low)
+
+        min_body_atr = float(getattr(cfg, "BREAKOUT_MIN_BODY_ATR", 0.35))
+        max_close_from_extreme = float(getattr(cfg, "BREAKOUT_MAX_CLOSE_FROM_EXTREME_PCT", 0.25))
+        max_breakout_wick_body_ratio = float(getattr(cfg, "BREAKOUT_MAX_WICK_BODY_RATIO", 0.8))
+        max_breakout_wick_range_ratio = float(getattr(cfg, "BREAKOUT_MAX_WICK_RANGE_RATIO", 0.35))
+
+        if body < atr_ltf * min_body_atr:
+            return False, {
+                "reason": "small_body_vs_atr",
+                "body": body,
+                "atr": atr_ltf,
+                "need": atr_ltf * min_body_atr,
+            }
+
+        if side == "long":
+            if close <= open_:
+                return False, {"reason": "no_bull_body"}
+            distance_to_extreme = high - close
+            breakout_wick = upper_wick
+        else:
+            if close >= open_:
+                return False, {"reason": "no_bear_body"}
+            distance_to_extreme = close - low
+            breakout_wick = lower_wick
+
+        if (distance_to_extreme / candle_range) > max_close_from_extreme:
+            return False, {
+                "reason": "close_not_near_extreme",
+                "distance": distance_to_extreme,
+                "range": candle_range,
+            }
+
+        if body <= 0.0:
+            return False, {"reason": "zero_body"}
+
+        if (breakout_wick / body) > max_breakout_wick_body_ratio:
+            return False, {
+                "reason": "wick_too_big_vs_body",
+                "wick": breakout_wick,
+                "body": body,
+            }
+
+        if (breakout_wick / candle_range) > max_breakout_wick_range_ratio:
+            return False, {
+                "reason": "wick_too_big_vs_range",
+                "wick": breakout_wick,
+                "range": candle_range,
+            }
+
+        return True, {
+            "body": body,
+            "range": candle_range,
+            "upper_wick": upper_wick,
+            "lower_wick": lower_wick,
+        }
+
     def signal(self, df: pd.DataFrame) -> Optional[str]:
         if df is None or len(df) < 100:
             return None
@@ -293,19 +372,55 @@ class MTFBreakoutStrategy(BaseStrategy):
         # 4) Итоговые сигналы
         # ======================================================
 
-        # LONG: H1 bull-тренд + пробой вверх на M15
+        breakout_quality_enabled = bool(getattr(cfg, "BREAKOUT_CANDLE_QUALITY_ENABLED", True))
+
+        # LONG: H1 bull-тренд + подтверждённое закрытие M15 выше диапазона
         if regime == "bull" and close > long_trigger and rsi_long_min <= rsi_ltf <= rsi_long_max:
+            if breakout_quality_enabled:
+                quality_ok, quality_meta = self._calc_breakout_candle_quality(last, atr_ltf, side="long")
+                if not quality_ok:
+                    logger.debug("[MTF] skip BUY poor breakout candle: %s", quality_meta)
+                    return None
+            else:
+                quality_meta = {}
+
             logger.debug(
-                "[MTF] BUY: close=%.2f rh=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f",
-                close, range_high, volume, vol_ma, adx_h, atr_pct_h, rsi_ltf,
+                "[MTF] BUY: close=%.2f rh=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f body=%.5f uw=%.5f lw=%.5f",
+                close,
+                range_high,
+                volume,
+                vol_ma,
+                adx_h,
+                atr_pct_h,
+                rsi_ltf,
+                float(quality_meta.get("body", 0.0)),
+                float(quality_meta.get("upper_wick", 0.0)),
+                float(quality_meta.get("lower_wick", 0.0)),
             )
             return "buy"
 
-        # SHORT: H1 bear-тренд + пробой вниз на M15
+        # SHORT: H1 bear-тренд + подтверждённое закрытие M15 ниже диапазона
         if regime == "bear" and close < short_trigger and rsi_short_min <= rsi_ltf <= rsi_short_max:
+            if breakout_quality_enabled:
+                quality_ok, quality_meta = self._calc_breakout_candle_quality(last, atr_ltf, side="short")
+                if not quality_ok:
+                    logger.debug("[MTF] skip SELL poor breakout candle: %s", quality_meta)
+                    return None
+            else:
+                quality_meta = {}
+
             logger.debug(
-                "[MTF] SELL: close=%.2f rl=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f",
-                close, range_low, volume, vol_ma, adx_h, atr_pct_h, rsi_ltf,
+                "[MTF] SELL: close=%.2f rl=%.2f vol=%.0f vol_ma=%.0f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f body=%.5f uw=%.5f lw=%.5f",
+                close,
+                range_low,
+                volume,
+                vol_ma,
+                adx_h,
+                atr_pct_h,
+                rsi_ltf,
+                float(quality_meta.get("body", 0.0)),
+                float(quality_meta.get("upper_wick", 0.0)),
+                float(quality_meta.get("lower_wick", 0.0)),
             )
             return "sell"
 

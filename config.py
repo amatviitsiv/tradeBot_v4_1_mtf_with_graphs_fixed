@@ -135,6 +135,16 @@ ATR_TS_MULT = 5.0
 BREAKOUT_VOLUME_MULT = 1.5  # volume > MA(volume) * BREAKOUT_VOLUME_MULT
 BREAKOUT_ADX_MIN = 20.0      # минимальный ADX для подтверждения пробоя
 
+# ===== Качество пробойной свечи =====
+# Пробой должен подтверждаться закрытием уже закрытой свечи, а не одним касанием диапазона.
+# Дополнительно фильтруем слабые/шумовые свечи: маленькое тело, закрытие далеко от экстремума,
+# а также длинный фитиль в сторону пробоя.
+BREAKOUT_CANDLE_QUALITY_ENABLED = True
+BREAKOUT_MIN_BODY_ATR = 0.35                # минимальный размер тела пробойной свечи в ATR(LTF)
+BREAKOUT_MAX_CLOSE_FROM_EXTREME_PCT = 0.25 # закрытие должно быть в лучших 25% диапазона свечи
+BREAKOUT_MAX_WICK_BODY_RATIO = 0.80        # фитиль в сторону пробоя не должен доминировать над телом
+BREAKOUT_MAX_WICK_RANGE_RATIO = 0.35       # и не должен занимать слишком большую часть всей свечи
+
 
 # ===== MTF (H1 + M15) ПАРАМЕТРЫ =====
 # Длина диапазона на LTF (M15) для поиска пробоя
@@ -236,7 +246,7 @@ BINANCE_API_SECRET = _os.getenv("BINANCE_API_SECRET", "O4o0oORj7wloy6DfeuWbcOVUy
 STATE_FILE = _os.getenv("BOT_STATE_FILE", "bot_state.json")
 
 # Версия стратегии/конфига — можно использовать в логах и state
-STRATEGY_VERSION = _os.getenv("STRATEGY_VERSION", "mtf_breakout_prod_prep_1")
+STRATEGY_VERSION = _os.getenv("STRATEGY_VERSION", "mtf_breakout_breakout_quality_step1")
 
 # ===== Telegram-уведомления =====
 # Если TELEGRAM_ENABLED=1 и заданы токен и chat_id, бот будет слать уведомления.
