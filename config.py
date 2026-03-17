@@ -24,7 +24,7 @@ EQUITY_NOTIFY_INTERVAL = 600
 API_KEY = "cOzVm76AAqWwFe6vvHcoZ2wB1mNhJg01DJ9GpA5ZXq12nBpGmsJdwMoXTyRVA9Hw"
 API_SECRET = "O4o0oORj7wloy6DfeuWbcOVUy9SfV8z94gSyBQF63kHyQkPPJDXlZqYmuKwmKcfX"
 
-FUTURES_SYMBOLS = ["BTCUSDT"]#["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
+FUTURES_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
 # ===== СПИСОК ПАР ДЛЯ ТОРГОВЛИ =====
 
 # config.py (важные куски)
@@ -256,6 +256,8 @@ SYMBOL_PARAM_OVERRIDES = {
         "ATR_SL_MULT": 5.5,
         "POSITION_TP1_ATR_MULT": 7.5,
         "POSITION_TRAILING_ATR_MULT": 4.8,
+        "RISK_MULTIPLIER": 1.00,
+        "RANGE_MAX_WIDTH_PCT": 0.10,
     },
     "ETHUSDT": {
         "BREAKOUT_BUFFER_PCT": 0.0010,
@@ -269,6 +271,8 @@ SYMBOL_PARAM_OVERRIDES = {
         "ATR_SL_MULT": 5.2,
         "POSITION_TP1_ATR_MULT": 7.2,
         "POSITION_TRAILING_ATR_MULT": 4.6,
+        "RISK_MULTIPLIER": 0.85,
+        "BREAKOUT_HOLD_BUFFER_ATR": 0.04,
     },
     "SOLUSDT": {
         "BREAKOUT_BUFFER_PCT": 0.0013,
@@ -282,6 +286,11 @@ SYMBOL_PARAM_OVERRIDES = {
         "ATR_SL_MULT": 5.0,
         "POSITION_TP1_ATR_MULT": 6.8,
         "POSITION_TRAILING_ATR_MULT": 4.3,
+        "RISK_MULTIPLIER": 0.65,
+        "ALT_QUALITY_MIN_SCORE": 0.53,
+        "BREAKOUT_CONFIRM_BUFFER_ATR": 0.16,
+        "BREAKOUT_HOLD_BUFFER_ATR": 0.08,
+        "RANGE_ENTRY_ZONE_ATR": 0.95,
     },
     "BNBUSDT": {
         "BREAKOUT_BUFFER_PCT": 0.0011,
@@ -295,6 +304,10 @@ SYMBOL_PARAM_OVERRIDES = {
         "ATR_SL_MULT": 5.1,
         "POSITION_TP1_ATR_MULT": 7.0,
         "POSITION_TRAILING_ATR_MULT": 4.5,
+        "RISK_MULTIPLIER": 0.80,
+        "ALT_QUALITY_MIN_SCORE": 0.50,
+        "BREAKOUT_CONFIRM_BUFFER_ATR": 0.14,
+        "BREAKOUT_HOLD_BUFFER_ATR": 0.06,
     },
     "AVAXUSDT": {
         "BREAKOUT_BUFFER_PCT": 0.0015,
@@ -308,6 +321,11 @@ SYMBOL_PARAM_OVERRIDES = {
         "ATR_SL_MULT": 4.8,
         "POSITION_TP1_ATR_MULT": 6.5,
         "POSITION_TRAILING_ATR_MULT": 4.1,
+        "RISK_MULTIPLIER": 0.55,
+        "ALT_QUALITY_MIN_SCORE": 0.56,
+        "BREAKOUT_CONFIRM_BUFFER_ATR": 0.18,
+        "BREAKOUT_HOLD_BUFFER_ATR": 0.10,
+        "RANGE_ENTRY_ZONE_ATR": 1.05,
     },
 }
 
@@ -381,6 +399,53 @@ BTC_REGIME_ALT_SYMBOLS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
 BTC_REGIME_MAX_SAME_SIDE_ALT_POSITIONS = 2
 
 
+# ===== Soft BTC regime filter tuning =====
+# Делаем фильтр мягче: для альтов допускаем не только идеальное EMA20>50>200,
+# но и нейтральный BTC, если ADX уже показывает направленное движение.
+BTC_REGIME_SOFT_ADX_MIN = 14.0
+BTC_REGIME_HARD_ADX_MIN = 20.0
+BTC_REGIME_ALLOW_NEUTRAL_IF_ADX_OK = True
+BTC_REGIME_MIN_SCORE = 0.95
+
+# ===== Market state engine =====
+# trend  -> breakout
+# range  -> mean reversion
+# panic  -> no-trade
+MARKET_STATE_TREND_ADX_MIN = 22.0
+MARKET_STATE_RANGE_ADX_MAX = 18.0
+MARKET_STATE_TREND_DRIFT_MIN = 0.004
+MARKET_STATE_PANIC_ATR_PCT = 0.028
+MARKET_STATE_PANIC_WICKINESS = 0.72
+
+# ===== Range strategy =====
+RANGE_LOOKBACK = 48
+RANGE_MAX_WIDTH_PCT = 0.08
+RANGE_ENTRY_ZONE_ATR = 0.80
+RANGE_TARGET_BUFFER_ATR = 0.35
+RANGE_RSI_LONG_MAX = 36.0
+RANGE_RSI_SHORT_MIN = 64.0
+RANGE_MIN_BOUNCE_BODY_ATR = 0.15
+
+# ===== Breakout confirmation =====
+BREAKOUT_CONFIRMATION_ENABLED = True
+BREAKOUT_CONFIRM_TWO_CLOSES_FOR_ALTS = True
+BREAKOUT_CONFIRM_BUFFER_ATR = 0.12
+BREAKOUT_HOLD_BUFFER_ATR = 0.05
+
+# ===== Alt quality filter =====
+ALT_QUALITY_MIN_SCORE = 0.48
+ALT_QUALITY_ATR_LOW_PCT = 0.004
+ALT_QUALITY_ATR_HIGH_PCT = 0.03
+
+# ===== Risk tuning =====
+BASE_POSITION_RISK_MULTIPLIER = 1.0
+ALT_POSITION_RISK_MULTIPLIER = 0.70
+BTC_POSITION_RISK_MULTIPLIER = 1.00
+ETH_POSITION_RISK_MULTIPLIER = 0.85
+BNB_POSITION_RISK_MULTIPLIER = 0.80
+SOL_POSITION_RISK_MULTIPLIER = 0.65
+AVAX_POSITION_RISK_MULTIPLIER = 0.55
+
 # ===== Session / time filter =====
 # Не торгуем в наименее ликвидные часы.
 # Окна задаются в UTC в формате [(start_hour, end_hour), ...], где start включительно, end не включительно.
@@ -416,7 +481,7 @@ BINANCE_API_SECRET = _os.getenv("BINANCE_API_SECRET", "O4o0oORj7wloy6DfeuWbcOVUy
 STATE_FILE = _os.getenv("BOT_STATE_FILE", "bot_state.json")
 
 # Версия стратегии/конфига — можно использовать в логах и state
-STRATEGY_VERSION = _os.getenv("STRATEGY_VERSION", "mtf_breakout_step7_volume_momentum")
+STRATEGY_VERSION = _os.getenv("STRATEGY_VERSION", "mtf_breakout_regime_range_v1")
 
 # ===== Telegram-уведомления =====
 # Если TELEGRAM_ENABLED=1 и заданы токен и chat_id, бот будет слать уведомления.

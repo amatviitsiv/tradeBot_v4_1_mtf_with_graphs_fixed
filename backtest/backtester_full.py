@@ -77,6 +77,22 @@ class Backtester:
         alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
         return sum(1 for sym, pos in positions.items() if pos is not None and sym in alt_symbols and pos.side == side)
 
+    def _symbol_risk_multiplier(self, sym: str) -> float:
+        try:
+            sym = str(sym or '').upper()
+            specific = cfg.get_symbol_param(sym, 'RISK_MULTIPLIER', None)
+            if specific is not None:
+                return max(0.0, float(specific))
+            if sym == 'BTCUSDT':
+                return max(0.0, float(getattr(cfg, 'BTC_POSITION_RISK_MULTIPLIER', getattr(cfg, 'BASE_POSITION_RISK_MULTIPLIER', 1.0))))
+            alt_symbols = set(getattr(cfg, 'BTC_REGIME_ALT_SYMBOLS', []) or [])
+            if sym in alt_symbols:
+                key = sym.replace('USDT', '') + '_POSITION_RISK_MULTIPLIER'
+                return max(0.0, float(getattr(cfg, key, getattr(cfg, 'ALT_POSITION_RISK_MULTIPLIER', 0.7))))
+        except Exception:
+            pass
+        return max(0.0, float(getattr(cfg, 'BASE_POSITION_RISK_MULTIPLIER', 1.0)))
+
     def _record_partial_close(
         self,
         sym: str,
@@ -432,11 +448,13 @@ class Backtester:
                 if stop_distance_pct <= 0:
                     continue
 
+                risk_multiplier = self._symbol_risk_multiplier(sym)
+                eff_risk_per_trade = risk_per_trade * risk_multiplier
                 notional, qty = self.risk.calc_futures_size_from_risk(
                     equity=equity,
                     price=price,
                     stop_distance_pct=stop_distance_pct,
-                    risk_per_trade=risk_per_trade,
+                    risk_per_trade=eff_risk_per_trade,
                     leverage=leverage,
                 )
                 if notional <= 0 or qty <= 0:

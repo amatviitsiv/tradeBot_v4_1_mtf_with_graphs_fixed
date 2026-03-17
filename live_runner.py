@@ -224,6 +224,22 @@ class LiveRunner:
         alt_symbols = set(getattr(config, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
         return sum(1 for sym, pos in self._positions.items() if pos is not None and sym in alt_symbols and pos.side == side)
 
+    def _symbol_risk_multiplier(self, symbol: str) -> float:
+        try:
+            symbol = str(symbol or '').upper()
+            specific = config.get_symbol_param(symbol, 'RISK_MULTIPLIER', None)
+            if specific is not None:
+                return max(0.0, float(specific))
+            if symbol == 'BTCUSDT':
+                return max(0.0, float(getattr(config, 'BTC_POSITION_RISK_MULTIPLIER', getattr(config, 'BASE_POSITION_RISK_MULTIPLIER', 1.0))))
+            alt_symbols = set(getattr(config, 'BTC_REGIME_ALT_SYMBOLS', []) or [])
+            if symbol in alt_symbols:
+                key = symbol.replace('USDT', '') + '_POSITION_RISK_MULTIPLIER'
+                return max(0.0, float(getattr(config, key, getattr(config, 'ALT_POSITION_RISK_MULTIPLIER', 0.7))))
+        except Exception:
+            pass
+        return max(0.0, float(getattr(config, 'BASE_POSITION_RISK_MULTIPLIER', 1.0)))
+
     async def _run_strategy_if_ready(self, symbol: str) -> None:
         """Запускается при закрытии M15 свечи.
 
@@ -513,11 +529,13 @@ class LiveRunner:
 
         stop_distance_abs = atr_sl_mult * atr
         stop_distance_pct = stop_distance_abs / price * 100.0
+        risk_multiplier = self._symbol_risk_multiplier(symbol)
+        eff_risk_per_trade = risk_per_trade * risk_multiplier
         notional, qty = self._risk.calc_futures_size_from_risk(
             equity=equity,
             price=price,
             stop_distance_pct=stop_distance_pct,
-            risk_per_trade=risk_per_trade,
+            risk_per_trade=eff_risk_per_trade,
             leverage=leverage,
         )
         if notional <= 0 or qty <= 0:
