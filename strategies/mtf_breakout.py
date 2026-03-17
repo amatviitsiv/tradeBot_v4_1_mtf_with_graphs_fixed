@@ -1035,6 +1035,21 @@ class MTFBreakoutStrategy(BaseStrategy):
             "side": side,
         }
 
+
+    def _btc_short_context_ok(self, symbol: str, regime: str, market_state: str, adx_h: float, rsi_h: float, drift: float, btc_score: float | None = None) -> tuple[bool, dict]:
+        btc_symbol = str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
+        if symbol != btc_symbol:
+            return True, {"reason": "not_btc_symbol"}
+        if not self._symbol_flag(symbol, "BTC_SHORTS_ONLY_STRONG_BEAR", bool(getattr(cfg, "BTC_SHORTS_ONLY_STRONG_BEAR", True))):
+            return True, {"reason": "btc_short_gate_disabled"}
+        min_adx = cfg.get_symbol_param_float(symbol, "BTC_SHORT_MIN_HTF_ADX", float(getattr(cfg, "BTC_SHORT_MIN_HTF_ADX", 24.0)))
+        min_drift = cfg.get_symbol_param_float(symbol, "BTC_SHORT_MIN_DRIFT_PCT", float(getattr(cfg, "BTC_SHORT_MIN_DRIFT_PCT", 0.010)))
+        max_rsi = cfg.get_symbol_param_float(symbol, "BTC_SHORT_MAX_HTF_RSI", float(getattr(cfg, "BTC_SHORT_MAX_HTF_RSI", 48.0)))
+        min_score = cfg.get_symbol_param_float(symbol, "BTC_SHORT_MIN_BTC_SCORE", float(getattr(cfg, "BTC_SHORT_MIN_BTC_SCORE", 1.05)))
+        score = float(btc_score if btc_score is not None else 999.0)
+        ok = bool(regime == "bear" and market_state == "trend" and adx_h >= min_adx and drift >= min_drift and rsi_h <= max_rsi and score >= min_score)
+        return ok, {"regime": regime, "market_state": market_state, "adx_h": adx_h, "drift": drift, "rsi_h": rsi_h, "btc_score": score, "min_adx": min_adx, "min_drift": min_drift, "max_rsi": max_rsi, "min_score": min_score}
+
     def _range_signal(self, symbol: str, df: pd.DataFrame, recent: pd.DataFrame, close: float, atr_ltf: float, adx_h: float, market_meta: dict) -> tuple[Optional[str], dict]:
         if len(recent) < 20 or atr_ltf <= 0 or close <= 0:
             return None, {"reason": "not_enough_range_history"}
@@ -1342,10 +1357,13 @@ class MTFBreakoutStrategy(BaseStrategy):
             fake_short_ok, fake_short_meta = self._check_fakeout_reversal_entry(symbol=symbol, df=df, recent=recent, side="short", range_high=range_high, range_low=range_low, atr_ltf=atr_ltf, adx_h=adx_h)
             if fake_short_ok:
                 if symbol == str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")) or not bool(getattr(cfg, "ALT_SHORTS_REQUIRE_STRONG_BTC_BEAR", True)):
-                    return self._set_signal("sell", trade_type="fakeout", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_FAKEOUT", float(getattr(cfg, "RISK_MULTIPLIER_FAKEOUT", 0.50)))), market_state=market_state, fakeout_meta=fake_short_meta, side="short")
+                    btc_short_ctx_ok, btc_short_ctx_meta = self._btc_short_context_ok(symbol=symbol, regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift)
+                    if btc_short_ctx_ok:
+                        return self._set_signal("sell", trade_type="fakeout", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_FAKEOUT", float(getattr(cfg, "RISK_MULTIPLIER_FAKEOUT", 0.50)))), market_state=market_state, fakeout_meta=fake_short_meta, btc_short_ctx=btc_short_ctx_meta, side="short")
                 btc_short_ok, btc_short_meta = self._check_btc_regime_filter(df, symbol=symbol, side="short")
-                if btc_short_ok:
-                    return self._set_signal("sell", trade_type="fakeout", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_FAKEOUT", float(getattr(cfg, "RISK_MULTIPLIER_FAKEOUT", 0.50)))), market_state=market_state, fakeout_meta=fake_short_meta, btc_meta=btc_short_meta, side="short")
+                btc_short_ctx_ok, btc_short_ctx_meta = self._btc_short_context_ok(symbol=symbol, regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=float(btc_short_meta.get("score", 0.0)))
+                if btc_short_ok and btc_short_ctx_ok:
+                    return self._set_signal("sell", trade_type="fakeout", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_FAKEOUT", float(getattr(cfg, "RISK_MULTIPLIER_FAKEOUT", 0.50)))), market_state=market_state, fakeout_meta=fake_short_meta, btc_meta=btc_short_meta, btc_short_ctx=btc_short_ctx_meta, side="short")
 
         if market_state == "range":
             range_sig, range_meta = self._range_signal(
@@ -1492,12 +1510,13 @@ class MTFBreakoutStrategy(BaseStrategy):
                 cont_comp_ok, cont_comp_meta = (False, {"disabled": True})
                 if self._symbol_flag(symbol, "ENABLE_CONT_COMP", False):
                     cont_comp_ok, cont_comp_meta = self._check_continuation_compression_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
-                if btc_ok and alt_ok and rs_ok and cont_comp_ok and allow_short:
-                    return self._set_signal("sell", trade_type="cont_compression", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONT_COMP", float(getattr(cfg, "RISK_MULTIPLIER_CONT_COMP", 0.75)))), market_state=market_state, cont_comp_meta=cont_comp_meta, side="short")
+                btc_short_ctx_ok, btc_short_ctx_meta = self._btc_short_context_ok(symbol=symbol, regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=float(btc_meta.get("score", 0.0)))
+                if btc_ok and alt_ok and rs_ok and cont_comp_ok and allow_short and btc_short_ctx_ok:
+                    return self._set_signal("sell", trade_type="cont_compression", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONT_COMP", float(getattr(cfg, "RISK_MULTIPLIER_CONT_COMP", 0.75)))), market_state=market_state, cont_comp_meta=cont_comp_meta, btc_short_ctx=btc_short_ctx_meta, side="short")
                 cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
-                if btc_ok and alt_ok and rs_ok and cont_ok and allow_short:
+                if btc_ok and alt_ok and rs_ok and cont_ok and allow_short and btc_short_ctx_ok:
                     logger.debug("[MTF] SELL continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
-                    return self._set_signal("sell", trade_type="continuation", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONTINUATION", float(getattr(cfg, "RISK_MULTIPLIER_CONTINUATION", 0.65)))), market_state=market_state, cont_meta=cont_meta, side="short")
+                    return self._set_signal("sell", trade_type="continuation", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONTINUATION", float(getattr(cfg, "RISK_MULTIPLIER_CONTINUATION", 0.65)))), market_state=market_state, cont_meta=cont_meta, btc_short_ctx=btc_short_ctx_meta, side="short")
 
         if market_state != "trend":
             return None
@@ -1575,6 +1594,10 @@ class MTFBreakoutStrategy(BaseStrategy):
                 if float(btc_meta.get("score", 0.0)) < btc_short_min:
                     logger.debug("[MTF] skip SELL weak BTC bear context: %s", btc_meta)
                     return None
+            btc_short_ctx_ok, btc_short_ctx_meta = self._btc_short_context_ok(symbol=symbol, regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=float(btc_meta.get("score", 0.0)))
+            if not btc_short_ctx_ok:
+                logger.debug("[MTF] skip SELL by BTC short context: %s", btc_short_ctx_meta)
+                return None
             confirm_ok, confirm_meta = self._check_breakout_confirmation(
                 symbol=symbol, df=df, side="short", trigger=short_trigger, range_high=range_high, range_low=range_low, atr_ltf=atr_ltf
             )
@@ -1617,6 +1640,6 @@ class MTFBreakoutStrategy(BaseStrategy):
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),
             )
-            return self._set_signal("sell", trade_type="impulse", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_IMPULSE", float(getattr(cfg, "RISK_MULTIPLIER_IMPULSE", 1.00)))), market_state=market_state, impulse_meta=impulse_meta, side="short")
+            return self._set_signal("sell", trade_type="impulse", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_IMPULSE", float(getattr(cfg, "RISK_MULTIPLIER_IMPULSE", 1.00)))), market_state=market_state, impulse_meta=impulse_meta, btc_short_ctx=btc_short_ctx_meta, side="short")
 
         return None
