@@ -858,6 +858,174 @@ class MTFBreakoutStrategy(BaseStrategy):
             "side": side,
         }
 
+    def _check_continuation_compression_entry(self, symbol: str, df: pd.DataFrame, side: str, atr_ltf: float) -> tuple[bool, dict]:
+        if len(df) < 140 or atr_ltf <= 0:
+            return False, {"reason": "not_enough_cont_comp_history"}
+        need_cols = {"EMA20", "EMA50", "EMA200", "open", "high", "low", "close", "volume", "RSI", "ATR", "HTF_ADX"}
+        if not need_cols.issubset(df.columns):
+            return False, {"reason": "missing_cont_comp_cols"}
+        try:
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            recent6 = df.iloc[-7:-1].copy()
+            prev12 = df.iloc[-19:-7].copy()
+            ema20 = float(last.get("EMA20", np.nan))
+            ema50 = float(last.get("EMA50", np.nan))
+            ema200 = float(last.get("EMA200", np.nan))
+            close = float(last.get("close", np.nan))
+            open_ = float(last.get("open", np.nan))
+            high = float(last.get("high", np.nan))
+            low = float(last.get("low", np.nan))
+            prev_close = float(prev.get("close", np.nan))
+            prev_open = float(prev.get("open", np.nan))
+            prev_high = float(prev.get("high", np.nan))
+            prev_low = float(prev.get("low", np.nan))
+            rsi = float(last.get("RSI", np.nan))
+            htf_adx = float(last.get("HTF_ADX", np.nan))
+        except Exception:
+            return False, {"reason": "bad_cont_comp_values"}
+        vals = [ema20, ema50, ema200, close, open_, high, low, prev_close, prev_open, prev_high, prev_low, rsi, htf_adx]
+        if any(np.isnan(x) for x in vals):
+            return False, {"reason": "nan_cont_comp_values"}
+
+        trend_ok = (ema20 > ema50 > ema200) if side == "long" else (ema20 < ema50 < ema200)
+        if not trend_ok:
+            return False, {"reason": "ltf_alignment_fail"}
+
+        body = abs(close - open_)
+        rng = max(high - low, 0.0)
+        prev_rng = max(prev_high - prev_low, 1e-9)
+        if rng <= 0:
+            return False, {"reason": "zero_range"}
+
+        try:
+            comp_rng = float((recent6["high"].astype(float) - recent6["low"].astype(float)).mean())
+            base_rng = float((prev12["high"].astype(float) - prev12["low"].astype(float)).mean())
+            comp_atr = float(recent6["ATR"].astype(float).mean())
+            base_atr = float(prev12["ATR"].astype(float).mean())
+            vol_ema = float(df["volume"].astype(float).ewm(span=12, adjust=False).mean().iloc[-1])
+            vol_ratio = float(last.get("volume", 0.0)) / max(vol_ema, 1e-9)
+        except Exception:
+            return False, {"reason": "cont_comp_calc_exception"}
+
+        compression_ratio = comp_rng / max(base_rng, 1e-9)
+        atr_compression_ratio = comp_atr / max(base_atr, 1e-9)
+        max_compression_ratio = cfg.get_symbol_param_float(symbol, "CONT_COMP_MAX_COMPRESSION_RATIO", float(getattr(cfg, "CONT_COMP_MAX_COMPRESSION_RATIO", 0.82)))
+        max_atr_comp_ratio = cfg.get_symbol_param_float(symbol, "CONT_COMP_MAX_ATR_RATIO", float(getattr(cfg, "CONT_COMP_MAX_ATR_RATIO", 0.90)))
+        min_body_atr = cfg.get_symbol_param_float(symbol, "CONT_COMP_MIN_BODY_ATR", float(getattr(cfg, "CONT_COMP_MIN_BODY_ATR", 0.42)))
+        min_range_atr = cfg.get_symbol_param_float(symbol, "CONT_COMP_MIN_RANGE_ATR", float(getattr(cfg, "CONT_COMP_MIN_RANGE_ATR", 0.80)))
+        min_vol_ratio = cfg.get_symbol_param_float(symbol, "CONT_COMP_MIN_VOL_RATIO", float(getattr(cfg, "CONT_COMP_MIN_VOL_RATIO", 1.02)))
+        min_htf_adx = cfg.get_symbol_param_float(symbol, "CONT_COMP_MIN_HTF_ADX", float(getattr(cfg, "CONT_COMP_MIN_HTF_ADX", 18.0)))
+        pullback_touch_atr = cfg.get_symbol_param_float(symbol, "CONT_COMP_TOUCH_ATR", float(getattr(cfg, "CONT_COMP_TOUCH_ATR", 0.45)))
+        break_prev_factor = cfg.get_symbol_param_float(symbol, "CONT_COMP_BREAK_PREV_FACTOR", float(getattr(cfg, "CONT_COMP_BREAK_PREV_FACTOR", 0.15)))
+        close_pos = (close - low) / rng
+        if side == "short":
+            close_pos = 1.0 - close_pos
+
+        if side == "long":
+            touch_ok = min(low, prev_low) <= ema20 + atr_ltf * pullback_touch_atr
+            expansion_ok = close > open_ and close > prev_high + atr_ltf * break_prev_factor and close_pos >= 0.60
+            rsi_ok = 47.0 <= rsi <= cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_LONG_MAX", float(getattr(cfg, "CONTINUATION_RSI_LONG_MAX", 63.0))) + 4.0
+        else:
+            touch_ok = max(high, prev_high) >= ema20 - atr_ltf * pullback_touch_atr
+            expansion_ok = close < open_ and close < prev_low - atr_ltf * break_prev_factor and close_pos >= 0.60
+            rsi_ok = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_SHORT_MIN", float(getattr(cfg, "CONTINUATION_RSI_SHORT_MIN", 37.0))) - 4.0 <= rsi <= 53.0
+
+        ok = bool(
+            compression_ratio <= max_compression_ratio
+            and atr_compression_ratio <= max_atr_comp_ratio
+            and touch_ok
+            and expansion_ok
+            and body >= atr_ltf * min_body_atr
+            and rng >= atr_ltf * min_range_atr
+            and vol_ratio >= min_vol_ratio
+            and htf_adx >= min_htf_adx
+            and rsi_ok
+        )
+        return ok, {
+            "compression_ratio": compression_ratio,
+            "atr_compression_ratio": atr_compression_ratio,
+            "touch_ok": touch_ok,
+            "expansion_ok": expansion_ok,
+            "vol_ratio": vol_ratio,
+            "htf_adx": htf_adx,
+            "rsi": rsi,
+            "body": body,
+            "range": rng,
+            "side": side,
+        }
+
+    def _check_fakeout_reversal_entry(self, symbol: str, df: pd.DataFrame, recent: pd.DataFrame, side: str, range_high: float, range_low: float, atr_ltf: float, adx_h: float) -> tuple[bool, dict]:
+        if len(df) < 60 or len(recent) < 20 or atr_ltf <= 0:
+            return False, {"reason": "not_enough_fakeout_history"}
+        try:
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            open_ = float(last.get("open", np.nan))
+            high = float(last.get("high", np.nan))
+            low = float(last.get("low", np.nan))
+            close = float(last.get("close", np.nan))
+            prev_open = float(prev.get("open", np.nan))
+            prev_high = float(prev.get("high", np.nan))
+            prev_low = float(prev.get("low", np.nan))
+            prev_close = float(prev.get("close", np.nan))
+            rsi = float(last.get("RSI", np.nan))
+            volume = float(last.get("volume", 0.0))
+            vol_ema = float(df["volume"].astype(float).ewm(span=12, adjust=False).mean().iloc[-1])
+        except Exception:
+            return False, {"reason": "bad_fakeout_values"}
+        vals=[open_,high,low,close,prev_open,prev_high,prev_low,prev_close,rsi,volume,vol_ema,adx_h]
+        if any(np.isnan(x) for x in vals):
+            return False, {"reason": "nan_fakeout_values"}
+
+        rng = max(high - low, 1e-9)
+        body = abs(close - open_)
+        close_pos = (close - low) / rng
+        wick_break = 0.0
+        pierced = False
+        reclaimed = False
+        rejection_ok = False
+        rsi_ok = False
+        fakeout_buf = cfg.get_symbol_param_float(symbol, "FAKEOUT_PIERCE_ATR", float(getattr(cfg, "FAKEOUT_PIERCE_ATR", 0.16)))
+        min_body_atr = cfg.get_symbol_param_float(symbol, "FAKEOUT_MIN_BODY_ATR", float(getattr(cfg, "FAKEOUT_MIN_BODY_ATR", 0.28)))
+        min_vol_ratio = cfg.get_symbol_param_float(symbol, "FAKEOUT_MIN_VOL_RATIO", float(getattr(cfg, "FAKEOUT_MIN_VOL_RATIO", 0.90)))
+        max_adx = cfg.get_symbol_param_float(symbol, "FAKEOUT_MAX_ADX", float(getattr(cfg, "FAKEOUT_MAX_ADX", 24.0)))
+        rsi_long_max = cfg.get_symbol_param_float(symbol, "FAKEOUT_RSI_LONG_MAX", float(getattr(cfg, "FAKEOUT_RSI_LONG_MAX", 32.0)))
+        rsi_short_min = cfg.get_symbol_param_float(symbol, "FAKEOUT_RSI_SHORT_MIN", float(getattr(cfg, "FAKEOUT_RSI_SHORT_MIN", 68.0)))
+
+        if side == "long":
+            pierced = min(low, prev_low) <= range_low - atr_ltf * fakeout_buf
+            reclaimed = close >= range_low and prev_close <= range_low + atr_ltf * 0.10
+            rejection_ok = close > open_ and close_pos >= 0.62 and (range_low - low) >= body * 0.8
+            rsi_ok = rsi <= rsi_long_max
+            wick_break = max(0.0, range_low - low)
+        else:
+            close_pos = 1.0 - close_pos
+            pierced = max(high, prev_high) >= range_high + atr_ltf * fakeout_buf
+            reclaimed = close <= range_high and prev_close >= range_high - atr_ltf * 0.10
+            rejection_ok = close < open_ and close_pos >= 0.62 and (high - range_high) >= body * 0.8
+            rsi_ok = rsi >= rsi_short_min
+            wick_break = max(0.0, high - range_high)
+
+        vol_ratio = volume / max(vol_ema, 1e-9)
+        ok = bool(
+            pierced and reclaimed and rejection_ok and rsi_ok
+            and body >= atr_ltf * min_body_atr
+            and vol_ratio >= min_vol_ratio
+            and adx_h <= max_adx
+        )
+        return ok, {
+            "pierced": pierced,
+            "reclaimed": reclaimed,
+            "rejection_ok": rejection_ok,
+            "rsi_ok": rsi_ok,
+            "vol_ratio": vol_ratio,
+            "adx_h": adx_h,
+            "body": body,
+            "wick_break": wick_break,
+            "side": side,
+        }
+
     def _range_signal(self, symbol: str, df: pd.DataFrame, recent: pd.DataFrame, close: float, atr_ltf: float, adx_h: float, market_meta: dict) -> tuple[Optional[str], dict]:
         if len(recent) < 20 or atr_ltf <= 0 or close <= 0:
             return None, {"reason": "not_enough_range_history"}
@@ -1158,6 +1326,18 @@ class MTFBreakoutStrategy(BaseStrategy):
         long_trigger = range_high * (1.0 + buf)
         short_trigger = range_low * (1.0 - buf)
 
+        if market_state in {"range", "transition"}:
+            fake_long_ok, fake_long_meta = self._check_fakeout_reversal_entry(symbol=symbol, df=df, recent=recent, side="long", range_high=range_high, range_low=range_low, atr_ltf=atr_ltf, adx_h=adx_h)
+            if fake_long_ok:
+                return self._set_signal("buy", trade_type="fakeout", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_FAKEOUT", float(getattr(cfg, "RISK_MULTIPLIER_FAKEOUT", 0.50)))), market_state=market_state, fakeout_meta=fake_long_meta, side="long")
+            fake_short_ok, fake_short_meta = self._check_fakeout_reversal_entry(symbol=symbol, df=df, recent=recent, side="short", range_high=range_high, range_low=range_low, atr_ltf=atr_ltf, adx_h=adx_h)
+            if fake_short_ok:
+                if symbol == str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")) or not bool(getattr(cfg, "ALT_SHORTS_REQUIRE_STRONG_BTC_BEAR", True)):
+                    return self._set_signal("sell", trade_type="fakeout", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_FAKEOUT", float(getattr(cfg, "RISK_MULTIPLIER_FAKEOUT", 0.50)))), market_state=market_state, fakeout_meta=fake_short_meta, side="short")
+                btc_short_ok, btc_short_meta = self._check_btc_regime_filter(df, symbol=symbol, side="short")
+                if btc_short_ok:
+                    return self._set_signal("sell", trade_type="fakeout", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_FAKEOUT", float(getattr(cfg, "RISK_MULTIPLIER_FAKEOUT", 0.50)))), market_state=market_state, fakeout_meta=fake_short_meta, btc_meta=btc_short_meta, side="short")
+
         if market_state == "range":
             range_sig, range_meta = self._range_signal(
                 symbol=symbol,
@@ -1283,6 +1463,9 @@ class MTFBreakoutStrategy(BaseStrategy):
                 btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="long")
                 alt_ok, alt_meta = self._calc_alt_quality_score(symbol=symbol, recent=recent, atr_ltf=atr_ltf, side="long")
                 rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="long")
+                cont_comp_ok, cont_comp_meta = self._check_continuation_compression_entry(symbol=symbol, df=df, side="long", atr_ltf=atr_ltf)
+                if btc_ok and alt_ok and rs_ok and cont_comp_ok:
+                    return self._set_signal("buy", trade_type="cont_compression", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONT_COMP", float(getattr(cfg, "RISK_MULTIPLIER_CONT_COMP", 0.75)))), market_state=market_state, cont_comp_meta=cont_comp_meta, side="long")
                 cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="long", atr_ltf=atr_ltf)
                 if btc_ok and alt_ok and rs_ok and cont_ok:
                     logger.debug("[MTF] BUY continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
@@ -1291,11 +1474,14 @@ class MTFBreakoutStrategy(BaseStrategy):
                 btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="short")
                 alt_ok, alt_meta = self._calc_alt_quality_score(symbol=symbol, recent=recent, atr_ltf=atr_ltf, side="short")
                 rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="short")
-                cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
                 allow_short = True
                 if symbol != str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")) and bool(getattr(cfg, "ALT_SHORTS_REQUIRE_STRONG_BTC_BEAR", True)):
                     btc_short_min = float(getattr(cfg, "BTC_REGIME_MIN_SCORE_SHORT", max(float(getattr(cfg, "BTC_REGIME_MIN_SCORE", 0.95)), 1.05)))
                     allow_short = float(btc_meta.get("score", 0.0)) >= btc_short_min
+                cont_comp_ok, cont_comp_meta = self._check_continuation_compression_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
+                if btc_ok and alt_ok and rs_ok and cont_comp_ok and allow_short:
+                    return self._set_signal("sell", trade_type="cont_compression", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONT_COMP", float(getattr(cfg, "RISK_MULTIPLIER_CONT_COMP", 0.75)))), market_state=market_state, cont_comp_meta=cont_comp_meta, side="short")
+                cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
                 if btc_ok and alt_ok and rs_ok and cont_ok and allow_short:
                     logger.debug("[MTF] SELL continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
                     return self._set_signal("sell", trade_type="continuation", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONTINUATION", float(getattr(cfg, "RISK_MULTIPLIER_CONTINUATION", 0.65)))), market_state=market_state, cont_meta=cont_meta, side="short")
