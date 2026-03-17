@@ -201,6 +201,7 @@ class LiveRunner:
         if df_btc_1h is None or df_btc_1h.empty:
             for col in htf_cols:
                 df_15_idx[f"BTC_HTF_{col}"] = pd.NA
+            df_15_idx["BTC_close"] = pd.NA
             return df_15_idx
 
         try:
@@ -214,10 +215,12 @@ class LiveRunner:
             for col in htf_cols:
                 out_col = f"BTC_HTF_{col}"
                 df_15_idx[out_col] = df_btc_sync[col] if col in df_btc_sync.columns else pd.NA
+            df_15_idx["BTC_close"] = df_btc_sync["close"] if "close" in df_btc_sync.columns else pd.NA
         except Exception as e:
             logger.exception("[RUNNER] failed to attach BTC regime columns: %s", e)
             for col in htf_cols:
                 df_15_idx[f"BTC_HTF_{col}"] = pd.NA
+            df_15_idx["BTC_close"] = pd.NA
         return df_15_idx
 
     def _count_same_side_alt_positions(self, side: str) -> int:

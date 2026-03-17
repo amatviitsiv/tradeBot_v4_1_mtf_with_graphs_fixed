@@ -460,7 +460,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 "compression_ratio": compression_ratio,
             }
 
-        if adx_h <= range_adx_max and range_width <= range_max_width:
+        if adx_h <= range_adx_max and range_width <= range_max_width and compression_ratio <= float(getattr(cfg, "RANGE_MAX_COMPRESSION_RATIO", 1.12)):
             return "range", {
                 "atr_pct_h": atr_pct_h,
                 "atr_pct_ltf": atr_pct_ltf,
@@ -470,13 +470,109 @@ class MTFBreakoutStrategy(BaseStrategy):
                 "compression_ratio": compression_ratio,
             }
 
-        return ("trend" if regime != "none" else "range"), {
+        transition_false_breakout = float(getattr(cfg, "MARKET_STATE_TRANSITION_FALSE_BREAKOUT_MIN", 0.58))
+        transition_wickiness = float(getattr(cfg, "MARKET_STATE_TRANSITION_WICKINESS_MIN", 0.62))
+        if regime == "none" or false_breakout_ratio >= transition_false_breakout or wickiness >= transition_wickiness:
+            return "transition", {
+                "atr_pct_h": atr_pct_h,
+                "atr_pct_ltf": atr_pct_ltf,
+                "wickiness": wickiness,
+                "false_breakout_ratio": false_breakout_ratio,
+                "range_width": range_width,
+                "compression_ratio": compression_ratio,
+            }
+
+        return "trend", {
             "atr_pct_h": atr_pct_h,
             "atr_pct_ltf": atr_pct_ltf,
             "wickiness": wickiness,
             "false_breakout_ratio": false_breakout_ratio,
             "range_width": range_width,
             "compression_ratio": compression_ratio,
+        }
+
+    def _check_relative_strength_filter(self, df: pd.DataFrame, symbol: str, side: str) -> tuple[bool, dict]:
+        btc_symbol = str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
+        if not symbol or symbol == btc_symbol:
+            return True, {"skipped": True, "score": 1.0}
+        if "BTC_close" not in df.columns:
+            return True, {"skipped": True, "reason": "missing_btc_close"}
+        try:
+            lookback = int(cfg.get_symbol_param_int(symbol, "REL_STRENGTH_LOOKBACK", int(getattr(cfg, "REL_STRENGTH_LOOKBACK", 48))))
+            ema_span = int(cfg.get_symbol_param_int(symbol, "REL_STRENGTH_EMA", int(getattr(cfg, "REL_STRENGTH_EMA", 34))))
+            min_ratio = float(cfg.get_symbol_param_float(symbol, "REL_STRENGTH_MIN_RATIO", float(getattr(cfg, "REL_STRENGTH_MIN_RATIO", 1.002))))
+            min_slope = float(cfg.get_symbol_param_float(symbol, "REL_STRENGTH_MIN_SLOPE", float(getattr(cfg, "REL_STRENGTH_MIN_SLOPE", 0.0))))
+            short_max_ratio = float(cfg.get_symbol_param_float(symbol, "REL_STRENGTH_SHORT_MAX_RATIO", float(getattr(cfg, "REL_STRENGTH_SHORT_MAX_RATIO", 0.998))))
+            short_min_slope = float(cfg.get_symbol_param_float(symbol, "REL_STRENGTH_SHORT_MIN_SLOPE", float(getattr(cfg, "REL_STRENGTH_SHORT_MIN_SLOPE", 0.0))))
+            recent = df.tail(max(lookback + 5, ema_span + 5)).copy()
+            alt_close = recent["close"].astype(float)
+            btc_close = recent["BTC_close"].astype(float)
+            rs = (alt_close / btc_close.replace(0.0, np.nan)).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(rs) < max(lookback // 2, 12):
+                return True, {"skipped": True, "reason": "short_rs_history"}
+            rs_now = float(rs.iloc[-1])
+            rs_ema = float(rs.ewm(span=max(5, ema_span), adjust=False).mean().iloc[-1])
+            rs_prev = float(rs.iloc[-min(len(rs), lookback)])
+            slope = (rs_now - rs_prev) / abs(rs_prev) if rs_prev != 0 else 0.0
+        except Exception as exc:
+            return True, {"skipped": True, "reason": "rs_exception", "error": str(exc)}
+
+        ratio = rs_now / rs_ema if rs_ema != 0 else 1.0
+        if side == "long":
+            ok = ratio >= min_ratio and slope >= min_slope
+        else:
+            ok = ratio <= short_max_ratio and slope <= short_min_slope
+        return ok, {
+            "rs_now": rs_now,
+            "rs_ema": rs_ema,
+            "ratio": ratio,
+            "slope": slope,
+            "side": side,
+        }
+
+    def _check_impulse_breakout(self, symbol: str, recent: pd.DataFrame, candle: pd.Series, side: str, trigger: float, atr_ltf: float) -> tuple[bool, dict]:
+        try:
+            open_ = float(candle.get("open"))
+            high = float(candle.get("high"))
+            low = float(candle.get("low"))
+            close = float(candle.get("close"))
+        except (TypeError, ValueError):
+            return False, {"reason": "bad_impulse_ohlc"}
+        if atr_ltf <= 0:
+            return False, {"reason": "bad_atr"}
+
+        body = abs(close - open_)
+        rng = max(high - low, 0.0)
+        excursion = (close - trigger) if side == "long" else (trigger - close)
+        min_body_atr = cfg.get_symbol_param_float(symbol, "IMPULSE_BREAKOUT_MIN_BODY_ATR", float(getattr(cfg, "IMPULSE_BREAKOUT_MIN_BODY_ATR", 0.85)))
+        min_range_atr = cfg.get_symbol_param_float(symbol, "IMPULSE_BREAKOUT_MIN_RANGE_ATR", float(getattr(cfg, "IMPULSE_BREAKOUT_MIN_RANGE_ATR", 1.20)))
+        min_excursion_atr = cfg.get_symbol_param_float(symbol, "IMPULSE_BREAKOUT_MIN_EXCURSION_ATR", float(getattr(cfg, "IMPULSE_BREAKOUT_MIN_EXCURSION_ATR", 0.18)))
+        min_close_pos = cfg.get_symbol_param_float(symbol, "IMPULSE_BREAKOUT_MIN_CLOSE_POS", float(getattr(cfg, "IMPULSE_BREAKOUT_MIN_CLOSE_POS", 0.68)))
+        if rng <= 0.0:
+            return False, {"reason": "zero_range"}
+        close_pos = (close - low) / rng
+        if side == "short":
+            close_pos = 1.0 - close_pos
+
+        atr_series = recent["ATR"].astype(float).dropna() if "ATR" in recent.columns else pd.Series(dtype=float)
+        atr_ma = float(atr_series.tail(min(12, len(atr_series))).mean()) if len(atr_series) > 0 else atr_ltf
+        atr_expanding = atr_ltf >= atr_ma * float(getattr(cfg, "IMPULSE_BREAKOUT_MIN_ATR_EXPANSION", 1.02))
+
+        ok = (
+            body >= atr_ltf * min_body_atr
+            and rng >= atr_ltf * min_range_atr
+            and excursion >= atr_ltf * min_excursion_atr
+            and close_pos >= min_close_pos
+            and atr_expanding
+        )
+        return ok, {
+            "body": body,
+            "range": rng,
+            "excursion": excursion,
+            "close_pos": close_pos,
+            "atr": atr_ltf,
+            "atr_ma": atr_ma,
+            "atr_expanding": atr_expanding,
         }
 
     def _calc_alt_quality_score(self, symbol: str, recent: pd.DataFrame, atr_ltf: float, side: str) -> tuple[bool, dict]:
@@ -508,11 +604,11 @@ class MTFBreakoutStrategy(BaseStrategy):
         else:
             atr_score = 1.0
         score = (
-            0.32 * max(0.0, 1.0 - wickiness) +
-            0.28 * max(0.0, 1.0 - false_breakout_ratio) +
-            0.20 * max(0.0, min(1.0, directional_eff)) +
-            0.10 * max(0.0, min(1.0, body_share * 1.6)) +
-            0.10 * atr_score
+            0.34 * max(0.0, 1.0 - wickiness) +
+            0.30 * max(0.0, 1.0 - false_breakout_ratio) +
+            0.18 * max(0.0, min(1.0, directional_eff)) +
+            0.10 * max(0.0, min(1.0, body_share * 1.8)) +
+            0.08 * atr_score
         )
         threshold = cfg.get_symbol_param_float(symbol, "ALT_QUALITY_MIN_SCORE", float(getattr(cfg, "ALT_QUALITY_MIN_SCORE", 0.48)))
         return score >= threshold, {
@@ -625,7 +721,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         elif adx >= soft_adx_min:
             score += 0.20
 
-        threshold = float(getattr(cfg, "BTC_REGIME_MIN_SCORE", 0.95))
+        threshold = float(getattr(cfg, "BTC_REGIME_MIN_SCORE_LONG", getattr(cfg, "BTC_REGIME_MIN_SCORE", 0.80))) if side == "long" else float(getattr(cfg, "BTC_REGIME_MIN_SCORE_SHORT", max(float(getattr(cfg, "BTC_REGIME_MIN_SCORE", 0.80)), 1.05)))
         ok = score >= threshold
         return ok, {
             "btc_regime": btc_regime,
@@ -663,31 +759,48 @@ class MTFBreakoutStrategy(BaseStrategy):
 
         entry_zone_atr = cfg.get_symbol_param_float(symbol, "RANGE_ENTRY_ZONE_ATR", float(getattr(cfg, "RANGE_ENTRY_ZONE_ATR", 0.8)))
         target_buffer_atr = cfg.get_symbol_param_float(symbol, "RANGE_TARGET_BUFFER_ATR", float(getattr(cfg, "RANGE_TARGET_BUFFER_ATR", 0.35)))
-        rsi_long_max = cfg.get_symbol_param_float(symbol, "RANGE_RSI_LONG_MAX", float(getattr(cfg, "RANGE_RSI_LONG_MAX", 36.0)))
-        rsi_short_min = cfg.get_symbol_param_float(symbol, "RANGE_RSI_SHORT_MIN", float(getattr(cfg, "RANGE_RSI_SHORT_MIN", 64.0)))
-        min_bounce_body_atr = cfg.get_symbol_param_float(symbol, "RANGE_MIN_BOUNCE_BODY_ATR", float(getattr(cfg, "RANGE_MIN_BOUNCE_BODY_ATR", 0.15)))
+        rsi_long_max = cfg.get_symbol_param_float(symbol, "RANGE_RSI_LONG_MAX", float(getattr(cfg, "RANGE_RSI_LONG_MAX", 32.0)))
+        rsi_short_min = cfg.get_symbol_param_float(symbol, "RANGE_RSI_SHORT_MIN", float(getattr(cfg, "RANGE_RSI_SHORT_MIN", 68.0)))
+        min_bounce_body_atr = cfg.get_symbol_param_float(symbol, "RANGE_MIN_BOUNCE_BODY_ATR", float(getattr(cfg, "RANGE_MIN_BOUNCE_BODY_ATR", 0.28)))
+        min_stretch_atr = cfg.get_symbol_param_float(symbol, "RANGE_MIN_STRETCH_FROM_MEAN_ATR", float(getattr(cfg, "RANGE_MIN_STRETCH_FROM_MEAN_ATR", 1.25)))
+        max_state_wickiness = float(getattr(cfg, "RANGE_MAX_STATE_WICKINESS", 0.58))
+        max_state_false_breakout = float(getattr(cfg, "RANGE_MAX_STATE_FALSE_BREAKOUT", 0.45))
+        max_compression_ratio = float(getattr(cfg, "RANGE_MAX_COMPRESSION_RATIO", 1.12))
+        max_adx = float(getattr(cfg, "RANGE_ENTRY_ADX_MAX", getattr(cfg, "MARKET_STATE_RANGE_ADX_MAX", 18.0)))
+        bounce_close_pos_min = cfg.get_symbol_param_float(symbol, "RANGE_BOUNCE_MIN_CLOSE_POS", float(getattr(cfg, "RANGE_BOUNCE_MIN_CLOSE_POS", 0.58)))
 
         lower_zone = range_low + entry_zone_atr * atr_ltf
         upper_zone = range_high - entry_zone_atr * atr_ltf
         body = abs(close - open_now)
         bounce_ok = body >= min_bounce_body_atr * atr_ltf
+        stretch_atr = abs(close - mean_price) / atr_ltf if atr_ltf > 0 else 0.0
+        candle_range = max(float(last.get("high", close)) - float(last.get("low", close)), 0.0)
+        close_pos = ((close - float(last.get("low", close))) / candle_range) if candle_range > 0 else 0.5
+        lower_close_ok = close_pos >= bounce_close_pos_min
+        upper_close_ok = (1.0 - close_pos) >= bounce_close_pos_min
+        state_wickiness = float(market_meta.get("wickiness", 0.0))
+        state_false_breakout = float(market_meta.get("false_breakout_ratio", 0.0))
+        state_compression = float(market_meta.get("compression_ratio", 0.0))
+        state_ok = state_wickiness <= max_state_wickiness and state_false_breakout <= max_state_false_breakout and state_compression <= max_compression_ratio and adx_h <= max_adx
 
-        if close <= lower_zone and rsi_ltf <= rsi_long_max and close > prev_close and bounce_ok and close < (range_mid - target_buffer_atr * atr_ltf):
+        if close <= lower_zone and rsi_ltf <= rsi_long_max and close > prev_close and bounce_ok and lower_close_ok and stretch_atr >= min_stretch_atr and state_ok and close < (range_mid - target_buffer_atr * atr_ltf):
             return "buy", {
                 "range_low": range_low,
                 "range_high": range_high,
                 "range_mid": range_mid,
                 "rsi_ltf": rsi_ltf,
                 "adx_h": adx_h,
+                "stretch_atr": stretch_atr,
                 "state": market_meta,
             }
-        if close >= upper_zone and rsi_ltf >= rsi_short_min and close < prev_close and bounce_ok and close > (range_mid + target_buffer_atr * atr_ltf):
+        if close >= upper_zone and rsi_ltf >= rsi_short_min and close < prev_close and bounce_ok and upper_close_ok and stretch_atr >= min_stretch_atr and state_ok and close > (range_mid + target_buffer_atr * atr_ltf):
             return "sell", {
                 "range_low": range_low,
                 "range_high": range_high,
                 "range_mid": range_mid,
                 "rsi_ltf": rsi_ltf,
                 "adx_h": adx_h,
+                "stretch_atr": stretch_atr,
                 "state": market_meta,
             }
         return None, {
@@ -840,6 +953,9 @@ class MTFBreakoutStrategy(BaseStrategy):
 
         if market_state == "panic":
             logger.debug("[MTF] skip panic market state: %s", market_meta)
+            return None
+        if market_state == "transition":
+            logger.debug("[MTF] skip transition market state: %s", market_meta)
             return None
 
         # Для trend-mode всё ещё требуем достаточно живой HTF-тренд.
@@ -1052,6 +1168,14 @@ class MTFBreakoutStrategy(BaseStrategy):
             if not confirm_ok:
                 logger.debug("[MTF] skip BUY by breakout confirmation: %s", confirm_meta)
                 return None
+            rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="long")
+            if not rs_ok:
+                logger.debug("[MTF] skip BUY by relative strength: %s", rs_meta)
+                return None
+            impulse_ok, impulse_meta = self._check_impulse_breakout(symbol=symbol, recent=recent, candle=last, side="long", trigger=long_trigger, atr_ltf=atr_ltf)
+            if not impulse_ok:
+                logger.debug("[MTF] skip BUY by impulse breakout: %s", impulse_meta)
+                return None
             if breakout_quality_enabled:
                 quality_ok, quality_meta = self._calc_breakout_candle_quality(last, atr_ltf, side="long")
                 if not quality_ok:
@@ -1061,7 +1185,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 quality_meta = {}
 
             logger.debug(
-                "[MTF] BUY: state=%s close=%.2f rh=%.2f vol=%.0f vol_ema=%.0f vol_med=%.0f imp=%.3f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f alt_score=%.3f btc_score=%.3f body=%.5f uw=%.5f lw=%.5f",
+                "[MTF] BUY: state=%s close=%.2f rh=%.2f vol=%.0f vol_ema=%.0f vol_med=%.0f imp=%.3f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f exc=%.5f body=%.5f uw=%.5f lw=%.5f",
                 market_state,
                 close,
                 range_high,
@@ -1074,6 +1198,8 @@ class MTFBreakoutStrategy(BaseStrategy):
                 rsi_ltf,
                 float(alt_meta.get("score", 1.0)),
                 float(btc_meta.get("score", 1.0)),
+                float(rs_meta.get("ratio", 1.0)),
+                float(impulse_meta.get("excursion", 0.0)),
                 float(quality_meta.get("body", 0.0)),
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),
@@ -1090,11 +1216,24 @@ class MTFBreakoutStrategy(BaseStrategy):
             if not alt_ok:
                 logger.debug("[MTF] skip SELL by alt quality: %s", alt_meta)
                 return None
+            if symbol != str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")) and bool(getattr(cfg, "ALT_SHORTS_REQUIRE_STRONG_BTC_BEAR", True)):
+                btc_short_min = float(getattr(cfg, "BTC_REGIME_MIN_SCORE_SHORT", max(float(getattr(cfg, "BTC_REGIME_MIN_SCORE", 0.95)), 1.05)))
+                if float(btc_meta.get("score", 0.0)) < btc_short_min:
+                    logger.debug("[MTF] skip SELL weak BTC bear context: %s", btc_meta)
+                    return None
             confirm_ok, confirm_meta = self._check_breakout_confirmation(
                 symbol=symbol, df=df, side="short", trigger=short_trigger, range_high=range_high, range_low=range_low, atr_ltf=atr_ltf
             )
             if not confirm_ok:
                 logger.debug("[MTF] skip SELL by breakout confirmation: %s", confirm_meta)
+                return None
+            rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="short")
+            if not rs_ok:
+                logger.debug("[MTF] skip SELL by relative strength: %s", rs_meta)
+                return None
+            impulse_ok, impulse_meta = self._check_impulse_breakout(symbol=symbol, recent=recent, candle=last, side="short", trigger=short_trigger, atr_ltf=atr_ltf)
+            if not impulse_ok:
+                logger.debug("[MTF] skip SELL by impulse breakout: %s", impulse_meta)
                 return None
             if breakout_quality_enabled:
                 quality_ok, quality_meta = self._calc_breakout_candle_quality(last, atr_ltf, side="short")
@@ -1105,7 +1244,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 quality_meta = {}
 
             logger.debug(
-                "[MTF] SELL: state=%s close=%.2f rl=%.2f vol=%.0f vol_ema=%.0f vol_med=%.0f imp=%.3f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f alt_score=%.3f btc_score=%.3f body=%.5f uw=%.5f lw=%.5f",
+                "[MTF] SELL: state=%s close=%.2f rl=%.2f vol=%.0f vol_ema=%.0f vol_med=%.0f imp=%.3f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f exc=%.5f body=%.5f uw=%.5f lw=%.5f",
                 market_state,
                 close,
                 range_low,
@@ -1118,6 +1257,8 @@ class MTFBreakoutStrategy(BaseStrategy):
                 rsi_ltf,
                 float(alt_meta.get("score", 1.0)),
                 float(btc_meta.get("score", 1.0)),
+                float(rs_meta.get("ratio", 1.0)),
+                float(impulse_meta.get("excursion", 0.0)),
                 float(quality_meta.get("body", 0.0)),
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),

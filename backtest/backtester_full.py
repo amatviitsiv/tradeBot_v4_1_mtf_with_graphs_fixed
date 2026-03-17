@@ -53,6 +53,7 @@ class Backtester:
             for sym, df in out.items():
                 for col in htf_cols:
                     df[f"BTC_{col}"] = pd.NA
+                df["BTC_close"] = pd.NA
             return out
 
         btc_sync_base = btc_df.copy()
@@ -63,12 +64,14 @@ class Backtester:
             if "open_time" not in df.columns:
                 for col in htf_cols:
                     df[f"BTC_{col}"] = pd.NA
+                df["BTC_close"] = pd.NA
                 continue
             idx_df = df.sort_values("open_time").drop_duplicates(subset=["open_time"], keep="last").set_index("open_time")
             btc_sync = btc_sync_base.reindex(idx_df.index, method="pad")
             for col in htf_cols:
                 out_col = f"BTC_{col}"
                 idx_df[out_col] = btc_sync[col] if col in btc_sync.columns else pd.NA
+            idx_df["BTC_close"] = btc_sync["close"] if "close" in btc_sync.columns else pd.NA
             idx_df["symbol"] = sym
             out[sym] = idx_df.reset_index()
         return out
