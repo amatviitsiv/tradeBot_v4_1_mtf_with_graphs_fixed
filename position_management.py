@@ -37,6 +37,9 @@ def maybe_move_to_break_even(pos, price: float, atr: float) -> bool:
     if atr <= 0:
         return False
     symbol = getattr(pos, "symbol", "")
+    if bool(getattr(cfg, "POSITION_BE_ONLY_AFTER_TP1", False)) or bool(_cfg_float("POSITION_BE_ONLY_AFTER_TP1", 0.0, symbol)):
+        if not getattr(pos, "tp1_hit", False):
+            return False
     trigger_atr = _cfg_float("POSITION_BE_TRIGGER_ATR", 0.0, symbol)
     if trigger_atr <= 0:
         return False
@@ -95,6 +98,9 @@ def maybe_activate_trailing(pos, price: float, atr: float) -> bool:
     if atr <= 0:
         return False
     symbol = getattr(pos, "symbol", "")
+    if bool(getattr(cfg, "POSITION_TRAILING_ONLY_AFTER_TP1", False)) or bool(_cfg_float("POSITION_TRAILING_ONLY_AFTER_TP1", 0.0, symbol)):
+        if not getattr(pos, "tp1_hit", False):
+            return False
     activation_atr = _cfg_float("POSITION_TRAILING_ACTIVATION_ATR", _cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0, symbol), symbol), symbol)
     if activation_atr <= 0:
         return False
