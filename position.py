@@ -37,6 +37,8 @@ class PositionState:
     trail_active: bool = False
 
     pyramid_level: int = 0
+    trade_type: str = "unknown"
+    market_state: str = "unknown"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -61,4 +63,6 @@ class PositionState:
             tp1_hit=bool(d.get("tp1_hit", False)),
             trail_active=bool(d.get("trail_active", False)),
             pyramid_level=int(d.get("pyramid_level", 0)),
+            trade_type=d.get("trade_type", "unknown"),
+            market_state=d.get("market_state", "unknown"),
         )

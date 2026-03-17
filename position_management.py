@@ -15,8 +15,34 @@ def _cfg_int(name: str, default: int) -> int:
         return int(default)
 
 
-def calc_tp1_price(entry_price: float, atr: float, side: str, symbol: str = "") -> float:
-    tp1_mult = _cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0, symbol), symbol)
+def _position_profile(pos) -> str:
+    market_state = str(getattr(pos, "market_state", "") or "").lower()
+    trade_type = str(getattr(pos, "trade_type", "") or "").lower()
+    if market_state in {"range", "transition"}:
+        return "range"
+    if trade_type in {"range", "fakeout", "btc_exhaustion_short", "exhaustion_short"}:
+        return "range"
+    return "trend"
+
+
+def _profile_cfg_float(base_name: str, default: float, pos=None, symbol: str = "") -> float:
+    profile = _position_profile(pos) if pos is not None else "trend"
+    prof_name = f"{base_name}_{profile.upper()}"
+    try:
+        if symbol:
+            v = cfg.get_symbol_param(symbol, prof_name, None)
+            if v is not None:
+                return float(v)
+        v = getattr(cfg, prof_name, None)
+        if v is not None:
+            return float(v)
+    except Exception:
+        pass
+    return _cfg_float(base_name, default, symbol)
+
+
+def calc_tp1_price(entry_price: float, atr: float, side: str, symbol: str = "", pos=None) -> float:
+    tp1_mult = _profile_cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0, symbol), pos, symbol)
     if side == "long":
         return entry_price + tp1_mult * atr
     return entry_price - tp1_mult * atr
@@ -40,10 +66,10 @@ def maybe_move_to_break_even(pos, price: float, atr: float) -> bool:
     if bool(getattr(cfg, "POSITION_BE_ONLY_AFTER_TP1", False)) or bool(_cfg_float("POSITION_BE_ONLY_AFTER_TP1", 0.0, symbol)):
         if not getattr(pos, "tp1_hit", False):
             return False
-    trigger_atr = _cfg_float("POSITION_BE_TRIGGER_ATR", 0.0, symbol)
+    trigger_atr = _profile_cfg_float("POSITION_BE_TRIGGER_ATR", 0.0, pos, symbol)
     if trigger_atr <= 0:
         return False
-    be_offset_atr = _cfg_float("POSITION_BE_OFFSET_ATR", 0.0, symbol)
+    be_offset_atr = _profile_cfg_float("POSITION_BE_OFFSET_ATR", 0.0, pos, symbol)
     moved = getattr(pos, "be_moved", False)
     if pos.side == "long":
         move_atr = (price - pos.entry_price) / atr
@@ -78,7 +104,7 @@ def on_tp1_hit(pos, price: float, atr: float) -> None:
     if atr <= 0:
         atr = 0.0
     symbol = getattr(pos, "symbol", "")
-    be_offset_atr = _cfg_float("POSITION_BE_OFFSET_ATR", 0.0, symbol)
+    be_offset_atr = _profile_cfg_float("POSITION_BE_OFFSET_ATR", 0.0, pos, symbol)
     if pos.side == "long":
         be_stop = pos.entry_price + be_offset_atr * atr
         if pos.stop_loss is None or be_stop > pos.stop_loss:
@@ -101,7 +127,7 @@ def maybe_activate_trailing(pos, price: float, atr: float) -> bool:
     if bool(getattr(cfg, "POSITION_TRAILING_ONLY_AFTER_TP1", False)) or bool(_cfg_float("POSITION_TRAILING_ONLY_AFTER_TP1", 0.0, symbol)):
         if not getattr(pos, "tp1_hit", False):
             return False
-    activation_atr = _cfg_float("POSITION_TRAILING_ACTIVATION_ATR", _cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0, symbol), symbol), symbol)
+    activation_atr = _profile_cfg_float("POSITION_TRAILING_ACTIVATION_ATR", _profile_cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0, symbol), pos, symbol), pos, symbol)
     if activation_atr <= 0:
         return False
     if getattr(pos, "trail_active", False):
@@ -123,8 +149,8 @@ def update_trailing_stop(pos, atr: float) -> bool:
     if peak is None:
         return False
     symbol = getattr(pos, "symbol", "")
-    trail_mult = _cfg_float("POSITION_TRAILING_ATR_MULT", _cfg_float("ATR_TS_MULT", 4.0, symbol), symbol)
-    trail_step_atr = _cfg_float("POSITION_TRAILING_STEP_ATR", 0.0)
+    trail_mult = _profile_cfg_float("POSITION_TRAILING_ATR_MULT", _cfg_float("ATR_TS_MULT", 4.0, symbol), pos, symbol)
+    trail_step_atr = _profile_cfg_float("POSITION_TRAILING_STEP_ATR", 0.0, pos, symbol)
     if pos.side == "long":
         candidate = float(peak) - trail_mult * atr
         if pos.stop_loss is not None:
@@ -155,8 +181,9 @@ def should_close_on_trailing(pos, price: float) -> bool:
     return price >= ts
 
 
-def tp1_fraction() -> float:
-    frac = _cfg_float("POSITION_TP1_CLOSE_FRACTION", 0.5)
+def tp1_fraction(pos=None) -> float:
+    symbol = getattr(pos, "symbol", "") if pos is not None else ""
+    frac = _profile_cfg_float("POSITION_TP1_CLOSE_FRACTION", 0.5, pos, symbol)
     if frac <= 0:
         return 0.0
     if frac >= 1:

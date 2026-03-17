@@ -597,7 +597,10 @@ class LiveRunner:
             tp1_hit=False,
             trail_active=False,
             pyramid_level=0,
+            trade_type=trade_type,
+            market_state=market_state,
         )
+        pos.tp1 = calc_tp1_price(price, atr, side, symbol, pos)
         self._positions[symbol] = pos
         self._update_position_state(symbol, pos)
 

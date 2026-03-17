@@ -473,7 +473,10 @@ class Backtester:
                     stop_loss = price - atr_sl_mult * atr
                 else:
                     stop_loss = price + atr_sl_mult * atr
-                tp1 = calc_tp1_price(price, atr, side, sym)
+                sig_meta = getattr(get_active_strategy(), "last_signal_meta", {}) or {}
+                trade_type = str(sig_meta.get("trade_type", "unknown") or "unknown")
+                market_state = str(sig_meta.get("market_state", "unknown") or "unknown")
+                tp1 = calc_tp1_price(price, atr, side, sym, None)
 
                 positions[sym] = Position(
                     symbol=sym,
@@ -492,7 +495,10 @@ class Backtester:
                     tp1_hit=False,
                     trail_active=False,
                     pyramid_level=0,
+                    trade_type=trade_type,
+                    market_state=market_state,
                 )
+                positions[sym].tp1 = calc_tp1_price(price, atr, side, sym, positions[sym])
                 open_count += 1
                 can_open_more = open_count < eff_max_positions
 
