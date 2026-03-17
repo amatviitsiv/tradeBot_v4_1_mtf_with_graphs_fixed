@@ -23,6 +23,13 @@ class MTFBreakoutStrategy(BaseStrategy):
 
     name: str = "mtf_breakout"
 
+    def __init__(self):
+        self.last_signal_meta = {"signal": None, "trade_type": None, "risk_multiplier": 1.0}
+
+    def _set_signal(self, signal: Optional[str], trade_type: str | None = None, risk_multiplier: float = 1.0, **meta):
+        self.last_signal_meta = {"signal": signal, "trade_type": trade_type, "risk_multiplier": float(risk_multiplier), **meta}
+        return signal
+
     def _extract_bar_timestamp(self, df: pd.DataFrame):
         """Пытается достать timestamp последней свечи из open_time или DatetimeIndex."""
         try:
@@ -44,7 +51,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 return ts
         except Exception:
             pass
-        return None
+        return self._set_signal(None)
 
     def _is_allowed_trading_time(self, df: pd.DataFrame) -> tuple[bool, dict]:
         """Фильтр торговых часов. Использует время закрытой LTF-свечи."""
@@ -736,15 +743,10 @@ class MTFBreakoutStrategy(BaseStrategy):
         }
 
     def _check_continuation_entry(self, symbol: str, df: pd.DataFrame, side: str, atr_ltf: float) -> tuple[bool, dict]:
-        """Continuation entry after pullback in established trend.
-
-        Designed to add frequency without returning to noisy raw breakout entries.
-        Uses a softer pullback + rejection model on LTF around EMA20/EMA50.
-        """
-        if len(df) < 5 or atr_ltf <= 0:
+        if len(df) < 120 or atr_ltf <= 0:
             return False, {"reason": "not_enough_continuation_history"}
-        needed = ["open", "high", "low", "close", "EMA20", "EMA50", "EMA200", "RSI"]
-        if not all(c in df.columns for c in needed):
+        need_cols = {"EMA20", "EMA50", "EMA200", "open", "high", "low", "close", "volume", "RSI", "HTF_ADX"}
+        if not need_cols.issubset(df.columns):
             return False, {"reason": "missing_continuation_cols"}
         try:
             last = df.iloc[-1]
@@ -757,37 +759,47 @@ class MTFBreakoutStrategy(BaseStrategy):
             high = float(last.get("high", np.nan))
             low = float(last.get("low", np.nan))
             prev_close = float(prev.get("close", np.nan))
-            prev_ema20 = float(prev.get("EMA20", np.nan))
-            rsi = float(last.get("RSI", np.nan))
             prev_open = float(prev.get("open", np.nan))
+            prev_ema20 = float(prev.get("EMA20", np.nan))
+            prev_high = float(prev.get("high", np.nan))
+            prev_low = float(prev.get("low", np.nan))
+            rsi = float(last.get("RSI", np.nan))
+            htf_adx = float(last.get("HTF_ADX", np.nan))
         except Exception:
             return False, {"reason": "bad_continuation_values"}
 
-        vals = [ema20, ema50, ema200, close, open_, high, low, prev_close, prev_ema20, rsi, prev_open]
+        vals = [ema20, ema50, ema200, close, open_, high, low, prev_close, prev_open, prev_ema20, prev_high, prev_low, rsi, htf_adx]
         if any(np.isnan(x) for x in vals):
             return False, {"reason": "nan_continuation_values"}
 
         body = abs(close - open_)
+        prev_body = abs(prev_close - prev_open)
         rng = max(high - low, 0.0)
-        if rng <= 0:
+        prev_rng = max(prev_high - prev_low, 0.0)
+        if rng <= 0 or prev_rng <= 0:
             return False, {"reason": "zero_range"}
 
         trend_ok = (ema20 > ema50 > ema200) if side == "long" else (ema20 < ema50 < ema200)
         if not trend_ok:
             return False, {"reason": "ltf_alignment_fail"}
 
-        touch_atr = cfg.get_symbol_param_float(symbol, "CONTINUATION_TOUCH_ATR", float(getattr(cfg, "CONTINUATION_TOUCH_ATR", 0.35)))
-        body_atr = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_BODY_ATR", float(getattr(cfg, "CONTINUATION_MIN_BODY_ATR", 0.32)))
-        close_pos_min = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_CLOSE_POS", float(getattr(cfg, "CONTINUATION_MIN_CLOSE_POS", 0.55)))
+        touch_atr = cfg.get_symbol_param_float(symbol, "CONTINUATION_TOUCH_ATR", float(getattr(cfg, "CONTINUATION_TOUCH_ATR", 0.28)))
+        body_atr = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_BODY_ATR", float(getattr(cfg, "CONTINUATION_MIN_BODY_ATR", 0.38)))
+        close_pos_min = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_CLOSE_POS", float(getattr(cfg, "CONTINUATION_MIN_CLOSE_POS", 0.62)))
         require_prev_pullback = bool(getattr(cfg, "CONTINUATION_REQUIRE_PREV_PULLBACK", True))
-        max_rsi_long = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_LONG_MAX", float(getattr(cfg, "CONTINUATION_RSI_LONG_MAX", 66.0)))
-        min_rsi_long = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_LONG_MIN", float(getattr(cfg, "CONTINUATION_RSI_LONG_MIN", 46.0)))
-        min_rsi_short = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_SHORT_MIN", float(getattr(cfg, "CONTINUATION_RSI_SHORT_MIN", 34.0)))
-        max_rsi_short = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_SHORT_MAX", float(getattr(cfg, "CONTINUATION_RSI_SHORT_MAX", 54.0)))
+        min_htf_adx = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_HTF_ADX", float(getattr(cfg, "CONTINUATION_MIN_HTF_ADX", 21.0)))
+        min_vol_ratio = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_VOL_RATIO", float(getattr(cfg, "CONTINUATION_MIN_VOL_RATIO", 0.98)))
+        max_rsi_long = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_LONG_MAX", float(getattr(cfg, "CONTINUATION_RSI_LONG_MAX", 63.0)))
+        min_rsi_long = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_LONG_MIN", float(getattr(cfg, "CONTINUATION_RSI_LONG_MIN", 48.0)))
+        min_rsi_short = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_SHORT_MIN", float(getattr(cfg, "CONTINUATION_RSI_SHORT_MIN", 37.0)))
+        max_rsi_short = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_SHORT_MAX", float(getattr(cfg, "CONTINUATION_RSI_SHORT_MAX", 52.0)))
+        pullback_depth_atr = cfg.get_symbol_param_float(symbol, "CONTINUATION_PULLBACK_DEPTH_ATR", float(getattr(cfg, "CONTINUATION_PULLBACK_DEPTH_ATR", 0.9)))
 
         close_pos = (close - low) / rng
+        prev_close_pos = (prev_close - prev_low) / prev_rng
         if side == "short":
             close_pos = 1.0 - close_pos
+            prev_close_pos = 1.0 - prev_close_pos
 
         recent = df.tail(min(len(df), 30)).copy()
         try:
@@ -795,35 +807,46 @@ class MTFBreakoutStrategy(BaseStrategy):
             vol_ratio = float(last.get("volume", 0.0)) / max(float(vol.ewm(span=12, adjust=False).mean().iloc[-1]), 1e-9)
         except Exception:
             vol_ratio = 1.0
-        min_vol_ratio = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_VOL_RATIO", float(getattr(cfg, "CONTINUATION_MIN_VOL_RATIO", 0.92)))
 
         if side == "long":
             touch_ok = low <= ema20 + atr_ltf * touch_atr
             reclaim_ok = close >= ema20 and close > open_ and close > prev_close and close_pos >= close_pos_min
-            prev_pullback_ok = (prev_close <= prev_ema20 + atr_ltf * touch_atr) or (prev_open <= prev_ema20 + atr_ltf * touch_atr)
+            prev_pullback_ok = (prev_low <= prev_ema20 + atr_ltf * touch_atr) or (prev_close <= prev_ema20 + atr_ltf * touch_atr)
+            pullback_depth_ok = abs(min(prev_low, low) - ema20) <= atr_ltf * pullback_depth_atr
             rsi_ok = min_rsi_long <= rsi <= max_rsi_long
+            rejection_ok = prev_close < prev_open and close > open_ and close > prev_open and close > prev_close and prev_close_pos <= 0.55
         else:
             touch_ok = high >= ema20 - atr_ltf * touch_atr
             reclaim_ok = close <= ema20 and close < open_ and close < prev_close and close_pos >= close_pos_min
-            prev_pullback_ok = (prev_close >= prev_ema20 - atr_ltf * touch_atr) or (prev_open >= prev_ema20 - atr_ltf * touch_atr)
+            prev_pullback_ok = (prev_high >= prev_ema20 - atr_ltf * touch_atr) or (prev_close >= prev_ema20 - atr_ltf * touch_atr)
+            pullback_depth_ok = abs(max(prev_high, high) - ema20) <= atr_ltf * pullback_depth_atr
             rsi_ok = min_rsi_short <= rsi <= max_rsi_short
+            rejection_ok = prev_close > prev_open and close < open_ and close < prev_open and close < prev_close and prev_close_pos <= 0.55
 
-        ok = touch_ok and reclaim_ok and body >= atr_ltf * body_atr and rsi_ok and vol_ratio >= min_vol_ratio
-        if require_prev_pullback:
-            ok = ok and prev_pullback_ok
+        ok = (
+            touch_ok
+            and reclaim_ok
+            and prev_pullback_ok if require_prev_pullback else touch_ok and reclaim_ok
+        )
+        ok = bool(ok and pullback_depth_ok and rejection_ok and body >= atr_ltf * body_atr and rsi_ok and vol_ratio >= min_vol_ratio and htf_adx >= min_htf_adx and body >= prev_body * 0.85)
 
         return ok, {
             "touch_ok": touch_ok,
             "reclaim_ok": reclaim_ok,
             "prev_pullback_ok": prev_pullback_ok,
+            "pullback_depth_ok": pullback_depth_ok,
+            "rejection_ok": rejection_ok,
             "body": body,
+            "prev_body": prev_body,
             "atr": atr_ltf,
             "rsi": rsi,
             "close_pos": close_pos,
+            "prev_close_pos": prev_close_pos,
             "vol_ratio": vol_ratio,
             "ema20": ema20,
             "ema50": ema50,
             "ema200": ema200,
+            "htf_adx": htf_adx,
             "side": side,
         }
 
@@ -851,10 +874,10 @@ class MTFBreakoutStrategy(BaseStrategy):
 
         entry_zone_atr = cfg.get_symbol_param_float(symbol, "RANGE_ENTRY_ZONE_ATR", float(getattr(cfg, "RANGE_ENTRY_ZONE_ATR", 0.8)))
         target_buffer_atr = cfg.get_symbol_param_float(symbol, "RANGE_TARGET_BUFFER_ATR", float(getattr(cfg, "RANGE_TARGET_BUFFER_ATR", 0.35)))
-        rsi_long_max = cfg.get_symbol_param_float(symbol, "RANGE_RSI_LONG_MAX", float(getattr(cfg, "RANGE_RSI_LONG_MAX", 32.0)))
-        rsi_short_min = cfg.get_symbol_param_float(symbol, "RANGE_RSI_SHORT_MIN", float(getattr(cfg, "RANGE_RSI_SHORT_MIN", 68.0)))
-        min_bounce_body_atr = cfg.get_symbol_param_float(symbol, "RANGE_MIN_BOUNCE_BODY_ATR", float(getattr(cfg, "RANGE_MIN_BOUNCE_BODY_ATR", 0.28)))
-        min_stretch_atr = cfg.get_symbol_param_float(symbol, "RANGE_MIN_STRETCH_FROM_MEAN_ATR", float(getattr(cfg, "RANGE_MIN_STRETCH_FROM_MEAN_ATR", 1.25)))
+        rsi_long_max = cfg.get_symbol_param_float(symbol, "RANGE_RSI_LONG_MAX", float(getattr(cfg, "RANGE_RSI_LONG_MAX", 28.0)))
+        rsi_short_min = cfg.get_symbol_param_float(symbol, "RANGE_RSI_SHORT_MIN", float(getattr(cfg, "RANGE_RSI_SHORT_MIN", 72.0)))
+        min_bounce_body_atr = cfg.get_symbol_param_float(symbol, "RANGE_MIN_BOUNCE_BODY_ATR", float(getattr(cfg, "RANGE_MIN_BOUNCE_BODY_ATR", 0.38)))
+        min_stretch_atr = cfg.get_symbol_param_float(symbol, "RANGE_MIN_STRETCH_FROM_MEAN_ATR", float(getattr(cfg, "RANGE_MIN_STRETCH_FROM_MEAN_ATR", 1.45)))
         max_state_wickiness = float(getattr(cfg, "RANGE_MAX_STATE_WICKINESS", 0.58))
         max_state_false_breakout = float(getattr(cfg, "RANGE_MAX_STATE_FALSE_BREAKOUT", 0.45))
         max_compression_ratio = float(getattr(cfg, "RANGE_MAX_COMPRESSION_RATIO", 1.12))
@@ -905,6 +928,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         }
 
     def signal(self, df: pd.DataFrame) -> Optional[str]:
+        self.last_signal_meta = {"signal": None, "trade_type": None, "risk_multiplier": 1.0}
         if df is None or len(df) < 100:
             return None
 
@@ -1138,7 +1162,7 @@ class MTFBreakoutStrategy(BaseStrategy):
             )
             if range_sig is not None:
                 logger.debug("[MTF] RANGE %s state=%s meta=%s", range_sig.upper(), market_state, range_meta)
-                return range_sig
+                return self._set_signal(range_sig, trade_type="range", risk_multiplier=float(getattr(cfg, "RISK_MULTIPLIER_RANGE", 0.45)), market_state=market_state, range_meta=range_meta)
 
         # Более устойчивый volume / momentum фильтр на LTF.
         volume_filter_enabled = bool(getattr(cfg, "BREAKOUT_VOLUME_FILTER_V2_ENABLED", True))
@@ -1254,7 +1278,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="long", atr_ltf=atr_ltf)
                 if btc_ok and alt_ok and rs_ok and cont_ok:
                     logger.debug("[MTF] BUY continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
-                    return "buy"
+                    return self._set_signal("buy", trade_type="continuation", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONTINUATION", float(getattr(cfg, "RISK_MULTIPLIER_CONTINUATION", 0.65)))), market_state=market_state, cont_meta=cont_meta, side="long")
             elif regime == "bear":
                 btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="short")
                 alt_ok, alt_meta = self._calc_alt_quality_score(symbol=symbol, recent=recent, atr_ltf=atr_ltf, side="short")
@@ -1266,7 +1290,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                     allow_short = float(btc_meta.get("score", 0.0)) >= btc_short_min
                 if btc_ok and alt_ok and rs_ok and cont_ok and allow_short:
                     logger.debug("[MTF] SELL continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
-                    return "sell"
+                    return self._set_signal("sell", trade_type="continuation", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONTINUATION", float(getattr(cfg, "RISK_MULTIPLIER_CONTINUATION", 0.65)))), market_state=market_state, cont_meta=cont_meta, side="short")
 
         if market_state != "trend":
             return None
@@ -1327,7 +1351,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),
             )
-            return "buy"
+            return self._set_signal("buy", trade_type="impulse", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_IMPULSE", float(getattr(cfg, "RISK_MULTIPLIER_IMPULSE", 1.00)))), market_state=market_state, impulse_meta=impulse_meta, side="long")
 
         # SHORT: H1 bear-тренд + подтверждённое закрытие M15 ниже диапазона
         if regime == "bear" and close < short_trigger and rsi_short_min <= rsi_ltf <= rsi_short_max:
@@ -1386,6 +1410,6 @@ class MTFBreakoutStrategy(BaseStrategy):
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),
             )
-            return "sell"
+            return self._set_signal("sell", trade_type="impulse", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_IMPULSE", float(getattr(cfg, "RISK_MULTIPLIER_IMPULSE", 1.00)))), market_state=market_state, impulse_meta=impulse_meta, side="short")
 
         return None

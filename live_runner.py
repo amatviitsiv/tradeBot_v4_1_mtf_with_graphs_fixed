@@ -29,6 +29,7 @@ from telegram_notifier import TelegramNotifier
 from broker_futures import LiveFuturesBroker
 from binance_ws_manager import BinanceWSManager
 from strategy import signal_from_indicators
+from strategies import get_active_strategy
 from risk import RiskManager
 from position import PositionState
 from indicators import compute_indicators  # type: ignore
@@ -339,6 +340,11 @@ class LiveRunner:
         logger.debug("[RUNNER] calling strategy for %s, len(df_mtf)=%d", symbol, len(df_mtf))
         signal = signal_from_indicators(df_mtf)
         logger.debug("[RUNNER] strategy returned signal=%r for %s", signal, symbol)
+        try:
+            sig_meta = getattr(get_active_strategy(), "last_signal_meta", {}) or {}
+            trade_risk_mult = float(sig_meta.get("risk_multiplier", 1.0) or 1.0)
+        except Exception:
+            trade_risk_mult = 1.0
 
         # --- оценка текущей equity и обновление пика ---
         equity = 0.0

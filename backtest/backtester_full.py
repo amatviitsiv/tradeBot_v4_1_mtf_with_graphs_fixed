@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 import config as cfg
 from indicators import compute_indicators
 from strategy import signal_from_indicators
+from strategies import get_active_strategy
 from risk import RiskManager
 from position import PositionState as Position
 from position_management import (
@@ -452,7 +453,12 @@ class Backtester:
                     continue
 
                 risk_multiplier = self._symbol_risk_multiplier(sym)
-                eff_risk_per_trade = risk_per_trade * risk_multiplier
+                try:
+                    sig_meta = getattr(get_active_strategy(), "last_signal_meta", {}) or {}
+                    trade_risk_mult = float(sig_meta.get("risk_multiplier", 1.0) or 1.0)
+                except Exception:
+                    trade_risk_mult = 1.0
+                eff_risk_per_trade = risk_per_trade * risk_multiplier * trade_risk_mult
                 notional, qty = self.risk.calc_futures_size_from_risk(
                     equity=equity,
                     price=price,
