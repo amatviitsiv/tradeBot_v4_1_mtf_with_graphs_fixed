@@ -789,6 +789,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         require_prev_pullback = bool(getattr(cfg, "CONTINUATION_REQUIRE_PREV_PULLBACK", True))
         min_htf_adx = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_HTF_ADX", float(getattr(cfg, "CONTINUATION_MIN_HTF_ADX", 21.0)))
         min_vol_ratio = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_VOL_RATIO", float(getattr(cfg, "CONTINUATION_MIN_VOL_RATIO", 0.98)))
+        soft_rejection = cfg.get_symbol_param_float(symbol, "CONTINUATION_SOFT_REJECTION", 0.0) > 0.5
         max_rsi_long = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_LONG_MAX", float(getattr(cfg, "CONTINUATION_RSI_LONG_MAX", 63.0)))
         min_rsi_long = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_LONG_MIN", float(getattr(cfg, "CONTINUATION_RSI_LONG_MIN", 48.0)))
         min_rsi_short = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_SHORT_MIN", float(getattr(cfg, "CONTINUATION_RSI_SHORT_MIN", 37.0)))
@@ -814,21 +815,28 @@ class MTFBreakoutStrategy(BaseStrategy):
             prev_pullback_ok = (prev_low <= prev_ema20 + atr_ltf * touch_atr) or (prev_close <= prev_ema20 + atr_ltf * touch_atr)
             pullback_depth_ok = abs(min(prev_low, low) - ema20) <= atr_ltf * pullback_depth_atr
             rsi_ok = min_rsi_long <= rsi <= max_rsi_long
-            rejection_ok = prev_close < prev_open and close > open_ and close > prev_open and close > prev_close and prev_close_pos <= 0.55
+            if soft_rejection:
+                rejection_ok = close > open_ and close > prev_close and close_pos >= max(0.50, close_pos_min - 0.06) and prev_close_pos <= 0.72
+            else:
+                rejection_ok = prev_close < prev_open and close > open_ and close > prev_open and close > prev_close and prev_close_pos <= 0.55
         else:
             touch_ok = high >= ema20 - atr_ltf * touch_atr
             reclaim_ok = close <= ema20 and close < open_ and close < prev_close and close_pos >= close_pos_min
             prev_pullback_ok = (prev_high >= prev_ema20 - atr_ltf * touch_atr) or (prev_close >= prev_ema20 - atr_ltf * touch_atr)
             pullback_depth_ok = abs(max(prev_high, high) - ema20) <= atr_ltf * pullback_depth_atr
             rsi_ok = min_rsi_short <= rsi <= max_rsi_short
-            rejection_ok = prev_close > prev_open and close < open_ and close < prev_open and close < prev_close and prev_close_pos <= 0.55
+            if soft_rejection:
+                rejection_ok = close < open_ and close < prev_close and close_pos >= max(0.50, close_pos_min - 0.06) and prev_close_pos <= 0.72
+            else:
+                rejection_ok = prev_close > prev_open and close < open_ and close < prev_open and close < prev_close and prev_close_pos <= 0.55
 
         ok = (
             touch_ok
             and reclaim_ok
             and prev_pullback_ok if require_prev_pullback else touch_ok and reclaim_ok
         )
-        ok = bool(ok and pullback_depth_ok and rejection_ok and body >= atr_ltf * body_atr and rsi_ok and vol_ratio >= min_vol_ratio and htf_adx >= min_htf_adx and body >= prev_body * 0.85)
+        prev_body_factor = 0.70 if soft_rejection else 0.85
+        ok = bool(ok and pullback_depth_ok and rejection_ok and body >= atr_ltf * body_atr and rsi_ok and vol_ratio >= min_vol_ratio and htf_adx >= min_htf_adx and body >= prev_body * prev_body_factor)
 
         return ok, {
             "touch_ok": touch_ok,
