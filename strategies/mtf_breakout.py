@@ -1073,6 +1073,63 @@ class MTFBreakoutStrategy(BaseStrategy):
 
         return self._btc_short_context_ok(symbol=symbol, regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=btc_score)
 
+    def _check_btc_exhaustion_short(self, symbol: str, df: pd.DataFrame, recent: pd.DataFrame, atr_ltf: float, adx_h: float, rsi_h: float, ema20_h: float, ema50_h: float, regime: str) -> tuple[bool, dict]:
+        btc_symbol = str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
+        if symbol != btc_symbol:
+            return False, {"reason": "not_btc"}
+        if not self._symbol_flag(symbol, "ENABLE_BTC_EXHAUSTION_SHORT", bool(getattr(cfg, "ENABLE_BTC_EXHAUSTION_SHORT", True))):
+            return False, {"reason": "btc_exhaustion_disabled"}
+        if atr_ltf <= 0 or len(df) < 3 or len(recent) < 10:
+            return False, {"reason": "btc_exhaustion_history"}
+        try:
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            open_ = float(last.get("open", np.nan))
+            high = float(last.get("high", np.nan))
+            low = float(last.get("low", np.nan))
+            close = float(last.get("close", np.nan))
+            prev_close = float(prev.get("close", np.nan))
+            rsi_ltf = float(last.get("RSI", np.nan))
+        except Exception:
+            return False, {"reason": "btc_exhaustion_parse"}
+        vals = [open_, high, low, close, prev_close, rsi_ltf, ema20_h, ema50_h, adx_h, rsi_h]
+        if any(np.isnan(v) for v in vals):
+            return False, {"reason": "btc_exhaustion_nan"}
+
+        min_stretch_atr = cfg.get_symbol_param_float(symbol, "BTC_EXHAUSTION_MIN_STRETCH_ATR", float(getattr(cfg, "BTC_EXHAUSTION_MIN_STRETCH_ATR", 1.20)))
+        min_rsi = cfg.get_symbol_param_float(symbol, "BTC_EXHAUSTION_MIN_RSI", float(getattr(cfg, "BTC_EXHAUSTION_MIN_RSI", 64.0)))
+        min_htf_adx = cfg.get_symbol_param_float(symbol, "BTC_EXHAUSTION_MIN_HTF_ADX", float(getattr(cfg, "BTC_EXHAUSTION_MIN_HTF_ADX", 14.0)))
+        max_htf_rsi = cfg.get_symbol_param_float(symbol, "BTC_EXHAUSTION_MAX_HTF_RSI", float(getattr(cfg, "BTC_EXHAUSTION_MAX_HTF_RSI", 60.0)))
+        min_upper_wick_body = cfg.get_symbol_param_float(symbol, "BTC_EXHAUSTION_MIN_UPPER_WICK_BODY", float(getattr(cfg, "BTC_EXHAUSTION_MIN_UPPER_WICK_BODY", 0.70)))
+        min_close_from_high = cfg.get_symbol_param_float(symbol, "BTC_EXHAUSTION_MIN_CLOSE_POS_FROM_HIGH", float(getattr(cfg, "BTC_EXHAUSTION_MIN_CLOSE_POS_FROM_HIGH", 0.55)))
+
+        recent_close = recent["close"].astype(float)
+        mean_price = float(recent_close.ewm(span=20, adjust=False).mean().iloc[-1])
+        stretch_atr = (close - mean_price) / atr_ltf
+        htf_bias_ok = bool(close >= ema20_h or close >= ema50_h)
+        body = abs(close - open_)
+        upper_wick = max(high - max(open_, close), 0.0)
+        candle_range = max(high - low, 1e-9)
+        close_from_high = (high - close) / candle_range
+        bearish_rejection = bool(close < open_ and close < prev_close)
+        wick_ok = upper_wick >= max(min_upper_wick_body * max(body, 1e-9), 0.18 * atr_ltf)
+        context_ok = bool(regime in {"bear", "none"} and adx_h >= min_htf_adx and rsi_h <= max_htf_rsi)
+        overextended = bool(stretch_atr >= min_stretch_atr and rsi_ltf >= min_rsi and htf_bias_ok)
+        ok = bool(context_ok and overextended and bearish_rejection and wick_ok and close_from_high >= min_close_from_high)
+        return ok, {
+            "reason": "btc_exhaustion_short",
+            "stretch_atr": stretch_atr,
+            "rsi_ltf": rsi_ltf,
+            "adx_h": adx_h,
+            "rsi_h": rsi_h,
+            "close_from_high": close_from_high,
+            "upper_wick": upper_wick,
+            "body": body,
+            "mean_price": mean_price,
+            "context_ok": context_ok,
+            "overextended": overextended,
+        }
+
     def _range_signal(self, symbol: str, df: pd.DataFrame, recent: pd.DataFrame, close: float, atr_ltf: float, adx_h: float, market_meta: dict) -> tuple[Optional[str], dict]:
         if len(recent) < 20 or atr_ltf <= 0 or close <= 0:
             return None, {"reason": "not_enough_range_history"}
@@ -1401,6 +1458,12 @@ class MTFBreakoutStrategy(BaseStrategy):
             if range_sig is not None:
                 logger.debug("[MTF] RANGE %s state=%s meta=%s", range_sig.upper(), market_state, range_meta)
                 return self._set_signal(range_sig, trade_type="range", risk_multiplier=float(getattr(cfg, "RISK_MULTIPLIER_RANGE", 0.45)), market_state=market_state, range_meta=range_meta)
+
+        if symbol == str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")):
+            btc_exh_ok, btc_exh_meta = self._check_btc_exhaustion_short(symbol=symbol, df=df, recent=recent, atr_ltf=atr_ltf, adx_h=adx_h, rsi_h=rsi_h, ema20_h=ema20_h, ema50_h=ema50_h, regime=regime)
+            if btc_exh_ok:
+                logger.debug("[MTF] BTC exhaustion short: state=%s meta=%s", market_state, btc_exh_meta)
+                return self._set_signal("sell", trade_type="btc_exhaustion", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "BTC_EXHAUSTION_RISK_MULTIPLIER", float(getattr(cfg, "BTC_EXHAUSTION_RISK_MULTIPLIER", 0.70)))), market_state=market_state, btc_exhaustion_meta=btc_exh_meta, side="short")
 
         # Более устойчивый volume / momentum фильтр на LTF.
         volume_filter_enabled = bool(getattr(cfg, "BREAKOUT_VOLUME_FILTER_V2_ENABLED", True))
