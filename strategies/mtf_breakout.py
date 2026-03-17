@@ -735,6 +735,98 @@ class MTFBreakoutStrategy(BaseStrategy):
             "btc_close": None if np.isnan(btc_close) else btc_close,
         }
 
+    def _check_continuation_entry(self, symbol: str, df: pd.DataFrame, side: str, atr_ltf: float) -> tuple[bool, dict]:
+        """Continuation entry after pullback in established trend.
+
+        Designed to add frequency without returning to noisy raw breakout entries.
+        Uses a softer pullback + rejection model on LTF around EMA20/EMA50.
+        """
+        if len(df) < 5 or atr_ltf <= 0:
+            return False, {"reason": "not_enough_continuation_history"}
+        needed = ["open", "high", "low", "close", "EMA20", "EMA50", "EMA200", "RSI"]
+        if not all(c in df.columns for c in needed):
+            return False, {"reason": "missing_continuation_cols"}
+        try:
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            ema20 = float(last.get("EMA20", np.nan))
+            ema50 = float(last.get("EMA50", np.nan))
+            ema200 = float(last.get("EMA200", np.nan))
+            close = float(last.get("close", np.nan))
+            open_ = float(last.get("open", np.nan))
+            high = float(last.get("high", np.nan))
+            low = float(last.get("low", np.nan))
+            prev_close = float(prev.get("close", np.nan))
+            prev_ema20 = float(prev.get("EMA20", np.nan))
+            rsi = float(last.get("RSI", np.nan))
+            prev_open = float(prev.get("open", np.nan))
+        except Exception:
+            return False, {"reason": "bad_continuation_values"}
+
+        vals = [ema20, ema50, ema200, close, open_, high, low, prev_close, prev_ema20, rsi, prev_open]
+        if any(np.isnan(x) for x in vals):
+            return False, {"reason": "nan_continuation_values"}
+
+        body = abs(close - open_)
+        rng = max(high - low, 0.0)
+        if rng <= 0:
+            return False, {"reason": "zero_range"}
+
+        trend_ok = (ema20 > ema50 > ema200) if side == "long" else (ema20 < ema50 < ema200)
+        if not trend_ok:
+            return False, {"reason": "ltf_alignment_fail"}
+
+        touch_atr = cfg.get_symbol_param_float(symbol, "CONTINUATION_TOUCH_ATR", float(getattr(cfg, "CONTINUATION_TOUCH_ATR", 0.35)))
+        body_atr = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_BODY_ATR", float(getattr(cfg, "CONTINUATION_MIN_BODY_ATR", 0.32)))
+        close_pos_min = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_CLOSE_POS", float(getattr(cfg, "CONTINUATION_MIN_CLOSE_POS", 0.55)))
+        require_prev_pullback = bool(getattr(cfg, "CONTINUATION_REQUIRE_PREV_PULLBACK", True))
+        max_rsi_long = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_LONG_MAX", float(getattr(cfg, "CONTINUATION_RSI_LONG_MAX", 66.0)))
+        min_rsi_long = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_LONG_MIN", float(getattr(cfg, "CONTINUATION_RSI_LONG_MIN", 46.0)))
+        min_rsi_short = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_SHORT_MIN", float(getattr(cfg, "CONTINUATION_RSI_SHORT_MIN", 34.0)))
+        max_rsi_short = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_SHORT_MAX", float(getattr(cfg, "CONTINUATION_RSI_SHORT_MAX", 54.0)))
+
+        close_pos = (close - low) / rng
+        if side == "short":
+            close_pos = 1.0 - close_pos
+
+        recent = df.tail(min(len(df), 30)).copy()
+        try:
+            vol = recent["volume"].astype(float)
+            vol_ratio = float(last.get("volume", 0.0)) / max(float(vol.ewm(span=12, adjust=False).mean().iloc[-1]), 1e-9)
+        except Exception:
+            vol_ratio = 1.0
+        min_vol_ratio = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_VOL_RATIO", float(getattr(cfg, "CONTINUATION_MIN_VOL_RATIO", 0.92)))
+
+        if side == "long":
+            touch_ok = low <= ema20 + atr_ltf * touch_atr
+            reclaim_ok = close >= ema20 and close > open_ and close > prev_close and close_pos >= close_pos_min
+            prev_pullback_ok = (prev_close <= prev_ema20 + atr_ltf * touch_atr) or (prev_open <= prev_ema20 + atr_ltf * touch_atr)
+            rsi_ok = min_rsi_long <= rsi <= max_rsi_long
+        else:
+            touch_ok = high >= ema20 - atr_ltf * touch_atr
+            reclaim_ok = close <= ema20 and close < open_ and close < prev_close and close_pos >= close_pos_min
+            prev_pullback_ok = (prev_close >= prev_ema20 - atr_ltf * touch_atr) or (prev_open >= prev_ema20 - atr_ltf * touch_atr)
+            rsi_ok = min_rsi_short <= rsi <= max_rsi_short
+
+        ok = touch_ok and reclaim_ok and body >= atr_ltf * body_atr and rsi_ok and vol_ratio >= min_vol_ratio
+        if require_prev_pullback:
+            ok = ok and prev_pullback_ok
+
+        return ok, {
+            "touch_ok": touch_ok,
+            "reclaim_ok": reclaim_ok,
+            "prev_pullback_ok": prev_pullback_ok,
+            "body": body,
+            "atr": atr_ltf,
+            "rsi": rsi,
+            "close_pos": close_pos,
+            "vol_ratio": vol_ratio,
+            "ema20": ema20,
+            "ema50": ema50,
+            "ema200": ema200,
+            "side": side,
+        }
+
     def _range_signal(self, symbol: str, df: pd.DataFrame, recent: pd.DataFrame, close: float, atr_ltf: float, adx_h: float, market_meta: dict) -> tuple[Optional[str], dict]:
         if len(recent) < 20 or atr_ltf <= 0 or close <= 0:
             return None, {"reason": "not_enough_range_history"}
@@ -951,12 +1043,13 @@ class MTFBreakoutStrategy(BaseStrategy):
             )
             return None
 
+        transition_state = False
         if market_state == "panic":
             logger.debug("[MTF] skip panic market state: %s", market_meta)
             return None
         if market_state == "transition":
-            logger.debug("[MTF] skip transition market state: %s", market_meta)
-            return None
+            transition_state = True
+            logger.debug("[MTF] transition market state: %s", market_meta)
 
         # Для trend-mode всё ещё требуем достаточно живой HTF-тренд.
         if market_state == "trend":
@@ -1051,10 +1144,8 @@ class MTFBreakoutStrategy(BaseStrategy):
         volume_filter_enabled = bool(getattr(cfg, "BREAKOUT_VOLUME_FILTER_V2_ENABLED", True))
         if volume_filter_enabled:
             volume_ok, volume_meta = self._calc_breakout_volume_momentum(recent=recent, candle=last, atr_ltf=atr_ltf, side="long" if regime == "bull" else "short")
-            if not volume_ok:
-                logger.debug("[MTF] skip weak breakout volume/momentum: %s", volume_meta)
-                return None
         else:
+            volume_ok = True
             volume_meta = {
                 "volume": volume,
                 "vol_ema": float(recent["volume"].astype(float).ewm(span=20, adjust=False).mean().iloc[-1]),
@@ -1149,7 +1240,39 @@ class MTFBreakoutStrategy(BaseStrategy):
         # ======================================================
 
         breakout_quality_enabled = bool(getattr(cfg, "BREAKOUT_CANDLE_QUALITY_ENABLED", True))
+
+        # Continuation entry: available in trend and transition states.
+        continuation_states = {"trend"}
+        if bool(getattr(cfg, "CONTINUATION_ALLOW_IN_TRANSITION", True)):
+            continuation_states.add("transition")
+
+        if market_state in continuation_states or transition_state:
+            if regime == "bull":
+                btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="long")
+                alt_ok, alt_meta = self._calc_alt_quality_score(symbol=symbol, recent=recent, atr_ltf=atr_ltf, side="long")
+                rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="long")
+                cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="long", atr_ltf=atr_ltf)
+                if btc_ok and alt_ok and rs_ok and cont_ok:
+                    logger.debug("[MTF] BUY continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
+                    return "buy"
+            elif regime == "bear":
+                btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="short")
+                alt_ok, alt_meta = self._calc_alt_quality_score(symbol=symbol, recent=recent, atr_ltf=atr_ltf, side="short")
+                rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="short")
+                cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
+                allow_short = True
+                if symbol != str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")) and bool(getattr(cfg, "ALT_SHORTS_REQUIRE_STRONG_BTC_BEAR", True)):
+                    btc_short_min = float(getattr(cfg, "BTC_REGIME_MIN_SCORE_SHORT", max(float(getattr(cfg, "BTC_REGIME_MIN_SCORE", 0.95)), 1.05)))
+                    allow_short = float(btc_meta.get("score", 0.0)) >= btc_short_min
+                if btc_ok and alt_ok and rs_ok and cont_ok and allow_short:
+                    logger.debug("[MTF] SELL continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
+                    return "sell"
+
         if market_state != "trend":
+            return None
+
+        if volume_filter_enabled and not volume_ok and not bool(getattr(cfg, "BREAKOUT_ALLOW_WITHOUT_VOLUME_IF_CONTINUATION_ONLY", False)):
+            logger.debug("[MTF] skip weak breakout volume/momentum: %s", volume_meta)
             return None
 
         # LONG: H1 bull-тренд + подтверждённое закрытие M15 выше диапазона
