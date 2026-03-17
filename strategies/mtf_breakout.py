@@ -30,6 +30,15 @@ class MTFBreakoutStrategy(BaseStrategy):
         self.last_signal_meta = {"signal": signal, "trade_type": trade_type, "risk_multiplier": float(risk_multiplier), **meta}
         return signal
 
+    def _symbol_flag(self, symbol: str, param_name: str, default: bool = False) -> bool:
+        value = cfg.get_symbol_param(symbol, param_name, default)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        try:
+            return bool(int(value))
+        except Exception:
+            return bool(value)
+
     def _extract_bar_timestamp(self, df: pd.DataFrame):
         """Пытается достать timestamp последней свечи из open_time или DatetimeIndex."""
         try:
@@ -1326,7 +1335,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         long_trigger = range_high * (1.0 + buf)
         short_trigger = range_low * (1.0 - buf)
 
-        if market_state in {"range", "transition"}:
+        if market_state in {"range", "transition"} and self._symbol_flag(symbol, "ENABLE_FAKEOUT", False):
             fake_long_ok, fake_long_meta = self._check_fakeout_reversal_entry(symbol=symbol, df=df, recent=recent, side="long", range_high=range_high, range_low=range_low, atr_ltf=atr_ltf, adx_h=adx_h)
             if fake_long_ok:
                 return self._set_signal("buy", trade_type="fakeout", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_FAKEOUT", float(getattr(cfg, "RISK_MULTIPLIER_FAKEOUT", 0.50)))), market_state=market_state, fakeout_meta=fake_long_meta, side="long")
@@ -1463,7 +1472,9 @@ class MTFBreakoutStrategy(BaseStrategy):
                 btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="long")
                 alt_ok, alt_meta = self._calc_alt_quality_score(symbol=symbol, recent=recent, atr_ltf=atr_ltf, side="long")
                 rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="long")
-                cont_comp_ok, cont_comp_meta = self._check_continuation_compression_entry(symbol=symbol, df=df, side="long", atr_ltf=atr_ltf)
+                cont_comp_ok, cont_comp_meta = (False, {"disabled": True})
+                if self._symbol_flag(symbol, "ENABLE_CONT_COMP", False):
+                    cont_comp_ok, cont_comp_meta = self._check_continuation_compression_entry(symbol=symbol, df=df, side="long", atr_ltf=atr_ltf)
                 if btc_ok and alt_ok and rs_ok and cont_comp_ok:
                     return self._set_signal("buy", trade_type="cont_compression", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONT_COMP", float(getattr(cfg, "RISK_MULTIPLIER_CONT_COMP", 0.75)))), market_state=market_state, cont_comp_meta=cont_comp_meta, side="long")
                 cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="long", atr_ltf=atr_ltf)
@@ -1478,7 +1489,9 @@ class MTFBreakoutStrategy(BaseStrategy):
                 if symbol != str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")) and bool(getattr(cfg, "ALT_SHORTS_REQUIRE_STRONG_BTC_BEAR", True)):
                     btc_short_min = float(getattr(cfg, "BTC_REGIME_MIN_SCORE_SHORT", max(float(getattr(cfg, "BTC_REGIME_MIN_SCORE", 0.95)), 1.05)))
                     allow_short = float(btc_meta.get("score", 0.0)) >= btc_short_min
-                cont_comp_ok, cont_comp_meta = self._check_continuation_compression_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
+                cont_comp_ok, cont_comp_meta = (False, {"disabled": True})
+                if self._symbol_flag(symbol, "ENABLE_CONT_COMP", False):
+                    cont_comp_ok, cont_comp_meta = self._check_continuation_compression_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
                 if btc_ok and alt_ok and rs_ok and cont_comp_ok and allow_short:
                     return self._set_signal("sell", trade_type="cont_compression", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONT_COMP", float(getattr(cfg, "RISK_MULTIPLIER_CONT_COMP", 0.75)))), market_state=market_state, cont_comp_meta=cont_comp_meta, side="short")
                 cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
