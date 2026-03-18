@@ -1,6 +1,13 @@
+
+import os
+import sys
 import numpy as np
 import pandas as pd
 from typing import Any, Dict, List, Optional
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.append(ROOT)
 
 import config as cfg
 from indicators import compute_indicators
@@ -694,3 +701,162 @@ class Backtester:
             if dd > max_dd:
                 max_dd = dd
         return max_dd
+
+# ------------------------------------------------------------------
+# Batch MTF backtest runner for yearly folders placed in the project root.
+# Expected folders: data_2022, data_2023, data_2024, data_2025
+# Expected files in each folder: <SYMBOL>_1h.csv and <SYMBOL>_15m.csv
+
+def _load_csv_for_batch(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    df = pd.read_csv(path)
+    df.columns = [c.lower() for c in df.columns]
+    if "open_time" in df.columns:
+        df["open_time"] = pd.to_datetime(df["open_time"])
+        df = df.sort_values("open_time").reset_index(drop=True)
+    return df
+
+
+def load_mtf_symbol_from_dir(symbol: str, data_dir: str) -> pd.DataFrame:
+    path_h1 = os.path.join(data_dir, f"{symbol}_1h.csv")
+    path_15m = os.path.join(data_dir, f"{symbol}_15m.csv")
+
+    df_15m = _load_csv_for_batch(path_15m)
+    df_1h = _load_csv_for_batch(path_h1)
+
+    for need in ("open", "high", "low", "close", "volume"):
+        if need not in df_15m.columns:
+            raise ValueError(f"{symbol}_15m.csv missing column {need}")
+        if need not in df_1h.columns:
+            raise ValueError(f"{symbol}_1h.csv missing column {need}")
+
+    df_1h_ind = compute_indicators(df_1h.copy())
+
+    if "open_time" not in df_1h_ind.columns or "open_time" not in df_15m.columns:
+        raise ValueError("Both HTF and LTF data must have open_time column for MTF mode")
+
+    df_1h_ind = df_1h_ind.set_index("open_time")
+    df_15m_idx = df_15m.set_index("open_time")
+    df_1h_sync = df_1h_ind.reindex(df_15m_idx.index, method="pad")
+
+    htf_cols = ["SMA_TREND", "EMA20", "EMA50", "EMA200", "ATR", "ADX", "RSI"]
+    for col in htf_cols:
+        hcol = f"HTF_{col}"
+        df_15m_idx[hcol] = df_1h_sync[col] if col in df_1h_sync.columns else pd.NA
+
+    return df_15m_idx.reset_index()
+
+
+def _format_result_block(year: str, symbols: list[str], history: int, max_len: int, result: Dict[str, Any]) -> str:
+    stats = result.get("trade_stats", {}) or {}
+    lines = [
+        str(year),
+        f"Symbols (MTF): {symbols}",
+        f"History: {history}",
+        f"Max_len: {max_len}",
+        f"Loop count: {max_len - history}",
+        "",
+        "=== BACKTEST RESULTS (MTF) ===",
+        f"PNL: {result.get('total_pnl', 0.0):.4f} USDT",
+        f"ROI: {result.get('roi', 0.0):.4f} %",
+        f"MaxDD: {result.get('max_drawdown', 0.0):.4f} %",
+        f"Trades: {stats.get('total_trades', 0)}",
+        f"Long trades: {stats.get('long_trades', 0)}",
+        f"Short trades: {stats.get('short_trades', 0)}",
+        f"Wins: {stats.get('wins', 0)}",
+        f"Losses: {stats.get('losses', 0)}",
+        f"Breakeven trades: {stats.get('breakeven_trades', 0)}",
+        f"WinRate: {stats.get('win_rate', 0.0):.2f} %",
+        f"ProfitFactor: {stats.get('profit_factor', 0.0):.4f}",
+        f"AvgTrade: {stats.get('avg_trade', 0.0):.4f} USDT",
+        f"AvgWin: {stats.get('avg_win', 0.0):.4f} USDT",
+        f"AvgLoss: {stats.get('avg_loss', 0.0):.4f} USDT",
+        f"Expectancy: {stats.get('expectancy', 0.0):.4f} USDT",
+        f"GrossProfit: {stats.get('gross_profit', 0.0):.4f} USDT",
+        f"GrossLoss: {stats.get('gross_loss', 0.0):.4f} USDT",
+        f"TP1 hit trades: {stats.get('tp1_hit_trades', 0)}",
+        f"TP1 hit rate: {stats.get('tp1_hit_rate', 0.0):.2f} %",
+        f"BE moved trades: {stats.get('be_moved_trades', 0)}",
+        f"Trailing active trades: {stats.get('trail_active_trades', 0)}",
+        f"Partial closes: {stats.get('partial_close_count', 0)}",
+        f"Partial close PnL: {stats.get('partial_close_pnl', 0.0):.4f} USDT",
+        f"Net AvgTrade (with partials): {stats.get('avg_trade', 0.0):.4f} USDT",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+
+def run_yearly_batch_backtests(project_root: Optional[str] = None, out_filename: str = "test_results.txt") -> str:
+    project_root = project_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    history = int(getattr(cfg, "BACKTEST_HISTORY", 300))
+    setattr(cfg, "STRATEGY_NAME", "mtf_breakout")
+
+    year_folders = [
+        ("2022", os.path.join(project_root, "data_2022")),
+        ("2023", os.path.join(project_root, "data_2023")),
+        ("2024", os.path.join(project_root, "data_2024")),
+        ("2025", os.path.join(project_root, "data_2025")),
+    ]
+    symbol_groups = [
+        ["BTCUSDT"],
+        ["BTCUSDT", "ETHUSDT"],
+        ["SOLUSDT", "BNBUSDT", "AVAXUSDT"],
+    ]
+
+    output_path = os.path.join(project_root, out_filename)
+    all_blocks: list[str] = []
+
+    for year, folder in year_folders:
+        if not os.path.isdir(folder):
+            all_blocks.append(f"{year}\n[SKIP] Folder not found: {folder}\n")
+            continue
+
+        for symbols in symbol_groups:
+            data: Dict[str, pd.DataFrame] = {}
+            max_len = 0
+            missing = []
+            for sym in symbols:
+                try:
+                    df_sym = load_mtf_symbol_from_dir(sym, folder)
+                except Exception as e:
+                    missing.append(f"{sym}: {e}")
+                    continue
+                if len(df_sym) == 0:
+                    missing.append(f"{sym}: empty data")
+                    continue
+                data[sym] = df_sym
+                max_len = max(max_len, len(df_sym))
+
+            if not data:
+                block = [
+                    str(year),
+                    f"Symbols (MTF): {symbols}",
+                    f"History: {history}",
+                    "",
+                    "[SKIP] No data loaded.",
+                ]
+                if missing:
+                    block.append("Problems: " + "; ".join(missing))
+                block.append("")
+                all_blocks.append("\n".join(block))
+                continue
+
+            bt = Backtester(data)
+            result = bt.run()
+            block = _format_result_block(year, symbols, history, max_len, result)
+            if missing:
+                block += "Problems: " + "; ".join(missing) + "\n\n"
+            all_blocks.append(block)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(all_blocks).rstrip() + "\n")
+
+    print(f"\n[BATCH] Results saved to: {output_path}")
+    return output_path
+
+
+if __name__ == "__main__":
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    run_yearly_batch_backtests(project_root=ROOT, out_filename="test_results.txt")
