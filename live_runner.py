@@ -45,6 +45,7 @@ from position_management import (
     update_trailing_stop,
     mark_tp1_bar,
     should_time_stop_after_tp1,
+    should_close_runner_on_stall,
 )
 
 
@@ -411,7 +412,7 @@ class LiveRunner:
             if closed:
                 return
 
-            update_peak_price(pos, price)
+            update_peak_price(pos, price, i)
             maybe_move_to_break_even(pos, price, atr)
 
             # Первая цель по прибыли: фиксируем меньшую часть раньше и оставляем хвост под тренд
@@ -432,6 +433,10 @@ class LiveRunner:
                 await self._close_position_live(symbol, pos, price, reason="trailing_stop")
                 return
             self._update_position_state(symbol, pos)
+
+            if pos.qty > 0 and should_close_runner_on_stall(pos, i):
+                await self._close_position_live(symbol, pos, price, reason="runner_stall")
+                return
 
             if pos.qty > 0 and should_time_stop_after_tp1(pos, i):
                 await self._close_position_live(symbol, pos, price, reason="time_stop_after_tp1")

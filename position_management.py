@@ -48,15 +48,30 @@ def calc_tp1_price(entry_price: float, atr: float, side: str, symbol: str = "", 
     return entry_price - tp1_mult * atr
 
 
-def update_peak_price(pos, price: float) -> None:
+def update_peak_price(pos, price: float, bar_index: int | None = None) -> None:
     peak = getattr(pos, "peak_price", None)
     if peak is None:
         pos.peak_price = float(price)
+        if bar_index is not None:
+            try:
+                pos.peak_bar_index = int(bar_index)
+            except Exception:
+                pass
         return
+    updated = False
     if pos.side == "long":
-        pos.peak_price = max(float(peak), float(price))
+        new_peak = max(float(peak), float(price))
+        updated = new_peak > float(peak)
+        pos.peak_price = new_peak
     else:
-        pos.peak_price = min(float(peak), float(price))
+        new_peak = min(float(peak), float(price))
+        updated = new_peak < float(peak)
+        pos.peak_price = new_peak
+    if updated and bar_index is not None:
+        try:
+            pos.peak_bar_index = int(bar_index)
+        except Exception:
+            pass
 
 
 def maybe_move_to_break_even(pos, price: float, atr: float) -> bool:
@@ -118,7 +133,7 @@ def on_tp1_hit(pos, price: float, atr: float) -> None:
     pos.trail_active = False
     pos.tp1 = None
     pos.tp1_hit_price = float(price)
-    update_peak_price(pos, price)
+    update_peak_price(pos, price, getattr(pos, "tp1_bar_index", None))
 
 
 def maybe_activate_trailing(pos, price: float, atr: float) -> bool:
@@ -226,5 +241,29 @@ def should_time_stop_after_tp1(pos, bar_index: int | None) -> bool:
         return False
     try:
         return int(bar_index) - int(tp1_bar_index) >= bars_limit
+    except Exception:
+        return False
+
+
+def should_close_runner_on_stall(pos, bar_index: int | None) -> bool:
+    if bar_index is None:
+        return False
+    symbol = getattr(pos, "symbol", "")
+    only_after_tp1 = bool(_cfg_float("POSITION_RUNNER_STALL_ONLY_AFTER_TP1", 1.0, symbol))
+    if only_after_tp1 and not getattr(pos, "tp1_hit", False):
+        return False
+    try:
+        bars_limit = int(_profile_cfg_float("POSITION_RUNNER_STALL_BARS", 0.0, pos, symbol))
+    except Exception:
+        bars_limit = 0
+    if bars_limit <= 0:
+        return False
+    peak_bar_index = getattr(pos, "peak_bar_index", None)
+    if peak_bar_index is None:
+        peak_bar_index = getattr(pos, "tp1_bar_index", None)
+    if peak_bar_index is None:
+        return False
+    try:
+        return int(bar_index) - int(peak_bar_index) >= bars_limit
     except Exception:
         return False

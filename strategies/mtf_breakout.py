@@ -1366,6 +1366,21 @@ class MTFBreakoutStrategy(BaseStrategy):
                 logger.debug("[MTF] skip overheated HTF move: %s", overext_meta)
                 return None
 
+            if bool(cfg.get_symbol_param(symbol, "MARKET_REGIME_FILTER_ENABLED", getattr(cfg, "MARKET_REGIME_FILTER_ENABLED", True))):
+                require_trend_state = bool(cfg.get_symbol_param(symbol, "MARKET_REGIME_REQUIRE_TREND_STATE", getattr(cfg, "MARKET_REGIME_REQUIRE_TREND_STATE", True)))
+                min_regime_adx = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_MIN_HTF_ADX", float(getattr(cfg, "MARKET_REGIME_MIN_HTF_ADX", 18.0))))
+                min_regime_atr_pct = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_MIN_HTF_ATR_PCT", float(getattr(cfg, "MARKET_REGIME_MIN_HTF_ATR_PCT", 0.0012))))
+                min_regime_drift = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_MIN_DRIFT_PCT", float(getattr(cfg, "MARKET_REGIME_MIN_DRIFT_PCT", drift_min_pct))))
+                if require_trend_state and market_state != "trend":
+                    logger.debug("[MTF] skip non-trend market_state by regime filter: %s", market_state)
+                    return None
+                if adx_h < min_regime_adx or atr_pct_h < min_regime_atr_pct or drift < min_regime_drift:
+                    logger.debug(
+                        "[MTF] skip weak regime: adx_h=%.2f atr_pct_h=%.5f drift=%.5f thresholds=(%.2f, %.5f, %.5f)",
+                        adx_h, atr_pct_h, drift, min_regime_adx, min_regime_atr_pct, min_regime_drift
+                    )
+                    return None
+
             drift_min_eff = drift_min_pct
             if bool(getattr(cfg, "MTF_DRIFT_ADAPTIVE_ENABLED", True)):
                 try:
