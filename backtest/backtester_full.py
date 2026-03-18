@@ -401,44 +401,48 @@ class Backtester:
                 if price is None or atr <= 0 or df_slice is None:
                     continue
 
-                # 1) Жёсткий SL
-                if pos.stop_loss is not None:
-                    if pos.side == "long" and price <= pos.stop_loss:
-                        balance, pnl_after_fee = self._close_position(balance, sym, pos, price, return_pnl=True, reason="stop_loss", bar_index=i)
-                        register_stop_loss(sym, pos.side, i, pnl_after_fee)
-                        positions[sym] = None
-                        continue
-                    if pos.side == "short" and price >= pos.stop_loss:
-                        balance, pnl_after_fee = self._close_position(balance, sym, pos, price, return_pnl=True, reason="stop_loss", bar_index=i)
-                        register_stop_loss(sym, pos.side, i, pnl_after_fee)
-                        positions[sym] = None
-                        continue
+                bar_high = float(row.get("high", price))
+                bar_low = float(row.get("low", price))
+                favorable_price = bar_high if pos.side == "long" else bar_low
 
-                update_peak_price(pos, price)
-                maybe_move_to_break_even(pos, price, atr)
-
-                # 2) Первая цель по прибыли: частично фиксируем импульс раньше
-                if pos.tp1 is not None and should_take_tp1(pos, price):
+                # 1) Intrabar SL / TP / trailing. Если на свече задеты несколько уровней,
+                # порядок определяется _pick_intrabar_exit(...).
+                exit_reason, exit_price = self._pick_intrabar_exit(pos, row)
+                if exit_reason == "stop_loss":
+                    balance, pnl_after_fee = self._close_position(balance, sym, pos, exit_price, return_pnl=True, reason="stop_loss", bar_index=i)
+                    register_stop_loss(sym, pos.side, i, pnl_after_fee)
+                    positions[sym] = None
+                    continue
+                if exit_reason == "tp1":
                     tp1_frac = tp1_fraction(pos)
                     if tp1_frac >= 1.0:
-                        balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="tp1_full", bar_index=i)
+                        balance, _ = self._close_position(balance, sym, pos, exit_price, return_pnl=True, reason="tp1_full", bar_index=i)
                         reset_stop_streak(sym, pos.side)
                         positions[sym] = None
                         continue
-                    balance = self._close_fraction(balance, sym, pos, price, fraction=tp1_frac, reason="tp1", bar_index=i)
-                    on_tp1_hit(pos, price, atr)
+                    balance = self._close_fraction(balance, sym, pos, exit_price, fraction=tp1_frac, reason="tp1", bar_index=i)
+                    on_tp1_hit(pos, exit_price, atr)
                     mark_tp1_bar(pos, i)
-                    update_trailing_stop(pos, atr)
-
-                # 3) Менее шумный трейлинг от лучшей достигнутой цены
-                maybe_activate_trailing(pos, price, atr)
-                update_trailing_stop(pos, atr)
-                if pos.trailing_stop is not None and should_close_on_trailing(pos, price):
-                    balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="trailing_stop", bar_index=i)
+                elif exit_reason == "trailing_stop":
+                    balance, _ = self._close_position(balance, sym, pos, exit_price, return_pnl=True, reason="trailing_stop", bar_index=i)
                     reset_stop_streak(sym, pos.side)
                     positions[sym] = None
                     continue
 
+                # 2) Обновляем MFE по экстремуму свечи и двигаем BE / trailing по лучшей цене внутри бара.
+                update_peak_price(pos, favorable_price)
+                maybe_move_to_break_even(pos, favorable_price, atr)
+
+                # 3) Runner включаем только после дополнительного прогресса за TP1.
+                maybe_activate_trailing(pos, favorable_price, atr)
+                update_trailing_stop(pos, atr)
+
+                # 3.25) После TP1 не держим хвост вечно: если продолжения нет — закрываем остаток.
+                if should_time_stop_after_tp1(pos, i):
+                    balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="time_stop_after_tp1", bar_index=i)
+                    reset_stop_streak(sym, pos.side)
+                    positions[sym] = None
+                    continue
 
                 # 3.5) Ограничение максимального времени жизни позиции (тайм-стоп)
                 # Для MTF-стратегии считаем возраст позиции в барах LTF (индекс i - open_time),

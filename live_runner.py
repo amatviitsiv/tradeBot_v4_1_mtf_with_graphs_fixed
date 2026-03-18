@@ -43,6 +43,8 @@ from position_management import (
     tp1_fraction,
     update_peak_price,
     update_trailing_stop,
+    mark_tp1_bar,
+    should_time_stop_after_tp1,
 )
 
 
@@ -420,7 +422,7 @@ class LiveRunner:
                     return
                 await self._close_fraction_live(symbol, pos, price, fraction=tp1_frac, reason="tp1")
                 on_tp1_hit(pos, price, atr)
-                update_trailing_stop(pos, atr)
+                mark_tp1_bar(pos, i)
                 self._update_position_state(symbol, pos)
 
             # Менее шумный трейлинг: ведём его от лучшей достигнутой цены
@@ -430,6 +432,10 @@ class LiveRunner:
                 await self._close_position_live(symbol, pos, price, reason="trailing_stop")
                 return
             self._update_position_state(symbol, pos)
+
+            if pos.qty > 0 and should_time_stop_after_tp1(pos, i):
+                await self._close_position_live(symbol, pos, price, reason="time_stop_after_tp1")
+                return
 
             # Ограничение максимального времени жизни позиции (тайм-стоп)
             mtf_max_bars = int(getattr(config, "MTF_MAX_BARS_IN_POSITION", 0) or 0)

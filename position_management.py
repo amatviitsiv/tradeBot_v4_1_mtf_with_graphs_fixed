@@ -115,8 +115,9 @@ def on_tp1_hit(pos, price: float, atr: float) -> None:
             pos.stop_loss = be_stop
     pos.be_moved = True
     pos.tp1_hit = True
-    pos.trail_active = True
+    pos.trail_active = False
     pos.tp1 = None
+    pos.tp1_hit_price = float(price)
     update_peak_price(pos, price)
 
 
@@ -136,10 +137,20 @@ def maybe_activate_trailing(pos, price: float, atr: float) -> bool:
         move_atr = (price - pos.entry_price) / atr
     else:
         move_atr = (pos.entry_price - price) / atr
-    if move_atr >= activation_atr:
-        pos.trail_active = True
-        return True
-    return False
+    if move_atr < activation_atr:
+        return False
+    if getattr(pos, "tp1_hit", False):
+        extra_after_tp1_atr = _profile_cfg_float("POSITION_RUNNER_ACTIVATION_ATR_AFTER_TP1", 0.0, pos, symbol)
+        if extra_after_tp1_atr > 0:
+            tp1_ref = float(getattr(pos, "tp1_hit_price", getattr(pos, "entry_price", price)) or price)
+            if pos.side == "long":
+                runner_move_atr = (price - tp1_ref) / atr
+            else:
+                runner_move_atr = (tp1_ref - price) / atr
+            if runner_move_atr < extra_after_tp1_atr:
+                return False
+    pos.trail_active = True
+    return True
 
 
 def update_trailing_stop(pos, atr: float) -> bool:
