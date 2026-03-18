@@ -18,6 +18,8 @@ from position_management import (
     tp1_fraction,
     update_peak_price,
     update_trailing_stop,
+    mark_tp1_bar,
+    should_time_stop_after_tp1,
 )
 
 
@@ -44,6 +46,57 @@ class Backtester:
         self.fee_rate = float(getattr(cfg, "FUTURES_FEE_RATE", 0.0004))
         self.closed_trades: List[Dict[str, Any]] = []
         self.partial_closes: List[Dict[str, Any]] = []
+        self.trade_realized_pnl: Dict[str, float] = {}
+
+    def _trade_key(self, sym: str, pos: Position) -> str:
+        return f"{sym}|{str(pos.side).lower()}|{int(float(getattr(pos, 'open_time', 0) or 0))}"
+
+    def _apply_exit_slippage(self, price: float, side: str, reason: str) -> float:
+        if not bool(getattr(cfg, "BACKTEST_APPLY_SLIPPAGE", True)):
+            return float(price)
+        bps = float(getattr(cfg, "BACKTEST_SLIPPAGE_BPS", 0.0) or 0.0)
+        if bps <= 0:
+            return float(price)
+        slip = bps / 10000.0
+        side = str(side).lower()
+        reason = str(reason).lower()
+        adverse_for_long = side == "long"
+        if reason in {"tp1", "take_profit", "tp", "target"}:
+            adverse_for_long = side == "long"
+        elif reason in {"stop_loss", "trailing_stop", "time_stop_after_tp1", "time_stop", "reverse_signal", "end_of_backtest"}:
+            adverse_for_long = side == "long"
+        if side == "long":
+            return float(price) * (1.0 - slip)
+        return float(price) * (1.0 + slip)
+
+    def _pick_intrabar_exit(self, pos: Position, bar: pd.Series) -> tuple[str | None, float | None]:
+        high = float(bar.get("high", bar.get("close", 0.0)))
+        low = float(bar.get("low", bar.get("close", 0.0)))
+        close = float(bar.get("close", 0.0))
+        order = str(getattr(cfg, "BACKTEST_INTRABAR_EXIT_ORDER", "conservative") or "conservative").lower()
+        if pos.side == "long":
+            sl_hit = pos.stop_loss is not None and low <= float(pos.stop_loss)
+            tp_hit = pos.tp1 is not None and high >= float(pos.tp1)
+            if sl_hit and tp_hit:
+                return ("stop_loss", float(pos.stop_loss)) if order == "conservative" else ("tp1", float(pos.tp1))
+            if sl_hit:
+                return "stop_loss", float(pos.stop_loss)
+            if tp_hit:
+                return "tp1", float(pos.tp1)
+            if pos.trailing_stop is not None and low <= float(pos.trailing_stop):
+                return "trailing_stop", float(pos.trailing_stop)
+        else:
+            sl_hit = pos.stop_loss is not None and high >= float(pos.stop_loss)
+            tp_hit = pos.tp1 is not None and low <= float(pos.tp1)
+            if sl_hit and tp_hit:
+                return ("stop_loss", float(pos.stop_loss)) if order == "conservative" else ("tp1", float(pos.tp1))
+            if sl_hit:
+                return "stop_loss", float(pos.stop_loss)
+            if tp_hit:
+                return "tp1", float(pos.tp1)
+            if pos.trailing_stop is not None and high >= float(pos.trailing_stop):
+                return "trailing_stop", float(pos.trailing_stop)
+        return None, None
 
     # ------------------------------------------------------------------
     def _attach_btc_regime_columns(self, out: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -132,6 +185,9 @@ class Backtester:
     ) -> None:
         entry_notional = float(pos.entry_price * pos.qty) if pos.qty > 0 else 0.0
         pnl_pct_on_notional = (float(pnl_after_fee) / entry_notional * 100.0) if entry_notional > 0 else 0.0
+        trade_key = self._trade_key(sym, pos)
+        partial_realized = float(self.trade_realized_pnl.get(trade_key, 0.0))
+        total_trade_pnl = float(partial_realized + pnl_after_fee)
         self.closed_trades.append(
             {
                 "symbol": sym,
@@ -140,10 +196,15 @@ class Backtester:
                 "exit_price": float(price),
                 "qty": float(pos.qty),
                 "pnl": float(pnl_after_fee),
+                "trade_pnl_total": float(total_trade_pnl),
+                "runner_pnl_after_tp1": float(pnl_after_fee),
+                "partial_realized_pnl": float(partial_realized),
                 "pnl_pct_on_notional": float(pnl_pct_on_notional),
                 "reason": reason,
                 "bar_index": int(bar_index) if bar_index is not None else None,
                 "entry_bar_index": int(pos.open_time) if getattr(pos, "open_time", None) is not None else None,
+                "trade_type": str(getattr(pos, "trade_type", "unknown") or "unknown"),
+                "market_state": str(getattr(pos, "market_state", "unknown") or "unknown"),
                 "tp1_hit": bool(getattr(pos, "tp1_hit", False)),
                 "be_moved": bool(getattr(pos, "be_moved", False)),
                 "trail_active": bool(getattr(pos, "trail_active", False)),
@@ -176,7 +237,7 @@ class Backtester:
                 "partial_close_pnl": float(sum(x["pnl"] for x in self.partial_closes)) if self.partial_closes else 0.0,
             }
 
-        pnls = [float(t["pnl"]) for t in self.closed_trades]
+        pnls = [float(t.get("trade_pnl_total", t["pnl"])) for t in self.closed_trades]
         wins = [x for x in pnls if x > 0]
         losses = [x for x in pnls if x < 0]
         breakevens = [x for x in pnls if x == 0]
@@ -242,6 +303,7 @@ class Backtester:
     def run(self) -> Dict[str, float]:
         self.closed_trades = []
         self.partial_closes = []
+        self.trade_realized_pnl = {}
         data = self._prepare()
         if not data:
             return {"total_pnl": 0.0, "roi": 0.0, "max_drawdown": 0.0}
@@ -548,6 +610,8 @@ class Backtester:
         print(f"Trailing active trades: {stats['trail_active_trades']}")
         print(f"Partial closes: {stats['partial_close_count']}")
         print(f"Partial close PnL: {stats['partial_close_pnl']:.4f} USDT")
+        if stats["total_trades"] > 0:
+            print(f"Net AvgTrade (with partials): {stats['avg_trade']:.4f} USDT")
 
         return {
             "total_pnl": float(total_pnl),
@@ -567,6 +631,7 @@ class Backtester:
         if qty_close <= 0:
             return balance
 
+        price = self._apply_exit_slippage(price, pos.side, reason)
         if pos.side == "long":
             pnl = (price - pos.entry_price) * qty_close
         else:
@@ -579,6 +644,8 @@ class Backtester:
 
         new_balance = balance + pnl_after_fee
         self._record_partial_close(sym, pos, price, qty_close, pnl_after_fee, reason=reason, bar_index=bar_index)
+        trade_key = self._trade_key(sym, pos)
+        self.trade_realized_pnl[trade_key] = float(self.trade_realized_pnl.get(trade_key, 0.0)) + float(pnl_after_fee)
 
         # уменьшаем позицию
         pos.qty -= qty_close
@@ -594,6 +661,7 @@ class Backtester:
         if pos.qty <= 0:
             return (balance, 0.0) if return_pnl else balance
 
+        price = self._apply_exit_slippage(price, pos.side, reason)
         if pos.side == "long":
             pnl = (price - pos.entry_price) * pos.qty
         else:

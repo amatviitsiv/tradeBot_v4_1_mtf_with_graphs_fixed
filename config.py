@@ -21,6 +21,8 @@ REAL_TRADING = False
 
 EQUITY_NOTIFY_INTERVAL = 600
 # API ключи для Binance (заполняешь ТОЛЬКО если REAL_TRADING = True)
+import os as _os
+
 API_KEY = "cOzVm76AAqWwFe6vvHcoZ2wB1mNhJg01DJ9GpA5ZXq12nBpGmsJdwMoXTyRVA9Hw"
 API_SECRET = "O4o0oORj7wloy6DfeuWbcOVUy9SfV8z94gSyBQF63kHyQkPPJDXlZqYmuKwmKcfX"
 
@@ -34,25 +36,13 @@ INITIAL_BALANCE_USDT = 5000
 TIMEFRAME = "1m"
 HISTORY_LIMIT = 300
 
-CAPITAL_ALLOCATION_PER_SYMBOL = 0.4   # 40% от equity на символ
-
-TAKE_PROFIT_PCT = 0.004   # 0.4%
-STOP_LOSS_PCT   = 0.002   # 0.2%
-
-# Трейлинг можно оставить как было, если он у тебя уже настроен
-TRAILING_ACTIVATION_PCT = 0.01
-TRAILING_STOP_PCT       = 0.005
-
-# Пирамидинг пока выключим — сначала добьёмся положительной базовой стратегии
-PYRAMID_ENABLED   = False
-PYRAMID_STEP_PCT  = 0.01
-PYRAMID_ADD_PCT   = 0.5
-PYRAMID_MAX_MULT  = 3.0
 
 # Индикаторы тренда
 SMA_TREND_PERIOD = 200
 EMA_FAST = 5
 EMA_SLOW = 13
+EMA_FAST_PERIOD = EMA_FAST
+EMA_SLOW_PERIOD = EMA_SLOW
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
@@ -77,7 +67,6 @@ RISK_PER_TRADE = 0.01                 # 1% от equity
 # ===== ФЬЮЧЕРСЫ =====
 # Базовое плечо. В коде можно будет делать dynamic_leverage(equity)
 FUTURES_LEVERAGE_DEFAULT = 5
-FUTURES_NOTIONAL_LIMIT = 2000.0  # максимальный размер позиции в USDT (для безопасности)
 
 # ===== ЛОГИКА ОПРОСА =====
 # Как часто перезапускаем цикл оценки стратегии (в секундах)
@@ -95,12 +84,6 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 # === Trend strategy params (Dual Trend Bot) ===
 
-
-# Максимальное количество добавочных входов поверх первой позиции
-PYRAMID_MAX_LAYERS = 2              # напр: 0 = отключено, 1–3 = разумно
-
-# Размер каждого добавочного входа относительно исходного notional
-PYRAMID_SCALE = 0.5                 # 0.5 = каждый догон на половину первоначального объёма
 
 # ATR-фильтр волатильности (% от цены)
 ATR_MIN_PCT = 0.1     # слишком тихий рынок ниже этого
@@ -178,7 +161,7 @@ BREAKOUT_RSI_STRONG_VOLUME_LOOSEN = 1.5
 LTF_ATR_MIN_PCT = 0.0002
 # Максимальное время жизни позиции в барах LTF (для MTF-стратегии)
 # Пример: 96 баров M15 ≈ 1 день
-MTF_MAX_BARS_IN_POSITION = 192
+MTF_MAX_BARS_IN_POSITION = 128
 
 # Динамический коэффициент для lookback по волатильности:
 # При высокой волатильности (atr_pct_h > MTF_ATR_HIGH_VOL_PCT) lookback уменьшается,
@@ -726,18 +709,24 @@ PRELOAD_1H_LIMIT  = int(_os.getenv('PRELOAD_1H_LIMIT', '200'))
 # 3) трейлинг ведём от лучшей достигнутой цены, а не от каждого нового close.
 POSITION_MANAGEMENT_V2_ENABLED = True
 POSITION_TP1_ATR_MULT = 8.0
-POSITION_TP1_CLOSE_FRACTION = 0.25
+POSITION_TP1_CLOSE_FRACTION = 0.40
 POSITION_BE_TRIGGER_ATR = 3.0
 POSITION_BE_OFFSET_ATR = 0.12
 POSITION_BE_ONLY_AFTER_TP1 = True
-POSITION_TRAILING_ACTIVATION_ATR = 8.0
-POSITION_TRAILING_ATR_MULT = 5.4
-POSITION_TRAILING_STEP_ATR = 0.40
+POSITION_TRAILING_ACTIVATION_ATR = 6.8
+POSITION_TRAILING_ATR_MULT = 4.7
+POSITION_TRAILING_STEP_ATR = 0.32
 POSITION_TRAILING_ONLY_AFTER_TP1 = True
+POSITION_TIME_STOP_AFTER_TP1_BARS = 16
+
+# Backtest realism
+BACKTEST_INTRABAR_EXIT_ORDER = "conservative"
+BACKTEST_SLIPPAGE_BPS = 1.0
+BACKTEST_APPLY_SLIPPAGE = True
 
 
 # ===== Continuation / trade-type params =====
-CONTINUATION_ALLOW_IN_TRANSITION = True
+CONTINUATION_ALLOW_IN_TRANSITION = False
 CONTINUATION_TOUCH_ATR = 0.35
 CONTINUATION_MIN_BODY_ATR = 0.32
 CONTINUATION_MIN_CLOSE_POS = 0.55
@@ -753,8 +742,8 @@ CONTINUATION_SOFT_REJECTION = 0.0
 
 # ===== v4-style risk model =====
 RISK_MULTIPLIER_IMPULSE = 1.00
-RISK_MULTIPLIER_CONTINUATION = 0.60
-RISK_MULTIPLIER_RANGE = 0.40
+RISK_MULTIPLIER_CONTINUATION = 0.40
+RISK_MULTIPLIER_RANGE = 0.25
 
 # ===== Range filters =====
 # values are defined in the main range section above to avoid duplicates
@@ -783,17 +772,17 @@ CONT_COMP_BREAK_PREV_FACTOR = 0.15
 # ===== v12 regime-based exit profiles =====
 # trend profile keeps v11 style runners; range/transition exits faster.
 POSITION_TP1_ATR_MULT_TREND = 8.8
-POSITION_TP1_CLOSE_FRACTION_TREND = 0.20
+POSITION_TP1_CLOSE_FRACTION_TREND = 0.38
 POSITION_BE_TRIGGER_ATR_TREND = 3.0
 POSITION_BE_OFFSET_ATR_TREND = 0.12
-POSITION_TRAILING_ACTIVATION_ATR_TREND = 8.8
-POSITION_TRAILING_ATR_MULT_TREND = 6.2
-POSITION_TRAILING_STEP_ATR_TREND = 0.48
+POSITION_TRAILING_ACTIVATION_ATR_TREND = 7.2
+POSITION_TRAILING_ATR_MULT_TREND = 5.0
+POSITION_TRAILING_STEP_ATR_TREND = 0.34
 
 POSITION_TP1_ATR_MULT_RANGE = 5.8
-POSITION_TP1_CLOSE_FRACTION_RANGE = 0.34
+POSITION_TP1_CLOSE_FRACTION_RANGE = 0.50
 POSITION_BE_TRIGGER_ATR_RANGE = 0.0
 POSITION_BE_OFFSET_ATR_RANGE = 0.08
-POSITION_TRAILING_ACTIVATION_ATR_RANGE = 5.8
-POSITION_TRAILING_ATR_MULT_RANGE = 3.8
-POSITION_TRAILING_STEP_ATR_RANGE = 0.28
+POSITION_TRAILING_ACTIVATION_ATR_RANGE = 4.8
+POSITION_TRAILING_ATR_MULT_RANGE = 3.0
+POSITION_TRAILING_STEP_ATR_RANGE = 0.20

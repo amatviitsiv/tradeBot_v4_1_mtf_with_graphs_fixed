@@ -189,3 +189,31 @@ def tp1_fraction(pos=None) -> float:
     if frac >= 1:
         return 0.99
     return frac
+
+
+
+def mark_tp1_bar(pos, bar_index: int | None) -> None:
+    if bar_index is None:
+        return
+    try:
+        pos.tp1_bar_index = int(bar_index)
+    except Exception:
+        pass
+
+
+def should_time_stop_after_tp1(pos, bar_index: int | None) -> bool:
+    if bar_index is None or not getattr(pos, "tp1_hit", False):
+        return False
+    try:
+        bars_limit = int(_profile_cfg_float("POSITION_TIME_STOP_AFTER_TP1_BARS", 0.0, pos, getattr(pos, "symbol", "")))
+    except Exception:
+        bars_limit = 0
+    if bars_limit <= 0:
+        return False
+    tp1_bar_index = getattr(pos, "tp1_bar_index", None)
+    if tp1_bar_index is None:
+        return False
+    try:
+        return int(bar_index) - int(tp1_bar_index) >= bars_limit
+    except Exception:
+        return False
