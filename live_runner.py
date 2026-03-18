@@ -118,7 +118,7 @@ class LiveRunner:
                         "volume": float(r[5]),
                     })
                 except Exception:
-                    continue
+                    return
             df = pd.DataFrame(rows)
             return df
 
@@ -414,7 +414,11 @@ class LiveRunner:
 
             # Первая цель по прибыли: фиксируем меньшую часть раньше и оставляем хвост под тренд
             if pos.tp1 is not None and pos.qty > 0 and should_take_tp1(pos, price):
-                await self._close_fraction_live(symbol, pos, price, fraction=tp1_fraction(), reason="tp1")
+                tp1_frac = tp1_fraction(pos)
+                if tp1_frac >= 1.0:
+                    await self._close_position_live(symbol, pos, price, reason="tp1_full")
+                    return
+                await self._close_fraction_live(symbol, pos, price, fraction=tp1_frac, reason="tp1")
                 on_tp1_hit(pos, price, atr)
                 update_trailing_stop(pos, atr)
                 self._update_position_state(symbol, pos)

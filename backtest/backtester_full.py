@@ -412,8 +412,15 @@ class Backtester:
 
                 # 2) Первая цель по прибыли: частично фиксируем импульс раньше
                 if pos.tp1 is not None and should_take_tp1(pos, price):
-                    balance = self._close_fraction(balance, sym, pos, price, fraction=tp1_fraction())
+                    tp1_frac = tp1_fraction(pos)
+                    if tp1_frac >= 1.0:
+                        balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="tp1_full", bar_index=i)
+                        reset_stop_streak(sym, pos.side)
+                        positions[sym] = None
+                        continue
+                    balance = self._close_fraction(balance, sym, pos, price, fraction=tp1_frac, reason="tp1", bar_index=i)
                     on_tp1_hit(pos, price, atr)
+                    mark_tp1_bar(pos, i)
                     update_trailing_stop(pos, atr)
 
                 # 3) Менее шумный трейлинг от лучшей достигнутой цены

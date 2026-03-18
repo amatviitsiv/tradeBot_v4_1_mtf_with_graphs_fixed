@@ -187,7 +187,7 @@ def tp1_fraction(pos=None) -> float:
     if frac <= 0:
         return 0.0
     if frac >= 1:
-        return 0.99
+        return 1.0
     return frac
 
 
