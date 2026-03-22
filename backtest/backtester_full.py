@@ -16,17 +16,19 @@ from strategies import get_active_strategy
 from risk import RiskManager
 from position import PositionState as Position
 from position_management import (
+    calc_initial_stop_price,
     calc_tp1_price,
     maybe_move_to_break_even,
     maybe_activate_trailing,
     on_tp1_hit,
     should_take_tp1,
     should_close_on_trailing,
+    should_time_stop_before_tp1,
+    should_time_stop_after_tp1,
     tp1_fraction,
     update_peak_price,
     update_trailing_stop,
     mark_tp1_bar,
-    should_time_stop_after_tp1,
 )
 
 
@@ -438,6 +440,13 @@ class Backtester:
                 maybe_activate_trailing(pos, favorable_price, atr)
                 update_trailing_stop(pos, atr)
 
+                # 3.2) Для continuation/range/fakeout идея должна сработать быстрее.
+                if should_time_stop_before_tp1(pos, i):
+                    balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="time_stop_before_tp1", bar_index=i)
+                    reset_stop_streak(sym, pos.side)
+                    positions[sym] = None
+                    continue
+
                 # 3.25) После TP1 не держим хвост вечно: если продолжения нет — закрываем остаток.
                 if should_time_stop_after_tp1(pos, i):
                     balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="time_stop_after_tp1", bar_index=i)
@@ -528,8 +537,11 @@ class Backtester:
                 if cooldown_enabled and i < int(cooldown_until_bar[sym].get(side, -1)):
                     continue
 
-                # расстояние до стопа в процентах
-                stop_distance_pct = atr_sl_mult * atr / price * 100.0
+                sig_meta = getattr(get_active_strategy(), "last_signal_meta", {}) or {}
+                trade_type = str(sig_meta.get("trade_type", "unknown") or "unknown")
+                market_state = str(sig_meta.get("market_state", "unknown") or "unknown")
+                initial_stop = calc_initial_stop_price(price, atr, side, sym, None, trade_type=trade_type, market_state=market_state)
+                stop_distance_pct = abs(price - initial_stop) / price * 100.0
                 if stop_distance_pct <= 0:
                     continue
 
@@ -550,13 +562,7 @@ class Backtester:
                 if notional <= 0 or qty <= 0:
                     continue
 
-                if side == "long":
-                    stop_loss = price - atr_sl_mult * atr
-                else:
-                    stop_loss = price + atr_sl_mult * atr
-                sig_meta = getattr(get_active_strategy(), "last_signal_meta", {}) or {}
-                trade_type = str(sig_meta.get("trade_type", "unknown") or "unknown")
-                market_state = str(sig_meta.get("market_state", "unknown") or "unknown")
+                stop_loss = initial_stop
                 tp1 = calc_tp1_price(price, atr, side, sym, None)
 
                 positions[sym] = Position(

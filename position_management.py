@@ -15,14 +15,23 @@ def _cfg_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _position_profile(pos) -> str:
-    market_state = str(getattr(pos, "market_state", "") or "").lower()
-    trade_type = str(getattr(pos, "trade_type", "") or "").lower()
+def _position_profile_from_values(market_state: str = "", trade_type: str = "") -> str:
+    market_state = str(market_state or "").lower()
+    trade_type = str(trade_type or "").lower()
+    if trade_type in {"continuation", "cont_compression"}:
+        return "continuation"
     if market_state in {"range", "transition"}:
         return "range"
-    if trade_type in {"range", "fakeout", "btc_exhaustion_short", "exhaustion_short"}:
+    if trade_type in {"range", "fakeout", "btc_exhaustion", "btc_exhaustion_short", "exhaustion_short"}:
         return "range"
     return "trend"
+
+
+def _position_profile(pos) -> str:
+    return _position_profile_from_values(
+        getattr(pos, "market_state", "") if pos is not None else "",
+        getattr(pos, "trade_type", "") if pos is not None else "",
+    )
 
 
 def _profile_cfg_float(base_name: str, default: float, pos=None, symbol: str = "") -> float:
@@ -46,6 +55,29 @@ def calc_tp1_price(entry_price: float, atr: float, side: str, symbol: str = "", 
     if side == "long":
         return entry_price + tp1_mult * atr
     return entry_price - tp1_mult * atr
+
+
+def calc_initial_stop_price(entry_price: float, atr: float, side: str, symbol: str = "", pos=None, trade_type: str = "", market_state: str = "") -> float:
+    profile = _position_profile(pos) if pos is not None else _position_profile_from_values(market_state, trade_type)
+    sl_mult = _cfg_float("POSITION_INITIAL_SL_ATR_MULT", _cfg_float("ATR_SL_MULT", 5.0, symbol), symbol)
+    prof_name = f"POSITION_INITIAL_SL_ATR_MULT_{profile.upper()}"
+    try:
+        if symbol:
+            v = cfg.get_symbol_param(symbol, prof_name, None)
+            if v is not None:
+                sl_mult = float(v)
+            else:
+                v = cfg.get_symbol_param(symbol, "POSITION_INITIAL_SL_ATR_MULT", None)
+                if v is not None:
+                    sl_mult = float(v)
+        v = getattr(cfg, prof_name, None)
+        if v is not None:
+            sl_mult = float(v)
+    except Exception:
+        pass
+    if side == "long":
+        return entry_price - sl_mult * atr
+    return entry_price + sl_mult * atr
 
 
 def update_peak_price(pos, price: float, bar_index: int | None = None) -> None:
@@ -236,6 +268,24 @@ def mark_tp1_bar(pos, bar_index: int | None) -> None:
         pos.tp1_bar_index = int(bar_index)
     except Exception:
         pass
+
+
+def should_time_stop_before_tp1(pos, bar_index: int | None) -> bool:
+    if bar_index is None or getattr(pos, "tp1_hit", False):
+        return False
+    try:
+        bars_limit = int(_profile_cfg_float("POSITION_TIME_STOP_BEFORE_TP1_BARS", 0.0, pos, getattr(pos, "symbol", "")))
+    except Exception:
+        bars_limit = 0
+    if bars_limit <= 0:
+        return False
+    open_bar_index = getattr(pos, "open_time", None)
+    if open_bar_index is None:
+        return False
+    try:
+        return int(bar_index) - int(float(open_bar_index)) >= bars_limit
+    except Exception:
+        return False
 
 
 def should_time_stop_after_tp1(pos, bar_index: int | None) -> bool:
