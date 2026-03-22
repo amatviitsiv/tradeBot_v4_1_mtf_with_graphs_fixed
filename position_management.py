@@ -85,11 +85,16 @@ def maybe_move_to_break_even(pos, price: float, atr: float) -> bool:
     if trigger_atr <= 0:
         return False
     be_offset_atr = _profile_cfg_float("POSITION_BE_OFFSET_ATR", 0.0, pos, symbol)
+    min_progress_after_tp1_atr = _profile_cfg_float("POSITION_BE_MIN_PROGRESS_AFTER_TP1_ATR", 0.0, pos, symbol)
     moved = getattr(pos, "be_moved", False)
     if pos.side == "long":
         move_atr = (price - pos.entry_price) / atr
         if move_atr < trigger_atr:
             return False
+        if getattr(pos, "tp1_hit", False) and min_progress_after_tp1_atr > 0:
+            tp1_ref = float(getattr(pos, "tp1_hit_price", getattr(pos, "entry_price", price)) or price)
+            if (price - tp1_ref) / atr < min_progress_after_tp1_atr:
+                return False
         be_stop = pos.entry_price + be_offset_atr * atr
         if moved and pos.stop_loss is not None and pos.stop_loss >= be_stop:
             return False
@@ -101,6 +106,10 @@ def maybe_move_to_break_even(pos, price: float, atr: float) -> bool:
         move_atr = (pos.entry_price - price) / atr
         if move_atr < trigger_atr:
             return False
+        if getattr(pos, "tp1_hit", False) and min_progress_after_tp1_atr > 0:
+            tp1_ref = float(getattr(pos, "tp1_hit_price", getattr(pos, "entry_price", price)) or price)
+            if (tp1_ref - price) / atr < min_progress_after_tp1_atr:
+                return False
         be_stop = pos.entry_price - be_offset_atr * atr
         if moved and pos.stop_loss is not None and pos.stop_loss <= be_stop:
             return False
@@ -119,16 +128,18 @@ def on_tp1_hit(pos, price: float, atr: float) -> None:
     if atr <= 0:
         atr = 0.0
     symbol = getattr(pos, "symbol", "")
-    be_offset_atr = _profile_cfg_float("POSITION_BE_OFFSET_ATR", 0.0, pos, symbol)
-    if pos.side == "long":
-        be_stop = pos.entry_price + be_offset_atr * atr
-        if pos.stop_loss is None or be_stop > pos.stop_loss:
-            pos.stop_loss = be_stop
-    else:
-        be_stop = pos.entry_price - be_offset_atr * atr
-        if pos.stop_loss is None or be_stop < pos.stop_loss:
-            pos.stop_loss = be_stop
-    pos.be_moved = True
+    move_be_on_tp1 = bool(_cfg_float("POSITION_MOVE_BE_ON_TP1", 0.0, symbol))
+    if move_be_on_tp1:
+        be_offset_atr = _profile_cfg_float("POSITION_BE_OFFSET_ATR", 0.0, pos, symbol)
+        if pos.side == "long":
+            be_stop = pos.entry_price + be_offset_atr * atr
+            if pos.stop_loss is None or be_stop > pos.stop_loss:
+                pos.stop_loss = be_stop
+        else:
+            be_stop = pos.entry_price - be_offset_atr * atr
+            if pos.stop_loss is None or be_stop < pos.stop_loss:
+                pos.stop_loss = be_stop
+        pos.be_moved = True
     pos.tp1_hit = True
     pos.trail_active = False
     pos.tp1 = None
