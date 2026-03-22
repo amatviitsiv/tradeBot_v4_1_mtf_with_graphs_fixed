@@ -401,13 +401,14 @@ class Backtester:
                 if price is None or atr <= 0 or df_slice is None:
                     continue
 
-                bar_high = float(row.get("high", price))
-                bar_low = float(row.get("low", price))
+                current_bar = data[sym].iloc[i]
+                bar_high = float(current_bar.get("high", price))
+                bar_low = float(current_bar.get("low", price))
                 favorable_price = bar_high if pos.side == "long" else bar_low
 
                 # 1) Intrabar SL / TP / trailing. Если на свече задеты несколько уровней,
                 # порядок определяется _pick_intrabar_exit(...).
-                exit_reason, exit_price = self._pick_intrabar_exit(pos, row)
+                exit_reason, exit_price = self._pick_intrabar_exit(pos, current_bar)
                 if exit_reason == "stop_loss":
                     balance, pnl_after_fee = self._close_position(balance, sym, pos, exit_price, return_pnl=True, reason="stop_loss", bar_index=i)
                     register_stop_loss(sym, pos.side, i, pnl_after_fee)
