@@ -18,6 +18,8 @@ def _cfg_int(name: str, default: int) -> int:
 def _position_profile_from_values(market_state: str = "", trade_type: str = "") -> str:
     market_state = str(market_state or "").lower()
     trade_type = str(trade_type or "").lower()
+    if trade_type == "alt_reversion":
+        return "alt_reversion"
     if trade_type in {"continuation", "cont_compression"}:
         return "continuation"
     if market_state in {"range", "transition"}:

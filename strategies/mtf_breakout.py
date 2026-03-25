@@ -39,6 +39,136 @@ class MTFBreakoutStrategy(BaseStrategy):
         except Exception:
             return bool(value)
 
+    def _is_alt_symbol(self, symbol: str) -> bool:
+        btc_symbol = str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
+        alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+        return bool(symbol and symbol != btc_symbol and symbol in alt_symbols)
+
+    def _alt_strong_setup(self, symbol: str, adx_h: float, drift: float, volume_meta: dict | None = None, rs_meta: dict | None = None, side: str = "long") -> bool:
+        if not self._is_alt_symbol(symbol):
+            return False
+        volume_meta = volume_meta or {}
+        rs_meta = rs_meta or {}
+        min_adx = float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_ADX", float(getattr(cfg, "ALT_STRONG_SETUP_ADX", 28.0))))
+        min_drift = float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_DRIFT_PCT", float(getattr(cfg, "ALT_STRONG_SETUP_DRIFT_PCT", 0.0085))))
+        min_impulse = float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_VOLUME_IMPULSE", float(getattr(cfg, "ALT_STRONG_SETUP_VOLUME_IMPULSE", 0.95))))
+        ratio = float(rs_meta.get("ratio", 1.0) or 1.0)
+        ratio_req = float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RS_RATIO_LONG", float(getattr(cfg, "ALT_STRONG_SETUP_RS_RATIO_LONG", 1.0)))) if side == "long" else float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RS_RATIO_SHORT", float(getattr(cfg, "ALT_STRONG_SETUP_RS_RATIO_SHORT", 1.0))))
+        return float(adx_h) >= min_adx and float(drift) >= min_drift and float(volume_meta.get("impulse_score", 0.0) or 0.0) >= min_impulse and ((ratio >= ratio_req) if side == "long" else (ratio <= ratio_req))
+
+    def _relax_alt_filters(self, symbol: str, side: str, alt_ok: bool, alt_meta: dict, rs_ok: bool, rs_meta: dict) -> tuple[bool, bool, dict, dict]:
+        if not self._is_alt_symbol(symbol):
+            return alt_ok, rs_ok, alt_meta, rs_meta
+        if not alt_ok:
+            score = float(alt_meta.get("score", 0.0) or 0.0)
+            threshold = float(alt_meta.get("threshold", cfg.get_symbol_param_float(symbol, "ALT_QUALITY_MIN_SCORE", float(getattr(cfg, "ALT_QUALITY_MIN_SCORE", 0.48)))) or 0.0)
+            relax = float(cfg.get_symbol_param_float(symbol, "ALT_QUALITY_THRESHOLD_RELAX", float(getattr(cfg, "ALT_QUALITY_THRESHOLD_RELAX", 0.05))))
+            if score >= max(0.0, threshold - relax):
+                alt_ok = True
+                alt_meta = {**alt_meta, "soft_pass": True, "soft_margin": relax}
+        if not rs_ok:
+            ratio = float(rs_meta.get("ratio", 1.0) or 1.0)
+            slope = float(rs_meta.get("slope", 0.0) or 0.0)
+            if side == "long":
+                relax_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_REL_STRENGTH_LONG_RATIO_RELAX", float(getattr(cfg, "ALT_REL_STRENGTH_LONG_RATIO_RELAX", 0.0020))))
+                relax_slope = float(cfg.get_symbol_param_float(symbol, "ALT_REL_STRENGTH_LONG_MIN_SLOPE_RELAX", float(getattr(cfg, "ALT_REL_STRENGTH_LONG_MIN_SLOPE_RELAX", 0.0030))))
+                min_ratio = float(cfg.get_symbol_param_float(symbol, "REL_STRENGTH_MIN_RATIO", float(getattr(cfg, "REL_STRENGTH_MIN_RATIO", 1.002))))
+                min_slope = float(cfg.get_symbol_param_float(symbol, "REL_STRENGTH_MIN_SLOPE", float(getattr(cfg, "REL_STRENGTH_MIN_SLOPE", 0.0))))
+                if ratio >= (min_ratio - relax_ratio) and slope >= (min_slope - relax_slope):
+                    rs_ok = True
+                    rs_meta = {**rs_meta, "soft_pass": True, "ratio_relax": relax_ratio, "slope_relax": relax_slope}
+            else:
+                relax_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_REL_STRENGTH_SHORT_RATIO_RELAX", float(getattr(cfg, "ALT_REL_STRENGTH_SHORT_RATIO_RELAX", 0.0020))))
+                relax_slope = float(cfg.get_symbol_param_float(symbol, "ALT_REL_STRENGTH_SHORT_MIN_SLOPE_RELAX", float(getattr(cfg, "ALT_REL_STRENGTH_SHORT_MIN_SLOPE_RELAX", 0.0030))))
+                max_ratio = float(cfg.get_symbol_param_float(symbol, "REL_STRENGTH_SHORT_MAX_RATIO", float(getattr(cfg, "REL_STRENGTH_SHORT_MAX_RATIO", 0.998))))
+                min_slope = float(cfg.get_symbol_param_float(symbol, "REL_STRENGTH_SHORT_MIN_SLOPE", float(getattr(cfg, "REL_STRENGTH_SHORT_MIN_SLOPE", 0.0))))
+                if ratio <= (max_ratio + relax_ratio) and slope <= (min_slope + relax_slope):
+                    rs_ok = True
+                    rs_meta = {**rs_meta, "soft_pass": True, "ratio_relax": relax_ratio, "slope_relax": relax_slope}
+        return alt_ok, rs_ok, alt_meta, rs_meta
+
+    def _is_mean_reversion_alt(self, symbol: str) -> bool:
+        symbols = set(getattr(cfg, "ALT_MEAN_REVERSION_SYMBOLS", ["SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+        return bool(symbol and symbol in symbols)
+
+    def _apply_directional_setup_scaling(self, symbol: str, base_risk_multiplier: float, adx_h: float, drift: float, volume_meta: dict | None = None, trade_type: str = "", side: str = "") -> tuple[float, dict]:
+        flags = {"core_strong_setup": False, "core_very_strong_setup": False, "directional_setup_strength": "normal"}
+        if not bool(getattr(cfg, "ENABLE_DIRECTIONAL_RISK_SCALING", True)):
+            return float(base_risk_multiplier), flags
+        scaling_symbols = set(getattr(cfg, "DIRECTIONAL_SCALING_SYMBOLS", ["BTCUSDT", "ETHUSDT"]) or [])
+        if symbol not in scaling_symbols:
+            return float(base_risk_multiplier), flags
+        volume_meta = volume_meta or {}
+        impulse_score = float(volume_meta.get("impulse_score", 0.0) or 0.0)
+        strong_adx = float(getattr(cfg, "STRONG_SETUP_MIN_ADX", 27.0))
+        very_strong_adx = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_ADX", 34.0))
+        strong_drift = float(getattr(cfg, "STRONG_SETUP_MIN_DRIFT_PCT", 0.0080))
+        very_strong_drift = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_DRIFT_PCT", 0.0120))
+        strong_impulse = float(getattr(cfg, "STRONG_SETUP_MIN_VOLUME_IMPULSE", 0.90))
+        very_strong_impulse = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_VOLUME_IMPULSE", 1.05))
+        risk_mult = float(base_risk_multiplier)
+        if float(adx_h) >= very_strong_adx and float(drift) >= very_strong_drift and impulse_score >= very_strong_impulse:
+            risk_mult *= float(getattr(cfg, "VERY_STRONG_SETUP_RISK_MULT", 1.70))
+            flags = {"core_strong_setup": True, "core_very_strong_setup": True, "directional_setup_strength": "very_strong"}
+        elif float(adx_h) >= strong_adx and float(drift) >= strong_drift and impulse_score >= strong_impulse:
+            risk_mult *= float(getattr(cfg, "STRONG_SETUP_RISK_MULT", 1.35))
+            flags = {"core_strong_setup": True, "core_very_strong_setup": False, "directional_setup_strength": "strong"}
+        return risk_mult, flags
+
+    def _check_alt_mean_reversion_entry(self, symbol: str, market_state: str, recent: pd.DataFrame, candle: pd.Series, atr_ltf: float) -> tuple[str | None, dict]:
+        if not bool(getattr(cfg, "ALT_MEAN_REVERSION_ENABLED", True)):
+            return None, {"reason": "disabled"}
+        if not self._is_mean_reversion_alt(symbol):
+            return None, {"reason": "not_alt_reversion_symbol"}
+        allow_states = set()
+        if bool(getattr(cfg, "ALT_MEAN_REVERSION_ALLOW_IN_RANGE", True)):
+            allow_states.add("range")
+        if bool(getattr(cfg, "ALT_MEAN_REVERSION_ALLOW_IN_TRANSITION", True)):
+            allow_states.add("transition")
+        if market_state not in allow_states:
+            return None, {"reason": "market_state_not_allowed", "market_state": market_state}
+        if atr_ltf <= 0 or recent is None or len(recent) < 5:
+            return None, {"reason": "not_enough_data"}
+        try:
+            open_ = float(candle.get("open", float("nan")))
+            high = float(candle.get("high", float("nan")))
+            low = float(candle.get("low", float("nan")))
+            close = float(candle.get("close", float("nan")))
+            ema20 = float(candle.get("EMA20", float("nan")))
+            rsi = float(candle.get("RSI", float("nan")))
+            volume = float(candle.get("volume", float("nan")))
+        except Exception:
+            return None, {"reason": "bad_candle_values"}
+        import math
+        if any(math.isnan(x) for x in [open_, high, low, close, ema20, rsi, volume]):
+            return None, {"reason": "nan_values"}
+        candle_range = max(high - low, 1e-9)
+        body_ratio = abs(close - open_) / candle_range
+        close_pos = (close - low) / candle_range
+        vol_ma = float(recent["volume"].astype(float).tail(8).mean()) if "volume" in recent.columns else 0.0
+        vol_ratio = (volume / vol_ma) if vol_ma > 0 else 1.0
+        stretch_atr = (close - ema20) / atr_ltf
+        min_stretch = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_STRETCH_ATR", float(getattr(cfg, "ALT_REV_MIN_STRETCH_ATR", 1.35))))
+        long_rsi_max = float(cfg.get_symbol_param_float(symbol, "ALT_REV_RSI_LONG_MAX", float(getattr(cfg, "ALT_REV_RSI_LONG_MAX", 34.0))))
+        short_rsi_min = float(cfg.get_symbol_param_float(symbol, "ALT_REV_RSI_SHORT_MIN", float(getattr(cfg, "ALT_REV_RSI_SHORT_MIN", 66.0))))
+        min_close_pos_long = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_CLOSE_POS_LONG", float(getattr(cfg, "ALT_REV_MIN_CLOSE_POS_LONG", 0.45))))
+        max_close_pos_short = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_CLOSE_POS_SHORT", float(getattr(cfg, "ALT_REV_MAX_CLOSE_POS_SHORT", 0.55))))
+        min_body_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_BODY_RATIO", float(getattr(cfg, "ALT_REV_MIN_BODY_RATIO", 0.18))))
+        min_vol_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_VOL_RATIO", float(getattr(cfg, "ALT_REV_MIN_VOL_RATIO", 0.90))))
+        meta = {
+            "stretch_atr": stretch_atr,
+            "rsi": rsi,
+            "close_pos": close_pos,
+            "body_ratio": body_ratio,
+            "vol_ratio": vol_ratio,
+            "market_state": market_state,
+        }
+        if stretch_atr <= -min_stretch and rsi <= long_rsi_max and close_pos >= min_close_pos_long and body_ratio >= min_body_ratio and vol_ratio >= min_vol_ratio:
+            return "buy", {**meta, "reason": "oversold_reversion"}
+        if stretch_atr >= min_stretch and rsi >= short_rsi_min and close_pos <= max_close_pos_short and body_ratio >= min_body_ratio and vol_ratio >= min_vol_ratio:
+            return "sell", {**meta, "reason": "overbought_reversion"}
+        return None, {**meta, "reason": "no_reversion_setup"}
+
     def _extract_bar_timestamp(self, df: pd.DataFrame):
         """Пытается достать timestamp последней свечи из open_time или DatetimeIndex."""
         try:
@@ -1073,6 +1203,178 @@ class MTFBreakoutStrategy(BaseStrategy):
 
         return self._btc_short_context_ok(symbol=symbol, regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=btc_score)
 
+    def _check_directional_regime_gate(self, symbol: str, side: str, trade_type: str, regime: str, market_state: str, adx_h: float, atr_pct_h: float, drift: float, rsi_h: float) -> tuple[bool, dict]:
+        if not bool(cfg.get_symbol_param(symbol, "MARKET_REGIME_DIRECTIONAL_GATE_ENABLED", getattr(cfg, "MARKET_REGIME_DIRECTIONAL_GATE_ENABLED", True))):
+            return True, {"enabled": False}
+
+        expected_regime = "bull" if side == "long" else "bear"
+        min_adx = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_DIRECTIONAL_MIN_HTF_ADX", float(getattr(cfg, "MARKET_REGIME_DIRECTIONAL_MIN_HTF_ADX", 23.0))))
+        min_atr_pct = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_DIRECTIONAL_MIN_HTF_ATR_PCT", float(getattr(cfg, "MARKET_REGIME_DIRECTIONAL_MIN_HTF_ATR_PCT", 0.0014))))
+        min_drift = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_DIRECTIONAL_MIN_DRIFT_PCT", float(getattr(cfg, "MARKET_REGIME_DIRECTIONAL_MIN_DRIFT_PCT", 0.0050))))
+        min_rsi_long = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_DIRECTIONAL_MIN_HTF_RSI_LONG", float(getattr(cfg, "MARKET_REGIME_DIRECTIONAL_MIN_HTF_RSI_LONG", 54.0))))
+        max_rsi_short = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_DIRECTIONAL_MAX_HTF_RSI_SHORT", float(getattr(cfg, "MARKET_REGIME_DIRECTIONAL_MAX_HTF_RSI_SHORT", 46.0))))
+        transition_min_adx = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_DIRECTIONAL_TRANSITION_MIN_HTF_ADX", float(getattr(cfg, "MARKET_REGIME_DIRECTIONAL_TRANSITION_MIN_HTF_ADX", 26.0))))
+        transition_min_drift = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_DIRECTIONAL_TRANSITION_MIN_DRIFT_PCT", float(getattr(cfg, "MARKET_REGIME_DIRECTIONAL_TRANSITION_MIN_DRIFT_PCT", 0.0065))))
+        block_impulse_transition = bool(cfg.get_symbol_param(symbol, "MARKET_REGIME_DIRECTIONAL_BLOCK_IMPULSE_IN_TRANSITION", getattr(cfg, "MARKET_REGIME_DIRECTIONAL_BLOCK_IMPULSE_IN_TRANSITION", True)))
+        allow_cont_transition = bool(cfg.get_symbol_param(symbol, "MARKET_REGIME_DIRECTIONAL_ALLOW_CONTINUATION_IN_TRANSITION", getattr(cfg, "MARKET_REGIME_DIRECTIONAL_ALLOW_CONTINUATION_IN_TRANSITION", True)))
+
+        if regime != expected_regime:
+            return False, {"reason": "regime_mismatch", "regime": regime, "expected_regime": expected_regime, "trade_type": trade_type, "side": side}
+
+        if market_state == "transition":
+            if trade_type == "impulse" and block_impulse_transition:
+                return False, {"reason": "transition_blocked_for_impulse", "trade_type": trade_type, "side": side, "adx_h": adx_h, "drift": drift}
+            if trade_type in {"continuation", "cont_compression"} and allow_cont_transition:
+                if adx_h < transition_min_adx or drift < transition_min_drift:
+                    return False, {
+                        "reason": "transition_too_weak",
+                        "trade_type": trade_type,
+                        "side": side,
+                        "adx_h": adx_h,
+                        "drift": drift,
+                        "min_adx": transition_min_adx,
+                        "min_drift": transition_min_drift,
+                    }
+            else:
+                return False, {"reason": "transition_blocked", "trade_type": trade_type, "side": side}
+        elif market_state != "trend":
+            return False, {"reason": "non_directional_market_state", "trade_type": trade_type, "side": side, "market_state": market_state}
+
+        if adx_h < min_adx or atr_pct_h < min_atr_pct or drift < min_drift:
+            return False, {
+                "reason": "weak_directional_regime",
+                "trade_type": trade_type,
+                "side": side,
+                "adx_h": adx_h,
+                "atr_pct_h": atr_pct_h,
+                "drift": drift,
+                "min_adx": min_adx,
+                "min_atr_pct": min_atr_pct,
+                "min_drift": min_drift,
+            }
+
+        if side == "long" and rsi_h < min_rsi_long:
+            return False, {"reason": "htf_rsi_not_bullish_enough", "trade_type": trade_type, "side": side, "rsi_h": rsi_h, "min_rsi_long": min_rsi_long}
+        if side == "short" and rsi_h > max_rsi_short:
+            return False, {"reason": "htf_rsi_not_bearish_enough", "trade_type": trade_type, "side": side, "rsi_h": rsi_h, "max_rsi_short": max_rsi_short}
+
+        return True, {
+            "trade_type": trade_type,
+            "side": side,
+            "regime": regime,
+            "market_state": market_state,
+            "adx_h": adx_h,
+            "atr_pct_h": atr_pct_h,
+            "drift": drift,
+            "rsi_h": rsi_h,
+            "min_adx": min_adx,
+            "min_atr_pct": min_atr_pct,
+            "min_drift": min_drift,
+        }
+
+    def _check_trend_strength_and_chop(self, symbol: str, df: pd.DataFrame, recent: pd.DataFrame, side: str, trade_type: str, close: float, atr_ltf: float, adx_h: float, atr_pct_h: float, drift: float) -> tuple[bool, dict]:
+        if not bool(cfg.get_symbol_param(symbol, "TREND_QUALITY_FILTER_ENABLED", getattr(cfg, "TREND_QUALITY_FILTER_ENABLED", True))):
+            return True, {"enabled": False}
+
+        try:
+            htf_slope_lookback = int(cfg.get_symbol_param_float(symbol, "TREND_QUALITY_HTF_SLOPE_LOOKBACK", int(getattr(cfg, "TREND_QUALITY_HTF_SLOPE_LOOKBACK", 8))))
+            chop_lookback = int(cfg.get_symbol_param_float(symbol, "CHOP_FILTER_LOOKBACK", int(getattr(cfg, "CHOP_FILTER_LOOKBACK", 12))))
+            max_crosses = int(cfg.get_symbol_param_float(symbol, "CHOP_FILTER_MAX_EMA20_CROSSES", int(getattr(cfg, "CHOP_FILTER_MAX_EMA20_CROSSES", 3))))
+            max_wickiness = float(cfg.get_symbol_param_float(symbol, "CHOP_FILTER_MAX_WICKINESS", float(getattr(cfg, "CHOP_FILTER_MAX_WICKINESS", 0.62))))
+            min_body_ratio = float(cfg.get_symbol_param_float(symbol, "CHOP_FILTER_MIN_BODY_RATIO", float(getattr(cfg, "CHOP_FILTER_MIN_BODY_RATIO", 0.33))))
+            min_htf_ema20_slope = float(cfg.get_symbol_param_float(symbol, "TREND_QUALITY_MIN_HTF_EMA20_SLOPE_PCT", float(getattr(cfg, "TREND_QUALITY_MIN_HTF_EMA20_SLOPE_PCT", 0.0032))))
+            min_htf_ema50_slope = float(cfg.get_symbol_param_float(symbol, "TREND_QUALITY_MIN_HTF_EMA50_SLOPE_PCT", float(getattr(cfg, "TREND_QUALITY_MIN_HTF_EMA50_SLOPE_PCT", 0.0018))))
+            min_combo_adx = float(cfg.get_symbol_param_float(symbol, "TREND_QUALITY_COMBO_MIN_HTF_ADX", float(getattr(cfg, "TREND_QUALITY_COMBO_MIN_HTF_ADX", 26.0))))
+            min_combo_drift = float(cfg.get_symbol_param_float(symbol, "TREND_QUALITY_COMBO_MIN_DRIFT_PCT", float(getattr(cfg, "TREND_QUALITY_COMBO_MIN_DRIFT_PCT", 0.0062))))
+            min_combo_atr_pct = float(cfg.get_symbol_param_float(symbol, "TREND_QUALITY_COMBO_MIN_ATR_PCT", float(getattr(cfg, "TREND_QUALITY_COMBO_MIN_ATR_PCT", 0.0015))))
+            impulse_max_wickiness = float(cfg.get_symbol_param_float(symbol, "IMPULSE_QUALITY_MAX_WICKINESS", float(getattr(cfg, "IMPULSE_QUALITY_MAX_WICKINESS", 0.58))))
+            impulse_min_body_ratio = float(cfg.get_symbol_param_float(symbol, "IMPULSE_QUALITY_MIN_BODY_RATIO", float(getattr(cfg, "IMPULSE_QUALITY_MIN_BODY_RATIO", 0.37))))
+        except Exception as exc:
+            return False, {"reason": "trend_quality_cfg_error", "error": str(exc)}
+
+        if len(df) < htf_slope_lookback + 1 or len(recent) < max(chop_lookback, 3):
+            return True, {"skipped": "not_enough_history"}
+
+        try:
+            htf_recent = df.iloc[-(htf_slope_lookback + 1):]
+            ema20_now = float(htf_recent["HTF_EMA20"].iloc[-1])
+            ema20_prev = float(htf_recent["HTF_EMA20"].iloc[0])
+            ema50_now = float(htf_recent["HTF_EMA50"].iloc[-1])
+            ema50_prev = float(htf_recent["HTF_EMA50"].iloc[0])
+        except Exception as exc:
+            return False, {"reason": "trend_quality_missing_htf_ema", "error": str(exc)}
+
+        ema20_slope_pct = abs(ema20_now - ema20_prev) / close if close > 0 else 0.0
+        ema50_slope_pct = abs(ema50_now - ema50_prev) / close if close > 0 else 0.0
+
+        aligned = (ema20_now >= ema50_now) if side == "long" else (ema20_now <= ema50_now)
+        if not aligned:
+            return False, {"reason": "htf_ema_alignment_failed", "side": side, "ema20": ema20_now, "ema50": ema50_now}
+
+        slope_ok = ema20_slope_pct >= min_htf_ema20_slope and ema50_slope_pct >= min_htf_ema50_slope
+        combo_ok = adx_h >= min_combo_adx and drift >= min_combo_drift and atr_pct_h >= min_combo_atr_pct
+        if not (slope_ok or combo_ok):
+            return False, {
+                "reason": "weak_trend_quality",
+                "side": side,
+                "trade_type": trade_type,
+                "ema20_slope_pct": ema20_slope_pct,
+                "ema50_slope_pct": ema50_slope_pct,
+                "adx_h": adx_h,
+                "drift": drift,
+                "atr_pct_h": atr_pct_h,
+                "min_htf_ema20_slope": min_htf_ema20_slope,
+                "min_htf_ema50_slope": min_htf_ema50_slope,
+                "min_combo_adx": min_combo_adx,
+                "min_combo_drift": min_combo_drift,
+                "min_combo_atr_pct": min_combo_atr_pct,
+            }
+
+        recent_slice = recent.tail(chop_lookback).copy()
+        try:
+            close_s = recent_slice["close"].astype(float)
+            open_s = recent_slice["open"].astype(float)
+            high_s = recent_slice["high"].astype(float)
+            low_s = recent_slice["low"].astype(float)
+            ema20_ltf = recent_slice["EMA20"].astype(float)
+        except Exception as exc:
+            return False, {"reason": "trend_quality_missing_ltf_cols", "error": str(exc)}
+
+        candle_range = (high_s - low_s).replace(0.0, np.nan)
+        body_ratio = ((close_s - open_s).abs() / candle_range).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        wickiness = (((high_s - np.maximum(open_s, close_s)) + (np.minimum(open_s, close_s) - low_s)) / candle_range).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+        sign_series = np.sign((close_s - ema20_ltf).fillna(0.0).to_numpy())
+        nonzero_signs = [int(s) for s in sign_series if s != 0]
+        ema20_crosses = sum(1 for i in range(1, len(nonzero_signs)) if nonzero_signs[i] != nonzero_signs[i - 1])
+        mean_body_ratio = float(body_ratio.mean()) if len(body_ratio) else 0.0
+        mean_wickiness = float(wickiness.mean()) if len(wickiness) else 1.0
+
+        effective_max_wickiness = impulse_max_wickiness if trade_type == "impulse" else max_wickiness
+        effective_min_body_ratio = impulse_min_body_ratio if trade_type == "impulse" else min_body_ratio
+
+        if ema20_crosses > max_crosses:
+            return False, {"reason": "chop_too_many_ema20_crosses", "trade_type": trade_type, "ema20_crosses": ema20_crosses, "max_crosses": max_crosses}
+
+        if mean_wickiness > effective_max_wickiness and mean_body_ratio < effective_min_body_ratio:
+            return False, {
+                "reason": "choppy_wicky_price_action",
+                "trade_type": trade_type,
+                "mean_wickiness": mean_wickiness,
+                "max_wickiness": effective_max_wickiness,
+                "mean_body_ratio": mean_body_ratio,
+                "min_body_ratio": effective_min_body_ratio,
+                "atr_ltf": atr_ltf,
+            }
+
+        return True, {
+            "trade_type": trade_type,
+            "ema20_slope_pct": ema20_slope_pct,
+            "ema50_slope_pct": ema50_slope_pct,
+            "ema20_crosses": ema20_crosses,
+            "mean_wickiness": mean_wickiness,
+            "mean_body_ratio": mean_body_ratio,
+        }
+
     def _check_btc_exhaustion_short(self, symbol: str, df: pd.DataFrame, recent: pd.DataFrame, atr_ltf: float, adx_h: float, rsi_h: float, ema20_h: float, ema50_h: float, regime: str) -> tuple[bool, dict]:
         btc_symbol = str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
         if symbol != btc_symbol:
@@ -1445,6 +1747,11 @@ class MTFBreakoutStrategy(BaseStrategy):
         long_trigger = range_high * (1.0 + buf)
         short_trigger = range_low * (1.0 - buf)
 
+        alt_rev_signal, alt_rev_meta = self._check_alt_mean_reversion_entry(symbol=symbol, market_state=market_state, recent=recent, candle=last, atr_ltf=atr_ltf)
+        if alt_rev_signal is not None:
+            logger.debug("[MTF] ALT REV %s state=%s meta=%s", alt_rev_signal.upper(), market_state, alt_rev_meta)
+            return self._set_signal(alt_rev_signal, trade_type="alt_reversion", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "ALT_REV_RISK_MULTIPLIER", float(getattr(cfg, "ALT_REV_RISK_MULTIPLIER", 0.60)))), market_state=market_state, alt_reversion_meta=alt_rev_meta, side="long" if alt_rev_signal == "buy" else "short")
+
         if market_state in {"range", "transition"} and self._symbol_flag(symbol, "ENABLE_FAKEOUT", False):
             fake_long_ok, fake_long_meta = self._check_fakeout_reversal_entry(symbol=symbol, df=df, recent=recent, side="long", range_high=range_high, range_low=range_low, atr_ltf=atr_ltf, adx_h=adx_h)
             if fake_long_ok:
@@ -1575,6 +1882,10 @@ class MTFBreakoutStrategy(BaseStrategy):
                 rsi_long_min = max(40.0, rsi_long_min - strong_loosen)
                 rsi_short_max = min(60.0, rsi_short_max + strong_loosen)
 
+        if self._is_alt_symbol(symbol):
+            rsi_long_min = max(40.0, rsi_long_min - float(cfg.get_symbol_param_float(symbol, "ALT_RSI_LONG_MIN_LOOSEN", float(getattr(cfg, "ALT_RSI_LONG_MIN_LOOSEN", 3.0)))))
+            rsi_short_max = min(60.0, rsi_short_max + float(cfg.get_symbol_param_float(symbol, "ALT_RSI_SHORT_MAX_LOOSEN", float(getattr(cfg, "ALT_RSI_SHORT_MAX_LOOSEN", 3.0)))))
+
         # ======================================================
         # 4) Итоговые сигналы
         # ======================================================
@@ -1594,12 +1905,36 @@ class MTFBreakoutStrategy(BaseStrategy):
                 cont_comp_ok, cont_comp_meta = (False, {"disabled": True})
                 if self._symbol_flag(symbol, "ENABLE_CONT_COMP", False):
                     cont_comp_ok, cont_comp_meta = self._check_continuation_compression_entry(symbol=symbol, df=df, side="long", atr_ltf=atr_ltf)
+                alt_ok, rs_ok, alt_meta, rs_meta = self._relax_alt_filters(symbol, "long", alt_ok, alt_meta, rs_ok, rs_meta)
                 if btc_ok and alt_ok and rs_ok and cont_comp_ok:
-                    return self._set_signal("buy", trade_type="cont_compression", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONT_COMP", float(getattr(cfg, "RISK_MULTIPLIER_CONT_COMP", 0.75)))), market_state=market_state, cont_comp_meta=cont_comp_meta, side="long")
+                    regime_gate_ok, regime_gate_meta = self._check_directional_regime_gate(symbol=symbol, side="long", trade_type="cont_compression", regime=regime, market_state=market_state, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift, rsi_h=rsi_h)
+                    if regime_gate_ok:
+                        trend_quality_ok, trend_quality_meta = self._check_trend_strength_and_chop(symbol=symbol, df=df, recent=recent, side="long", trade_type="cont_compression", close=close, atr_ltf=atr_ltf, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift)
+                        if trend_quality_ok:
+                            risk_mult = float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONT_COMP", float(getattr(cfg, "RISK_MULTIPLIER_CONT_COMP", 0.75))))
+                            strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="long")
+                            if strong_setup:
+                                risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
+                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="cont_compression", side="long")
+                            return self._set_signal("buy", trade_type="cont_compression", risk_multiplier=risk_mult, market_state=market_state, cont_comp_meta=cont_comp_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="long", strong_setup=strong_setup, **setup_flags)
+                        logger.debug("[MTF] skip BUY cont_compression by trend quality/chop: %s", trend_quality_meta)
+                    logger.debug("[MTF] skip BUY cont_compression by directional regime gate: %s", regime_gate_meta)
                 cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="long", atr_ltf=atr_ltf)
+                alt_ok, rs_ok, alt_meta, rs_meta = self._relax_alt_filters(symbol, "long", alt_ok, alt_meta, rs_ok, rs_meta)
                 if btc_ok and alt_ok and rs_ok and cont_ok:
-                    logger.debug("[MTF] BUY continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
-                    return self._set_signal("buy", trade_type="continuation", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONTINUATION", float(getattr(cfg, "RISK_MULTIPLIER_CONTINUATION", 0.65)))), market_state=market_state, cont_meta=cont_meta, side="long")
+                    regime_gate_ok, regime_gate_meta = self._check_directional_regime_gate(symbol=symbol, side="long", trade_type="continuation", regime=regime, market_state=market_state, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift, rsi_h=rsi_h)
+                    if regime_gate_ok:
+                        trend_quality_ok, trend_quality_meta = self._check_trend_strength_and_chop(symbol=symbol, df=df, recent=recent, side="long", trade_type="continuation", close=close, atr_ltf=atr_ltf, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift)
+                        if trend_quality_ok:
+                            logger.debug("[MTF] BUY continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
+                            risk_mult = float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONTINUATION", float(getattr(cfg, "RISK_MULTIPLIER_CONTINUATION", 0.65))))
+                            strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="long")
+                            if strong_setup:
+                                risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
+                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="continuation", side="long")
+                            return self._set_signal("buy", trade_type="continuation", risk_multiplier=risk_mult, market_state=market_state, cont_meta=cont_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="long", strong_setup=strong_setup, **setup_flags)
+                        logger.debug("[MTF] skip BUY continuation by trend quality/chop: %s", trend_quality_meta)
+                    logger.debug("[MTF] skip BUY continuation by directional regime gate: %s", regime_gate_meta)
             elif regime == "bear":
                 btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="short")
                 alt_ok, alt_meta = self._calc_alt_quality_score(symbol=symbol, recent=recent, atr_ltf=atr_ltf, side="short")
@@ -1612,13 +1947,37 @@ class MTFBreakoutStrategy(BaseStrategy):
                 if self._symbol_flag(symbol, "ENABLE_CONT_COMP", False):
                     cont_comp_ok, cont_comp_meta = self._check_continuation_compression_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
                 btc_short_ctx_ok, btc_short_ctx_meta = self._btc_short_trade_ok(symbol=symbol, trade_type="cont_compression", regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=float(btc_meta.get("score", 0.0)))
+                alt_ok, rs_ok, alt_meta, rs_meta = self._relax_alt_filters(symbol, "short", alt_ok, alt_meta, rs_ok, rs_meta)
                 if btc_ok and alt_ok and rs_ok and cont_comp_ok and allow_short and btc_short_ctx_ok:
-                    return self._set_signal("sell", trade_type="cont_compression", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONT_COMP", float(getattr(cfg, "RISK_MULTIPLIER_CONT_COMP", 0.75)))), market_state=market_state, cont_comp_meta=cont_comp_meta, btc_short_ctx=btc_short_ctx_meta, side="short")
+                    regime_gate_ok, regime_gate_meta = self._check_directional_regime_gate(symbol=symbol, side="short", trade_type="cont_compression", regime=regime, market_state=market_state, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift, rsi_h=rsi_h)
+                    if regime_gate_ok:
+                        trend_quality_ok, trend_quality_meta = self._check_trend_strength_and_chop(symbol=symbol, df=df, recent=recent, side="short", trade_type="cont_compression", close=close, atr_ltf=atr_ltf, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift)
+                        if trend_quality_ok:
+                            risk_mult = float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONT_COMP", float(getattr(cfg, "RISK_MULTIPLIER_CONT_COMP", 0.75))))
+                            strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="short")
+                            if strong_setup:
+                                risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
+                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="cont_compression", side="short")
+                            return self._set_signal("sell", trade_type="cont_compression", risk_multiplier=risk_mult, market_state=market_state, cont_comp_meta=cont_comp_meta, btc_short_ctx=btc_short_ctx_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="short", strong_setup=strong_setup, **setup_flags)
+                        logger.debug("[MTF] skip SELL cont_compression by trend quality/chop: %s", trend_quality_meta)
+                    logger.debug("[MTF] skip SELL cont_compression by directional regime gate: %s", regime_gate_meta)
                 cont_ok, cont_meta = self._check_continuation_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
-                btc_short_cont_ok, btc_short_cont_meta = self._btc_short_trade_ok(symbol=symbol, trade_type="impulse", regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=float(btc_meta.get("score", 0.0)))
+                btc_short_cont_ok, btc_short_cont_meta = self._btc_short_trade_ok(symbol=symbol, trade_type="continuation", regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=float(btc_meta.get("score", 0.0)))
+                alt_ok, rs_ok, alt_meta, rs_meta = self._relax_alt_filters(symbol, "short", alt_ok, alt_meta, rs_ok, rs_meta)
                 if btc_ok and alt_ok and rs_ok and cont_ok and allow_short and btc_short_cont_ok:
-                    logger.debug("[MTF] SELL continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
-                    return self._set_signal("sell", trade_type="continuation", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONTINUATION", float(getattr(cfg, "RISK_MULTIPLIER_CONTINUATION", 0.65)))), market_state=market_state, cont_meta=cont_meta, btc_short_ctx=btc_short_cont_meta, side="short")
+                    regime_gate_ok, regime_gate_meta = self._check_directional_regime_gate(symbol=symbol, side="short", trade_type="continuation", regime=regime, market_state=market_state, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift, rsi_h=rsi_h)
+                    if regime_gate_ok:
+                        trend_quality_ok, trend_quality_meta = self._check_trend_strength_and_chop(symbol=symbol, df=df, recent=recent, side="short", trade_type="continuation", close=close, atr_ltf=atr_ltf, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift)
+                        if trend_quality_ok:
+                            logger.debug("[MTF] SELL continuation: state=%s rsi=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f cont=%s", market_state, rsi_ltf, float(alt_meta.get("score", 1.0)), float(btc_meta.get("score", 1.0)), float(rs_meta.get("ratio", 1.0)), cont_meta)
+                            risk_mult = float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_CONTINUATION", float(getattr(cfg, "RISK_MULTIPLIER_CONTINUATION", 0.65))))
+                            strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="short")
+                            if strong_setup:
+                                risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
+                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="continuation", side="short")
+                            return self._set_signal("sell", trade_type="continuation", risk_multiplier=risk_mult, market_state=market_state, cont_meta=cont_meta, btc_short_ctx=btc_short_cont_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="short", strong_setup=strong_setup, **setup_flags)
+                        logger.debug("[MTF] skip SELL continuation by trend quality/chop: %s", trend_quality_meta)
+                    logger.debug("[MTF] skip SELL continuation by directional regime gate: %s", regime_gate_meta)
 
         if market_state != "trend":
             return None
@@ -1644,6 +2003,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 logger.debug("[MTF] skip BUY by breakout confirmation: %s", confirm_meta)
                 return None
             rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="long")
+            alt_ok, rs_ok, alt_meta, rs_meta = self._relax_alt_filters(symbol, "long", alt_ok, alt_meta, rs_ok, rs_meta)
             if not rs_ok:
                 logger.debug("[MTF] skip BUY by relative strength: %s", rs_meta)
                 return None
@@ -1659,6 +2019,14 @@ class MTFBreakoutStrategy(BaseStrategy):
             else:
                 quality_meta = {}
 
+            regime_gate_ok, regime_gate_meta = self._check_directional_regime_gate(symbol=symbol, side="long", trade_type="impulse", regime=regime, market_state=market_state, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift, rsi_h=rsi_h)
+            if not regime_gate_ok:
+                logger.debug("[MTF] skip BUY impulse by directional regime gate: %s", regime_gate_meta)
+                return None
+            trend_quality_ok, trend_quality_meta = self._check_trend_strength_and_chop(symbol=symbol, df=df, recent=recent, side="long", trade_type="impulse", close=close, atr_ltf=atr_ltf, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift)
+            if not trend_quality_ok:
+                logger.debug("[MTF] skip BUY impulse by trend quality/chop: %s", trend_quality_meta)
+                return None
             logger.debug(
                 "[MTF] BUY: state=%s close=%.2f rh=%.2f vol=%.0f vol_ema=%.0f vol_med=%.0f imp=%.3f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f exc=%.5f body=%.5f uw=%.5f lw=%.5f",
                 market_state,
@@ -1679,7 +2047,12 @@ class MTFBreakoutStrategy(BaseStrategy):
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),
             )
-            return self._set_signal("buy", trade_type="impulse", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_IMPULSE", float(getattr(cfg, "RISK_MULTIPLIER_IMPULSE", 1.00)))), market_state=market_state, impulse_meta=impulse_meta, side="long")
+            risk_mult = float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_IMPULSE", float(getattr(cfg, "RISK_MULTIPLIER_IMPULSE", 1.00))))
+            strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="long")
+            if strong_setup:
+                risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
+            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="impulse", side="long")
+            return self._set_signal("buy", trade_type="impulse", risk_multiplier=risk_mult, market_state=market_state, impulse_meta=impulse_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="long", strong_setup=strong_setup, **setup_flags)
 
         # SHORT: H1 bear-тренд + подтверждённое закрытие M15 ниже диапазона
         if regime == "bear" and close < short_trigger and rsi_short_min <= rsi_ltf <= rsi_short_max:
@@ -1707,6 +2080,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 logger.debug("[MTF] skip SELL by breakout confirmation: %s", confirm_meta)
                 return None
             rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="short")
+            alt_ok, rs_ok, alt_meta, rs_meta = self._relax_alt_filters(symbol, "short", alt_ok, alt_meta, rs_ok, rs_meta)
             if not rs_ok:
                 logger.debug("[MTF] skip SELL by relative strength: %s", rs_meta)
                 return None
@@ -1722,6 +2096,14 @@ class MTFBreakoutStrategy(BaseStrategy):
             else:
                 quality_meta = {}
 
+            regime_gate_ok, regime_gate_meta = self._check_directional_regime_gate(symbol=symbol, side="short", trade_type="impulse", regime=regime, market_state=market_state, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift, rsi_h=rsi_h)
+            if not regime_gate_ok:
+                logger.debug("[MTF] skip SELL impulse by directional regime gate: %s", regime_gate_meta)
+                return None
+            trend_quality_ok, trend_quality_meta = self._check_trend_strength_and_chop(symbol=symbol, df=df, recent=recent, side="short", trade_type="impulse", close=close, atr_ltf=atr_ltf, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift)
+            if not trend_quality_ok:
+                logger.debug("[MTF] skip SELL impulse by trend quality/chop: %s", trend_quality_meta)
+                return None
             logger.debug(
                 "[MTF] SELL: state=%s close=%.2f rl=%.2f vol=%.0f vol_ema=%.0f vol_med=%.0f imp=%.3f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f exc=%.5f body=%.5f uw=%.5f lw=%.5f",
                 market_state,
@@ -1742,6 +2124,11 @@ class MTFBreakoutStrategy(BaseStrategy):
                 float(quality_meta.get("upper_wick", 0.0)),
                 float(quality_meta.get("lower_wick", 0.0)),
             )
-            return self._set_signal("sell", trade_type="impulse", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_IMPULSE", float(getattr(cfg, "RISK_MULTIPLIER_IMPULSE", 1.00)))), market_state=market_state, impulse_meta=impulse_meta, btc_short_ctx=btc_short_ctx_meta, side="short")
+            risk_mult = float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_IMPULSE", float(getattr(cfg, "RISK_MULTIPLIER_IMPULSE", 1.00))))
+            strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="short")
+            if strong_setup:
+                risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
+            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="impulse", side="short")
+            return self._set_signal("sell", trade_type="impulse", risk_multiplier=risk_mult, market_state=market_state, impulse_meta=impulse_meta, btc_short_ctx=btc_short_ctx_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="short", strong_setup=strong_setup, **setup_flags)
 
         return None
