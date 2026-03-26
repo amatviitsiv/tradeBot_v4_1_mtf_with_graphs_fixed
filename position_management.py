@@ -20,7 +20,7 @@ def _position_profile_from_values(market_state: str = "", trade_type: str = "") 
     trade_type = str(trade_type or "").lower()
     if trade_type == "alt_reversion":
         return "alt_reversion"
-    if trade_type in {"continuation", "cont_compression"}:
+    if trade_type in {"continuation", "cont_compression", "pullback"}:
         return "continuation"
     if market_state in {"range", "transition"}:
         return "range"

@@ -91,28 +91,75 @@ class MTFBreakoutStrategy(BaseStrategy):
         symbols = set(getattr(cfg, "ALT_MEAN_REVERSION_SYMBOLS", ["SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
         return bool(symbol and symbol in symbols)
 
-    def _apply_directional_setup_scaling(self, symbol: str, base_risk_multiplier: float, adx_h: float, drift: float, volume_meta: dict | None = None, trade_type: str = "", side: str = "") -> tuple[float, dict]:
-        flags = {"core_strong_setup": False, "core_very_strong_setup": False, "directional_setup_strength": "normal"}
+    def _apply_directional_setup_scaling(self, symbol: str, base_risk_multiplier: float, adx_h: float, drift: float, volume_meta: dict | None = None, trade_type: str = "", side: str = "", market_state: str = "", trend_quality_meta: dict | None = None) -> tuple[float, dict]:
+        flags = {"core_strong_setup": False, "core_very_strong_setup": False, "directional_setup_strength": "normal", "smart_scaling_pass": False}
         if not bool(getattr(cfg, "ENABLE_DIRECTIONAL_RISK_SCALING", True)):
             return float(base_risk_multiplier), flags
         scaling_symbols = set(getattr(cfg, "DIRECTIONAL_SCALING_SYMBOLS", ["BTCUSDT", "ETHUSDT"]) or [])
         if symbol not in scaling_symbols:
             return float(base_risk_multiplier), flags
+
+        if bool(getattr(cfg, "SMART_SCALING_ONLY_IN_TREND", True)) and market_state != "trend":
+            flags["smart_scaling_reason"] = "non_trend_market_state"
+            return float(base_risk_multiplier), flags
+
+        if trade_type == "impulse" and not bool(getattr(cfg, "SMART_SCALING_ALLOW_FOR_IMPULSE", True)):
+            flags["smart_scaling_reason"] = "impulse_disabled"
+            return float(base_risk_multiplier), flags
+        if trade_type == "continuation" and not bool(getattr(cfg, "SMART_SCALING_ALLOW_FOR_CONTINUATION", True)):
+            flags["smart_scaling_reason"] = "continuation_disabled"
+            return float(base_risk_multiplier), flags
+        if trade_type == "cont_compression" and not bool(getattr(cfg, "SMART_SCALING_ALLOW_FOR_CONT_COMPRESSION", True)):
+            flags["smart_scaling_reason"] = "cont_compression_disabled"
+            return float(base_risk_multiplier), flags
+
+        trend_quality_meta = trend_quality_meta or {}
         volume_meta = volume_meta or {}
         impulse_score = float(volume_meta.get("impulse_score", 0.0) or 0.0)
-        strong_adx = float(getattr(cfg, "STRONG_SETUP_MIN_ADX", 27.0))
-        very_strong_adx = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_ADX", 34.0))
-        strong_drift = float(getattr(cfg, "STRONG_SETUP_MIN_DRIFT_PCT", 0.0080))
-        very_strong_drift = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_DRIFT_PCT", 0.0120))
-        strong_impulse = float(getattr(cfg, "STRONG_SETUP_MIN_VOLUME_IMPULSE", 0.90))
-        very_strong_impulse = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_VOLUME_IMPULSE", 1.05))
+        ema20_crosses = int(trend_quality_meta.get("ema20_crosses", 99) or 99)
+        mean_wickiness = float(trend_quality_meta.get("mean_wickiness", 1.0) or 1.0)
+        mean_body_ratio = float(trend_quality_meta.get("mean_body_ratio", 0.0) or 0.0)
+        ema20_slope_pct = float(trend_quality_meta.get("ema20_slope_pct", 0.0) or 0.0)
+        ema50_slope_pct = float(trend_quality_meta.get("ema50_slope_pct", 0.0) or 0.0)
+
+        if bool(getattr(cfg, "ENABLE_SMART_DIRECTIONAL_SCALING", True)):
+            max_crosses = int(getattr(cfg, "SMART_SCALING_MAX_EMA20_CROSSES", 1))
+            max_wickiness = float(getattr(cfg, "SMART_SCALING_MAX_WICKINESS", 0.52))
+            min_body_ratio = float(getattr(cfg, "SMART_SCALING_MIN_BODY_RATIO", 0.40))
+            min_ema20_slope = float(getattr(cfg, "SMART_SCALING_MIN_EMA20_SLOPE_PCT", 0.0038))
+            min_ema50_slope = float(getattr(cfg, "SMART_SCALING_MIN_EMA50_SLOPE_PCT", 0.0020))
+            min_atr_pct = float(getattr(cfg, "SMART_SCALING_MIN_ATR_PCT", 0.0016))
+            clean_trend = ema20_crosses <= max_crosses and mean_wickiness <= max_wickiness and mean_body_ratio >= min_body_ratio
+            slope_trend = ema20_slope_pct >= min_ema20_slope and ema50_slope_pct >= min_ema50_slope
+            if not (clean_trend and slope_trend and float(getattr(self, "_last_atr_pct_h", 0.0) or 0.0) >= min_atr_pct):
+                flags["smart_scaling_reason"] = "trend_quality_not_clean_enough"
+                return float(base_risk_multiplier), flags
+            flags["smart_scaling_pass"] = True
+
+        strong_adx = float(getattr(cfg, "STRONG_SETUP_MIN_ADX", 26.0))
+        very_strong_adx = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_ADX", 32.0))
+        strong_drift = float(getattr(cfg, "STRONG_SETUP_MIN_DRIFT_PCT", 0.0075))
+        very_strong_drift = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_DRIFT_PCT", 0.0110))
+        strong_impulse = float(getattr(cfg, "STRONG_SETUP_MIN_VOLUME_IMPULSE", 0.85))
+        very_strong_impulse = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_VOLUME_IMPULSE", 0.98))
+
+        if side == "short":
+            strong_adx += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_ADX", 2.0))
+            very_strong_adx += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_ADX", 2.0))
+            strong_drift += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_DRIFT_PCT", 0.0015))
+            very_strong_drift += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_DRIFT_PCT", 0.0015))
+            strong_impulse += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_IMPULSE", 0.05))
+            very_strong_impulse += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_IMPULSE", 0.05))
+
         risk_mult = float(base_risk_multiplier)
         if float(adx_h) >= very_strong_adx and float(drift) >= very_strong_drift and impulse_score >= very_strong_impulse:
-            risk_mult *= float(getattr(cfg, "VERY_STRONG_SETUP_RISK_MULT", 1.70))
-            flags = {"core_strong_setup": True, "core_very_strong_setup": True, "directional_setup_strength": "very_strong"}
+            risk_mult *= float(getattr(cfg, "VERY_STRONG_SETUP_RISK_MULT", 2.20))
+            flags.update({"core_strong_setup": True, "core_very_strong_setup": True, "directional_setup_strength": "very_strong"})
         elif float(adx_h) >= strong_adx and float(drift) >= strong_drift and impulse_score >= strong_impulse:
-            risk_mult *= float(getattr(cfg, "STRONG_SETUP_RISK_MULT", 1.35))
-            flags = {"core_strong_setup": True, "core_very_strong_setup": False, "directional_setup_strength": "strong"}
+            risk_mult *= float(getattr(cfg, "STRONG_SETUP_RISK_MULT", 1.60))
+            flags.update({"core_strong_setup": True, "core_very_strong_setup": False, "directional_setup_strength": "strong"})
+        else:
+            flags["smart_scaling_reason"] = "base_thresholds_not_met"
         return risk_mult, flags
 
     def _check_alt_mean_reversion_entry(self, symbol: str, market_state: str, recent: pd.DataFrame, candle: pd.Series, atr_ltf: float) -> tuple[str | None, dict]:
@@ -137,36 +184,97 @@ class MTFBreakoutStrategy(BaseStrategy):
             ema20 = float(candle.get("EMA20", float("nan")))
             rsi = float(candle.get("RSI", float("nan")))
             volume = float(candle.get("volume", float("nan")))
+            adx_ltf = float(candle.get("ADX", float("nan")))
+            adx_htf = float(candle.get("HTF_ADX", float("nan")))
+            htf_ema20 = float(candle.get("HTF_EMA20", float("nan")))
+            htf_ema50 = float(candle.get("HTF_EMA50", float("nan")))
+            htf_rsi = float(candle.get("HTF_RSI", float("nan")))
+            atr_pct = (atr_ltf / close) if close > 0 else 0.0
         except Exception:
             return None, {"reason": "bad_candle_values"}
         import math
-        if any(math.isnan(x) for x in [open_, high, low, close, ema20, rsi, volume]):
+        if any(math.isnan(x) for x in [open_, high, low, close, ema20, rsi, volume, adx_ltf, adx_htf, htf_ema20, htf_ema50, htf_rsi]):
             return None, {"reason": "nan_values"}
         candle_range = max(high - low, 1e-9)
         body_ratio = abs(close - open_) / candle_range
         close_pos = (close - low) / candle_range
+        upper_wick = max(0.0, high - max(open_, close))
+        lower_wick = max(0.0, min(open_, close) - low)
+        upper_wick_ratio = upper_wick / candle_range
+        lower_wick_ratio = lower_wick / candle_range
         vol_ma = float(recent["volume"].astype(float).tail(8).mean()) if "volume" in recent.columns else 0.0
         vol_ratio = (volume / vol_ma) if vol_ma > 0 else 1.0
         stretch_atr = (close - ema20) / atr_ltf
-        min_stretch = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_STRETCH_ATR", float(getattr(cfg, "ALT_REV_MIN_STRETCH_ATR", 1.35))))
-        long_rsi_max = float(cfg.get_symbol_param_float(symbol, "ALT_REV_RSI_LONG_MAX", float(getattr(cfg, "ALT_REV_RSI_LONG_MAX", 34.0))))
-        short_rsi_min = float(cfg.get_symbol_param_float(symbol, "ALT_REV_RSI_SHORT_MIN", float(getattr(cfg, "ALT_REV_RSI_SHORT_MIN", 66.0))))
-        min_close_pos_long = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_CLOSE_POS_LONG", float(getattr(cfg, "ALT_REV_MIN_CLOSE_POS_LONG", 0.45))))
-        max_close_pos_short = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_CLOSE_POS_SHORT", float(getattr(cfg, "ALT_REV_MAX_CLOSE_POS_SHORT", 0.55))))
-        min_body_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_BODY_RATIO", float(getattr(cfg, "ALT_REV_MIN_BODY_RATIO", 0.18))))
-        min_vol_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_VOL_RATIO", float(getattr(cfg, "ALT_REV_MIN_VOL_RATIO", 0.90))))
+        min_stretch = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_STRETCH_ATR", float(getattr(cfg, "ALT_REV_MIN_STRETCH_ATR", 2.10))))
+        long_rsi_max = float(cfg.get_symbol_param_float(symbol, "ALT_REV_RSI_LONG_MAX", float(getattr(cfg, "ALT_REV_RSI_LONG_MAX", 27.0))))
+        short_rsi_min = float(cfg.get_symbol_param_float(symbol, "ALT_REV_RSI_SHORT_MIN", float(getattr(cfg, "ALT_REV_RSI_SHORT_MIN", 73.0))))
+        min_close_pos_long = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_CLOSE_POS_LONG", float(getattr(cfg, "ALT_REV_MIN_CLOSE_POS_LONG", 0.60))))
+        max_close_pos_short = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_CLOSE_POS_SHORT", float(getattr(cfg, "ALT_REV_MAX_CLOSE_POS_SHORT", 0.40))))
+        min_body_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_BODY_RATIO", float(getattr(cfg, "ALT_REV_MIN_BODY_RATIO", 0.28))))
+        min_vol_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_VOL_RATIO", float(getattr(cfg, "ALT_REV_MIN_VOL_RATIO", 1.02))))
+        max_htf_adx = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_HTF_ADX", float(getattr(cfg, "ALT_REV_MAX_HTF_ADX", 18.0))))
+        max_ltf_adx = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_LTF_ADX", float(getattr(cfg, "ALT_REV_MAX_LTF_ADX", 22.0))))
+        min_atr_pct = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_ATR_PCT", float(getattr(cfg, "ALT_REV_MIN_ATR_PCT", 0.0025))))
+        require_reversal = bool(getattr(cfg, "ALT_REV_REQUIRE_REVERSAL_CANDLE", True))
+        min_wick_rejection = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_WICK_REJECTION", float(getattr(cfg, "ALT_REV_MIN_WICK_REJECTION", 0.20))))
+        max_htf_drift = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_HTF_DRIFT_PCT", float(getattr(cfg, "ALT_REV_MAX_HTF_DRIFT_PCT", 0.010))))
+        max_htf_ema_spread = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_HTF_EMA_SPREAD_PCT", float(getattr(cfg, "ALT_REV_MAX_HTF_EMA_SPREAD_PCT", 0.010))))
+        max_price_to_htf_ema20 = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_PRICE_TO_HTF_EMA20_PCT", float(getattr(cfg, "ALT_REV_MAX_PRICE_TO_HTF_EMA20_PCT", 0.030))))
+        htf_rsi_min = float(cfg.get_symbol_param_float(symbol, "ALT_REV_HTF_RSI_MIN", float(getattr(cfg, "ALT_REV_HTF_RSI_MIN", 40.0))))
+        htf_rsi_max = float(cfg.get_symbol_param_float(symbol, "ALT_REV_HTF_RSI_MAX", float(getattr(cfg, "ALT_REV_HTF_RSI_MAX", 60.0))))
+        htf_ema_spread_pct = abs(htf_ema20 - htf_ema50) / close if close > 0 else 0.0
+        price_to_htf_ema20_pct = abs(close - htf_ema20) / close if close > 0 else 0.0
+        htf_drift_pct = abs(htf_ema20 - htf_ema50) / max(abs(htf_ema50), 1e-9)
         meta = {
             "stretch_atr": stretch_atr,
             "rsi": rsi,
             "close_pos": close_pos,
             "body_ratio": body_ratio,
             "vol_ratio": vol_ratio,
+            "adx_ltf": adx_ltf,
+            "adx_htf": adx_htf,
+            "atr_pct": atr_pct,
             "market_state": market_state,
+            "htf_ema_spread_pct": htf_ema_spread_pct,
+            "price_to_htf_ema20_pct": price_to_htf_ema20_pct,
+            "htf_drift_pct": htf_drift_pct,
+            "htf_rsi": htf_rsi,
         }
-        if stretch_atr <= -min_stretch and rsi <= long_rsi_max and close_pos >= min_close_pos_long and body_ratio >= min_body_ratio and vol_ratio >= min_vol_ratio:
-            return "buy", {**meta, "reason": "oversold_reversion"}
-        if stretch_atr >= min_stretch and rsi >= short_rsi_min and close_pos <= max_close_pos_short and body_ratio >= min_body_ratio and vol_ratio >= min_vol_ratio:
-            return "sell", {**meta, "reason": "overbought_reversion"}
+        if market_state == "transition":
+            min_stretch *= 1.08
+            long_rsi_max = min(long_rsi_max, 33.0)
+            short_rsi_min = max(short_rsi_min, 67.0)
+            max_htf_adx = min(max_htf_adx, float(getattr(cfg, "ALT_REV_MAX_HTF_ADX_TRANSITION", max_htf_adx)))
+            max_ltf_adx = min(max_ltf_adx, float(getattr(cfg, "ALT_REV_MAX_LTF_ADX_TRANSITION", max_ltf_adx)))
+            max_htf_drift = min(max_htf_drift, float(getattr(cfg, "ALT_REV_TRANSITION_MAX_HTF_DRIFT_PCT", max_htf_drift)))
+            max_htf_ema_spread = min(max_htf_ema_spread, float(getattr(cfg, "ALT_REV_TRANSITION_MAX_HTF_EMA_SPREAD_PCT", max_htf_ema_spread)))
+            max_price_to_htf_ema20 = min(max_price_to_htf_ema20, float(getattr(cfg, "ALT_REV_TRANSITION_MAX_PRICE_TO_HTF_EMA20_PCT", max_price_to_htf_ema20)))
+            htf_rsi_min = max(htf_rsi_min, float(getattr(cfg, "ALT_REV_TRANSITION_HTF_RSI_MIN", htf_rsi_min)))
+            htf_rsi_max = min(htf_rsi_max, float(getattr(cfg, "ALT_REV_TRANSITION_HTF_RSI_MAX", htf_rsi_max)))
+        if adx_htf > max_htf_adx or adx_ltf > max_ltf_adx:
+            return None, {**meta, "reason": "adx_too_high"}
+        if atr_pct < min_atr_pct:
+            return None, {**meta, "reason": "atr_pct_too_low"}
+        if htf_drift_pct > max_htf_drift:
+            return None, {**meta, "reason": "htf_drift_too_high"}
+        if htf_ema_spread_pct > max_htf_ema_spread:
+            return None, {**meta, "reason": "htf_ema_spread_too_wide"}
+        if price_to_htf_ema20_pct > max_price_to_htf_ema20:
+            return None, {**meta, "reason": "price_too_far_from_htf_ema20"}
+        if not (htf_rsi_min <= htf_rsi <= htf_rsi_max):
+            return None, {**meta, "reason": "htf_rsi_not_neutral"}
+        # Reversal candle is now a quality bonus instead of a hard gate for phase 2.
+        long_reversal_ok = (close > open_ and lower_wick_ratio >= min_wick_rejection) or lower_wick_ratio >= (min_wick_rejection * 1.35)
+        short_reversal_ok = (close < open_ and upper_wick_ratio >= min_wick_rejection) or upper_wick_ratio >= (min_wick_rejection * 1.35)
+        long_ok = stretch_atr <= -min_stretch and rsi <= long_rsi_max and close_pos >= min_close_pos_long and body_ratio >= min_body_ratio and vol_ratio >= min_vol_ratio
+        short_ok = stretch_atr >= min_stretch and rsi >= short_rsi_min and close_pos <= max_close_pos_short and body_ratio >= min_body_ratio and vol_ratio >= min_vol_ratio
+        if require_reversal:
+            long_ok = long_ok and long_reversal_ok
+            short_ok = short_ok and short_reversal_ok
+        if long_ok:
+            return "buy", {**meta, "reason": "oversold_reversion", "lower_wick_ratio": lower_wick_ratio, "reversal_bonus": bool(long_reversal_ok)}
+        if short_ok:
+            return "sell", {**meta, "reason": "overbought_reversion", "upper_wick_ratio": upper_wick_ratio, "reversal_bonus": bool(short_reversal_ok)}
         return None, {**meta, "reason": "no_reversion_setup"}
 
     def _extract_bar_timestamp(self, df: pd.DataFrame):
@@ -881,10 +989,197 @@ class MTFBreakoutStrategy(BaseStrategy):
             "btc_close": None if np.isnan(btc_close) else btc_close,
         }
 
+
+    def _check_pullback_trend_entry(self, symbol: str, df: pd.DataFrame, side: str, atr_ltf: float) -> tuple[bool, dict]:
+        if len(df) < 120 or atr_ltf <= 0:
+            return False, {"reason": "not_enough_pullback_history"}
+        need_cols = {"EMA20", "EMA50", "EMA200", "open", "high", "low", "close", "volume", "RSI", "HTF_ADX", "HTF_EMA20"}
+        if not need_cols.issubset(df.columns):
+            return False, {"reason": "missing_pullback_cols"}
+        try:
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            ema20 = float(last.get("EMA20", np.nan))
+            ema50 = float(last.get("EMA50", np.nan))
+            ema200 = float(last.get("EMA200", np.nan))
+            close = float(last.get("close", np.nan))
+            open_ = float(last.get("open", np.nan))
+            high = float(last.get("high", np.nan))
+            low = float(last.get("low", np.nan))
+            prev_close = float(prev.get("close", np.nan))
+            prev_open = float(prev.get("open", np.nan))
+            prev_high = float(prev.get("high", np.nan))
+            prev_low = float(prev.get("low", np.nan))
+            prev_ema20 = float(prev.get("EMA20", np.nan))
+            prev_ema50 = float(prev.get("EMA50", np.nan))
+            rsi = float(last.get("RSI", np.nan))
+            htf_adx = float(last.get("HTF_ADX", np.nan))
+            htf_ema20 = float(last.get("HTF_EMA20", np.nan))
+        except Exception:
+            return False, {"reason": "bad_pullback_values"}
+
+        vals = [ema20, ema50, ema200, close, open_, high, low, prev_close, prev_open, prev_high, prev_low, prev_ema20, prev_ema50, rsi, htf_adx, htf_ema20]
+        if any(np.isnan(x) for x in vals):
+            return False, {"reason": "nan_pullback_values"}
+
+        trend_ok = (ema20 > ema50 > ema200) if side == "long" else (ema20 < ema50 < ema200)
+        if not trend_ok:
+            return False, {"reason": "ltf_alignment_fail"}
+
+        touch_atr = cfg.get_symbol_param_float(symbol, "PULLBACK_TOUCH_ATR", float(getattr(cfg, "PULLBACK_TOUCH_ATR", 0.55)))
+        deep_touch_atr = cfg.get_symbol_param_float(symbol, "PULLBACK_MAX_DEEP_TOUCH_ATR", float(getattr(cfg, "PULLBACK_MAX_DEEP_TOUCH_ATR", 1.10)))
+        min_body_atr = cfg.get_symbol_param_float(symbol, "PULLBACK_MIN_BODY_ATR", float(getattr(cfg, "PULLBACK_MIN_BODY_ATR", 0.30)))
+        min_close_pos = cfg.get_symbol_param_float(symbol, "PULLBACK_MIN_CLOSE_POS", float(getattr(cfg, "PULLBACK_MIN_CLOSE_POS", 0.55)))
+        min_vol_ratio = cfg.get_symbol_param_float(symbol, "PULLBACK_MIN_VOL_RATIO", float(getattr(cfg, "PULLBACK_MIN_VOL_RATIO", 0.90)))
+        min_htf_adx = cfg.get_symbol_param_float(symbol, "PULLBACK_MIN_HTF_ADX", float(getattr(cfg, "PULLBACK_MIN_HTF_ADX", 20.0)))
+        require_prev_counter = bool(getattr(cfg, "PULLBACK_REQUIRE_PREV_COUNTER_CANDLE", True))
+        prev_close_pos_max = cfg.get_symbol_param_float(symbol, "PULLBACK_PREV_CLOSE_POS_MAX", float(getattr(cfg, "PULLBACK_PREV_CLOSE_POS_MAX", 0.62)))
+        reclaim_ema20 = bool(getattr(cfg, "PULLBACK_RECLAIM_EMA20_REQUIRED", True))
+        min_rsi_long = cfg.get_symbol_param_float(symbol, "PULLBACK_RSI_LONG_MIN", float(getattr(cfg, "PULLBACK_RSI_LONG_MIN", 46.0)))
+        max_rsi_long = cfg.get_symbol_param_float(symbol, "PULLBACK_RSI_LONG_MAX", float(getattr(cfg, "PULLBACK_RSI_LONG_MAX", 63.0)))
+        min_rsi_short = cfg.get_symbol_param_float(symbol, "PULLBACK_RSI_SHORT_MIN", float(getattr(cfg, "PULLBACK_RSI_SHORT_MIN", 37.0)))
+        max_rsi_short = cfg.get_symbol_param_float(symbol, "PULLBACK_RSI_SHORT_MAX", float(getattr(cfg, "PULLBACK_RSI_SHORT_MAX", 54.0)))
+        pre_impulse_bars = int(getattr(cfg, "PULLBACK_PRE_IMPULSE_BARS", 8))
+        pre_impulse_min_atr = cfg.get_symbol_param_float(symbol, "PULLBACK_PRE_IMPULSE_MIN_ATR", float(getattr(cfg, "PULLBACK_PRE_IMPULSE_MIN_ATR", 1.45)))
+        pre_impulse_min_atr_short = cfg.get_symbol_param_float(symbol, "PULLBACK_PRE_IMPULSE_MIN_ATR_SHORT", float(getattr(cfg, "PULLBACK_PRE_IMPULSE_MIN_ATR_SHORT", 1.75)))
+        max_ema20_crosses = int(getattr(cfg, "PULLBACK_MAX_EMA20_CROSSES", 2))
+        max_avg_wick_ratio = cfg.get_symbol_param_float(symbol, "PULLBACK_MAX_AVG_WICK_RATIO", float(getattr(cfg, "PULLBACK_MAX_AVG_WICK_RATIO", 0.46)))
+        min_ema20_slope_pct = cfg.get_symbol_param_float(symbol, "PULLBACK_MIN_EMA20_SLOPE_PCT", float(getattr(cfg, "PULLBACK_MIN_EMA20_SLOPE_PCT", 0.00055)))
+        min_ema50_slope_pct = cfg.get_symbol_param_float(symbol, "PULLBACK_MIN_EMA50_SLOPE_PCT", float(getattr(cfg, "PULLBACK_MIN_EMA50_SLOPE_PCT", 0.00035)))
+        min_ema20_slope_pct_short = cfg.get_symbol_param_float(symbol, "PULLBACK_MIN_EMA20_SLOPE_PCT_SHORT", float(getattr(cfg, "PULLBACK_MIN_EMA20_SLOPE_PCT_SHORT", 0.00075)))
+        min_ema50_slope_pct_short = cfg.get_symbol_param_float(symbol, "PULLBACK_MIN_EMA50_SLOPE_PCT_SHORT", float(getattr(cfg, "PULLBACK_MIN_EMA50_SLOPE_PCT_SHORT", 0.00045)))
+        max_price_to_htf_ema20_pct = cfg.get_symbol_param_float(symbol, "PULLBACK_MAX_PRICE_TO_HTF_EMA20_PCT", float(getattr(cfg, "PULLBACK_MAX_PRICE_TO_HTF_EMA20_PCT", 0.030)))
+        max_price_to_htf_ema20_pct_short = cfg.get_symbol_param_float(symbol, "PULLBACK_MAX_PRICE_TO_HTF_EMA20_PCT_SHORT", float(getattr(cfg, "PULLBACK_MAX_PRICE_TO_HTF_EMA20_PCT_SHORT", 0.025)))
+        max_same_dir_bars = int(getattr(cfg, "PULLBACK_MAX_PRE_IMPULSE_SAME_DIR_BARS", 5))
+        max_same_dir_bars_short = int(getattr(cfg, "PULLBACK_MAX_PRE_IMPULSE_SAME_DIR_BARS_SHORT", 4))
+        decay_lookback = int(getattr(cfg, "PULLBACK_DECAY_LOOKBACK", 4))
+        min_decay_ratio = cfg.get_symbol_param_float(symbol, "PULLBACK_MIN_MOMENTUM_DECAY_RATIO", float(getattr(cfg, "PULLBACK_MIN_MOMENTUM_DECAY_RATIO", 0.52)))
+        min_decay_ratio_short = cfg.get_symbol_param_float(symbol, "PULLBACK_MIN_MOMENTUM_DECAY_RATIO_SHORT", float(getattr(cfg, "PULLBACK_MIN_MOMENTUM_DECAY_RATIO_SHORT", 0.62)))
+        recent_body_atr_min = cfg.get_symbol_param_float(symbol, "PULLBACK_RECENT_BODY_ATR_MIN", float(getattr(cfg, "PULLBACK_RECENT_BODY_ATR_MIN", 0.22)))
+        recent_body_atr_min_short = cfg.get_symbol_param_float(symbol, "PULLBACK_RECENT_BODY_ATR_MIN_SHORT", float(getattr(cfg, "PULLBACK_RECENT_BODY_ATR_MIN_SHORT", 0.26)))
+
+        body = abs(close - open_)
+        rng = max(high - low, 0.0)
+        prev_rng = max(prev_high - prev_low, 1e-9)
+        if rng <= 0:
+            return False, {"reason": "zero_range"}
+        close_pos = (close - low) / rng
+        prev_close_pos = (prev_close - prev_low) / prev_rng
+        if side == "short":
+            close_pos = 1.0 - close_pos
+            prev_close_pos = 1.0 - prev_close_pos
+
+        recent = df.tail(min(len(df), 30)).copy()
+        try:
+            vol = recent["volume"].astype(float)
+            vol_ratio = float(last.get("volume", 0.0)) / max(float(vol.ewm(span=12, adjust=False).mean().iloc[-1]), 1e-9)
+        except Exception:
+            vol_ratio = 1.0
+
+        pull_recent = df.tail(min(len(df), max(12, pre_impulse_bars + 4))).copy()
+        close_s = pull_recent["close"].astype(float)
+        ema20_s = pull_recent["EMA20"].astype(float)
+        ema50_s = pull_recent["EMA50"].astype(float)
+        high_s = pull_recent["high"].astype(float)
+        low_s = pull_recent["low"].astype(float)
+        open_s = pull_recent["open"].astype(float)
+        bar_range = (high_s - low_s).clip(lower=1e-9)
+        wick_ratio_s = (((high_s - close_s.combine(open_s, max)) + (close_s.combine(open_s, min) - low_s)).clip(lower=0.0) / bar_range)
+        avg_wick_ratio = float(wick_ratio_s.tail(min(5, len(wick_ratio_s))).mean()) if len(wick_ratio_s) else 1.0
+        closes_rel = close_s.tail(min(8, len(close_s)))
+        ema20_rel = ema20_s.tail(len(closes_rel))
+        ema20_crosses = int((((closes_rel > ema20_rel).astype(int)).diff().abs() == 1).sum()) if len(closes_rel) > 1 else 0
+        slope_lookback = min(6, len(ema20_s) - 1)
+        ema20_slope_pct = abs(float(ema20_s.iloc[-1] - ema20_s.iloc[-1 - slope_lookback])) / max(abs(float(ema20_s.iloc[-1 - slope_lookback])), 1e-9) if slope_lookback >= 1 else 0.0
+        ema50_slope_pct = abs(float(ema50_s.iloc[-1] - ema50_s.iloc[-1 - slope_lookback])) / max(abs(float(ema50_s.iloc[-1 - slope_lookback])), 1e-9) if slope_lookback >= 1 else 0.0
+        leg_window = df.iloc[max(0, len(df) - (pre_impulse_bars + 3)):-1].copy()
+        if len(leg_window) >= 3:
+            leg_high = float(leg_window["high"].astype(float).max())
+            leg_low = float(leg_window["low"].astype(float).min())
+            pre_impulse_atr = (leg_high - leg_low) / max(atr_ltf, 1e-9)
+        else:
+            pre_impulse_atr = 0.0
+
+        body_s = (close_s - open_s).abs()
+        same_dir_series = close_s.diff().dropna()
+        recent_impulse = leg_window.tail(min(len(leg_window), max(decay_lookback, 3))).copy() if len(leg_window) else leg_window.copy()
+        if len(recent_impulse) >= max(decay_lookback, 3):
+            recent_bodies = (recent_impulse["close"].astype(float) - recent_impulse["open"].astype(float)).abs() / max(atr_ltf, 1e-9)
+            split = max(2, len(recent_bodies) // 2)
+            older_mean = float(recent_bodies.iloc[:split].mean()) if split > 0 else 0.0
+            newer_mean = float(recent_bodies.iloc[-split:].mean()) if split > 0 else 0.0
+            momentum_decay_ratio = newer_mean / max(older_mean, 1e-9)
+            recent_body_atr = newer_mean
+        else:
+            momentum_decay_ratio = 1.0
+            recent_body_atr = 0.0
+
+        if side == "long":
+            touch20 = low <= ema20 + atr_ltf * touch_atr
+            touch50 = low <= ema50 + atr_ltf * touch_atr
+            touch_ok = touch20 or touch50
+            not_too_deep = low >= ema50 - atr_ltf * deep_touch_atr
+            reclaim_ok = close >= ema20 if reclaim_ema20 else close >= open_
+            bullish_ok = close > open_ and close > prev_close and close_pos >= min_close_pos
+            prev_counter_ok = (prev_close < prev_open and prev_close_pos <= prev_close_pos_max) if require_prev_counter else True
+            rsi_ok = min_rsi_long <= rsi <= max_rsi_long
+            slope_ok = ema20_slope_pct >= min_ema20_slope_pct and ema50_slope_pct >= min_ema50_slope_pct
+            pre_impulse_ok = pre_impulse_atr >= pre_impulse_min_atr
+            price_to_htf_ema20_pct = abs(close - htf_ema20) / max(abs(htf_ema20), 1e-9)
+            trend_not_exhausted = price_to_htf_ema20_pct <= max_price_to_htf_ema20_pct
+            same_dir_bars = int((same_dir_series > 0).sum()) if len(same_dir_series) else 0
+            exhaustion_ok = same_dir_bars <= max_same_dir_bars
+            decay_ok = momentum_decay_ratio >= min_decay_ratio and recent_body_atr >= recent_body_atr_min
+        else:
+            touch20 = high >= ema20 - atr_ltf * touch_atr
+            touch50 = high >= ema50 - atr_ltf * touch_atr
+            touch_ok = touch20 or touch50
+            not_too_deep = high <= ema50 + atr_ltf * deep_touch_atr
+            reclaim_ok = close <= ema20 if reclaim_ema20 else close <= open_
+            bullish_ok = close < open_ and close < prev_close and close_pos >= min_close_pos
+            prev_counter_ok = (prev_close > prev_open and prev_close_pos <= prev_close_pos_max) if require_prev_counter else True
+            rsi_ok = min_rsi_short <= rsi <= max_rsi_short
+            slope_ok = ema20_slope_pct >= min_ema20_slope_pct_short and ema50_slope_pct >= min_ema50_slope_pct_short
+            pre_impulse_ok = pre_impulse_atr >= pre_impulse_min_atr_short
+            price_to_htf_ema20_pct = abs(close - htf_ema20) / max(abs(htf_ema20), 1e-9)
+            trend_not_exhausted = price_to_htf_ema20_pct <= max_price_to_htf_ema20_pct_short
+            same_dir_bars = int((same_dir_series < 0).sum()) if len(same_dir_series) else 0
+            exhaustion_ok = same_dir_bars <= max_same_dir_bars_short
+            decay_ok = momentum_decay_ratio >= min_decay_ratio_short and recent_body_atr >= recent_body_atr_min_short
+
+        clean_trend_ok = ema20_crosses <= max_ema20_crosses and avg_wick_ratio <= max_avg_wick_ratio
+        continuation_ok = trend_not_exhausted and exhaustion_ok and decay_ok
+        ok = bool(touch_ok and not_too_deep and reclaim_ok and bullish_ok and prev_counter_ok and body >= atr_ltf * min_body_atr and vol_ratio >= min_vol_ratio and htf_adx >= min_htf_adx and rsi_ok and slope_ok and pre_impulse_ok and clean_trend_ok and continuation_ok)
+        return ok, {
+            "touch20": touch20,
+            "touch50": touch50,
+            "touch_ok": touch_ok,
+            "not_too_deep": not_too_deep,
+            "reclaim_ok": reclaim_ok,
+            "trigger_ok": bullish_ok,
+            "prev_counter_ok": prev_counter_ok,
+            "body": body,
+            "atr": atr_ltf,
+            "close_pos": close_pos,
+            "prev_close_pos": prev_close_pos,
+            "vol_ratio": vol_ratio,
+            "rsi": rsi,
+            "htf_adx": htf_adx,
+            "ema20_crosses": ema20_crosses,
+            "avg_wick_ratio": avg_wick_ratio,
+            "ema20_slope_pct": ema20_slope_pct,
+            "ema50_slope_pct": ema50_slope_pct,
+            "pre_impulse_atr": pre_impulse_atr,
+            "slope_ok": slope_ok,
+            "pre_impulse_ok": pre_impulse_ok,
+            "clean_trend_ok": clean_trend_ok,
+            "side": side,
+        }
+
     def _check_continuation_entry(self, symbol: str, df: pd.DataFrame, side: str, atr_ltf: float) -> tuple[bool, dict]:
         if len(df) < 120 or atr_ltf <= 0:
             return False, {"reason": "not_enough_continuation_history"}
-        need_cols = {"EMA20", "EMA50", "EMA200", "open", "high", "low", "close", "volume", "RSI", "HTF_ADX"}
+        need_cols = {"EMA20", "EMA50", "EMA200", "open", "high", "low", "close", "volume", "RSI", "HTF_ADX", "HTF_EMA20"}
         if not need_cols.issubset(df.columns):
             return False, {"reason": "missing_continuation_cols"}
         try:
@@ -934,6 +1229,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         min_rsi_short = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_SHORT_MIN", float(getattr(cfg, "CONTINUATION_RSI_SHORT_MIN", 37.0)))
         max_rsi_short = cfg.get_symbol_param_float(symbol, "CONTINUATION_RSI_SHORT_MAX", float(getattr(cfg, "CONTINUATION_RSI_SHORT_MAX", 52.0)))
         pullback_depth_atr = cfg.get_symbol_param_float(symbol, "CONTINUATION_PULLBACK_DEPTH_ATR", float(getattr(cfg, "CONTINUATION_PULLBACK_DEPTH_ATR", 0.9)))
+        pre_impulse_bars = int(getattr(cfg, "PULLBACK_PRE_IMPULSE_BARS", 8))
 
         close_pos = (close - low) / rng
         prev_close_pos = (prev_close - prev_low) / prev_rng
@@ -947,6 +1243,30 @@ class MTFBreakoutStrategy(BaseStrategy):
             vol_ratio = float(last.get("volume", 0.0)) / max(float(vol.ewm(span=12, adjust=False).mean().iloc[-1]), 1e-9)
         except Exception:
             vol_ratio = 1.0
+
+        pull_recent = df.tail(min(len(df), max(12, pre_impulse_bars + 4))).copy()
+        close_s = pull_recent["close"].astype(float)
+        ema20_s = pull_recent["EMA20"].astype(float)
+        ema50_s = pull_recent["EMA50"].astype(float)
+        high_s = pull_recent["high"].astype(float)
+        low_s = pull_recent["low"].astype(float)
+        open_s = pull_recent["open"].astype(float)
+        bar_range = (high_s - low_s).clip(lower=1e-9)
+        wick_ratio_s = (((high_s - close_s.combine(open_s, max)) + (close_s.combine(open_s, min) - low_s)).clip(lower=0.0) / bar_range)
+        avg_wick_ratio = float(wick_ratio_s.tail(min(5, len(wick_ratio_s))).mean()) if len(wick_ratio_s) else 1.0
+        closes_rel = close_s.tail(min(8, len(close_s)))
+        ema20_rel = ema20_s.tail(len(closes_rel))
+        ema20_crosses = int((((closes_rel > ema20_rel).astype(int)).diff().abs() == 1).sum()) if len(closes_rel) > 1 else 0
+        slope_lookback = min(6, len(ema20_s) - 1)
+        ema20_slope_pct = abs(float(ema20_s.iloc[-1] - ema20_s.iloc[-1 - slope_lookback])) / max(abs(float(ema20_s.iloc[-1 - slope_lookback])), 1e-9) if slope_lookback >= 1 else 0.0
+        ema50_slope_pct = abs(float(ema50_s.iloc[-1] - ema50_s.iloc[-1 - slope_lookback])) / max(abs(float(ema50_s.iloc[-1 - slope_lookback])), 1e-9) if slope_lookback >= 1 else 0.0
+        leg_window = df.iloc[max(0, len(df) - (pre_impulse_bars + 3)):-1].copy()
+        if len(leg_window) >= 3:
+            leg_high = float(leg_window["high"].astype(float).max())
+            leg_low = float(leg_window["low"].astype(float).min())
+            pre_impulse_atr = (leg_high - leg_low) / max(atr_ltf, 1e-9)
+        else:
+            pre_impulse_atr = 0.0
 
         if side == "long":
             touch_ok = low <= ema20 + atr_ltf * touch_atr
@@ -1573,6 +1893,7 @@ class MTFBreakoutStrategy(BaseStrategy):
             return None
 
         atr_pct_h = atr_h / close
+        self._last_atr_pct_h = atr_pct_h
         min_atr_pct = float(getattr(cfg, "ANTI_CHOP_MIN_ATR_PCT", 0.0005))
         if atr_pct_h < min_atr_pct:
             return None
@@ -1898,6 +2219,34 @@ class MTFBreakoutStrategy(BaseStrategy):
             continuation_states.add("transition")
 
         if market_state in continuation_states or transition_state:
+            pullback_states = {"trend"}
+            if bool(getattr(cfg, "PULLBACK_TREND_ALLOW_IN_TRANSITION", False)):
+                pullback_states.add("transition")
+            pullback_enabled = bool(getattr(cfg, "PULLBACK_TREND_ENABLED", False)) and symbol in set(getattr(cfg, "PULLBACK_TREND_SYMBOLS", []))
+            if pullback_enabled and market_state in pullback_states:
+                if regime == "bull":
+                    btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="long")
+                    pullback_ok, pullback_meta = self._check_pullback_trend_entry(symbol=symbol, df=df, side="long", atr_ltf=atr_ltf)
+                    if btc_ok and pullback_ok:
+                        regime_gate_ok, regime_gate_meta = self._check_directional_regime_gate(symbol=symbol, side="long", trade_type="continuation", regime=regime, market_state=market_state, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift, rsi_h=rsi_h)
+                        if regime_gate_ok:
+                            trend_quality_ok, trend_quality_meta = self._check_trend_strength_and_chop(symbol=symbol, df=df, recent=recent, side="long", trade_type="continuation", close=close, atr_ltf=atr_ltf, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift)
+                            if trend_quality_ok:
+                                risk_mult = float(cfg.get_symbol_param_float(symbol, "PULLBACK_RISK_MULTIPLIER", float(getattr(cfg, "PULLBACK_RISK_MULTIPLIER", 0.75))))
+                                risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="continuation", side="long", market_state=market_state, trend_quality_meta=trend_quality_meta)
+                                return self._set_signal("buy", trade_type="pullback", risk_multiplier=risk_mult, market_state=market_state, pullback_meta=pullback_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="long", **setup_flags)
+                elif regime == "bear":
+                    btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="short")
+                    pullback_ok, pullback_meta = self._check_pullback_trend_entry(symbol=symbol, df=df, side="short", atr_ltf=atr_ltf)
+                    btc_short_ok, btc_short_meta = self._btc_short_trade_ok(symbol=symbol, trade_type="continuation", regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=float(btc_meta.get("score", 0.0)))
+                    if btc_ok and pullback_ok and btc_short_ok:
+                        regime_gate_ok, regime_gate_meta = self._check_directional_regime_gate(symbol=symbol, side="short", trade_type="continuation", regime=regime, market_state=market_state, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift, rsi_h=rsi_h)
+                        if regime_gate_ok:
+                            trend_quality_ok, trend_quality_meta = self._check_trend_strength_and_chop(symbol=symbol, df=df, recent=recent, side="short", trade_type="continuation", close=close, atr_ltf=atr_ltf, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift)
+                            if trend_quality_ok:
+                                risk_mult = float(cfg.get_symbol_param_float(symbol, "PULLBACK_RISK_MULTIPLIER", float(getattr(cfg, "PULLBACK_RISK_MULTIPLIER", 0.75))))
+                                risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="continuation", side="short", market_state=market_state, trend_quality_meta=trend_quality_meta)
+                                return self._set_signal("sell", trade_type="pullback", risk_multiplier=risk_mult, market_state=market_state, pullback_meta=pullback_meta, btc_short_ctx=btc_short_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="short", **setup_flags)
             if regime == "bull":
                 btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="long")
                 alt_ok, alt_meta = self._calc_alt_quality_score(symbol=symbol, recent=recent, atr_ltf=atr_ltf, side="long")
@@ -1915,7 +2264,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                             strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="long")
                             if strong_setup:
                                 risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
-                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="cont_compression", side="long")
+                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="cont_compression", side="long", market_state=market_state, trend_quality_meta=trend_quality_meta)
                             return self._set_signal("buy", trade_type="cont_compression", risk_multiplier=risk_mult, market_state=market_state, cont_comp_meta=cont_comp_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="long", strong_setup=strong_setup, **setup_flags)
                         logger.debug("[MTF] skip BUY cont_compression by trend quality/chop: %s", trend_quality_meta)
                     logger.debug("[MTF] skip BUY cont_compression by directional regime gate: %s", regime_gate_meta)
@@ -1931,7 +2280,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                             strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="long")
                             if strong_setup:
                                 risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
-                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="continuation", side="long")
+                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="continuation", side="long", market_state=market_state, trend_quality_meta=trend_quality_meta)
                             return self._set_signal("buy", trade_type="continuation", risk_multiplier=risk_mult, market_state=market_state, cont_meta=cont_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="long", strong_setup=strong_setup, **setup_flags)
                         logger.debug("[MTF] skip BUY continuation by trend quality/chop: %s", trend_quality_meta)
                     logger.debug("[MTF] skip BUY continuation by directional regime gate: %s", regime_gate_meta)
@@ -1957,7 +2306,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                             strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="short")
                             if strong_setup:
                                 risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
-                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="cont_compression", side="short")
+                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="cont_compression", side="short", market_state=market_state, trend_quality_meta=trend_quality_meta)
                             return self._set_signal("sell", trade_type="cont_compression", risk_multiplier=risk_mult, market_state=market_state, cont_comp_meta=cont_comp_meta, btc_short_ctx=btc_short_ctx_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="short", strong_setup=strong_setup, **setup_flags)
                         logger.debug("[MTF] skip SELL cont_compression by trend quality/chop: %s", trend_quality_meta)
                     logger.debug("[MTF] skip SELL cont_compression by directional regime gate: %s", regime_gate_meta)
@@ -1974,7 +2323,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                             strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="short")
                             if strong_setup:
                                 risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
-                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="continuation", side="short")
+                            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="continuation", side="short", market_state=market_state, trend_quality_meta=trend_quality_meta)
                             return self._set_signal("sell", trade_type="continuation", risk_multiplier=risk_mult, market_state=market_state, cont_meta=cont_meta, btc_short_ctx=btc_short_cont_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="short", strong_setup=strong_setup, **setup_flags)
                         logger.debug("[MTF] skip SELL continuation by trend quality/chop: %s", trend_quality_meta)
                     logger.debug("[MTF] skip SELL continuation by directional regime gate: %s", regime_gate_meta)
@@ -2051,7 +2400,7 @@ class MTFBreakoutStrategy(BaseStrategy):
             strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="long")
             if strong_setup:
                 risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
-            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="impulse", side="long")
+            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="impulse", side="long", market_state=market_state, trend_quality_meta=trend_quality_meta)
             return self._set_signal("buy", trade_type="impulse", risk_multiplier=risk_mult, market_state=market_state, impulse_meta=impulse_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="long", strong_setup=strong_setup, **setup_flags)
 
         # SHORT: H1 bear-тренд + подтверждённое закрытие M15 ниже диапазона
@@ -2128,7 +2477,7 @@ class MTFBreakoutStrategy(BaseStrategy):
             strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="short")
             if strong_setup:
                 risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
-            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="impulse", side="short")
+            risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="impulse", side="short", market_state=market_state, trend_quality_meta=trend_quality_meta)
             return self._set_signal("sell", trade_type="impulse", risk_multiplier=risk_mult, market_state=market_state, impulse_meta=impulse_meta, btc_short_ctx=btc_short_ctx_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="short", strong_setup=strong_setup, **setup_flags)
 
         return None
