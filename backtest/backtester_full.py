@@ -29,6 +29,7 @@ from position_management import (
     update_peak_price,
     update_trailing_stop,
     mark_tp1_bar,
+    should_close_runner_on_stall,
 )
 
 
@@ -424,8 +425,8 @@ class Backtester:
                         positions[sym] = None
                         continue
                     balance = self._close_fraction(balance, sym, pos, exit_price, fraction=tp1_frac, reason="tp1", bar_index=i)
-                    on_tp1_hit(pos, exit_price, atr)
                     mark_tp1_bar(pos, i)
+                    on_tp1_hit(pos, exit_price, atr)
                 elif exit_reason == "trailing_stop":
                     balance, _ = self._close_position(balance, sym, pos, exit_price, return_pnl=True, reason="trailing_stop", bar_index=i)
                     reset_stop_streak(sym, pos.side)
@@ -433,7 +434,7 @@ class Backtester:
                     continue
 
                 # 2) Обновляем MFE по экстремуму свечи и двигаем BE / trailing по лучшей цене внутри бара.
-                update_peak_price(pos, favorable_price)
+                update_peak_price(pos, favorable_price, i)
                 maybe_move_to_break_even(pos, favorable_price, atr)
 
                 # 3) Runner включаем только после дополнительного прогресса за TP1.
@@ -450,6 +451,12 @@ class Backtester:
                 # 3.25) После TP1 не держим хвост вечно: если продолжения нет — закрываем остаток.
                 if should_time_stop_after_tp1(pos, i):
                     balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="time_stop_after_tp1", bar_index=i)
+                    reset_stop_streak(sym, pos.side)
+                    positions[sym] = None
+                    continue
+
+                if should_close_runner_on_stall(pos, i):
+                    balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="runner_stall", bar_index=i)
                     reset_stop_streak(sym, pos.side)
                     positions[sym] = None
                     continue

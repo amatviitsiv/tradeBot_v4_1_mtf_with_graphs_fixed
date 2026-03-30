@@ -87,195 +87,128 @@ class MTFBreakoutStrategy(BaseStrategy):
                     rs_meta = {**rs_meta, "soft_pass": True, "ratio_relax": relax_ratio, "slope_relax": relax_slope}
         return alt_ok, rs_ok, alt_meta, rs_meta
 
-    def _is_mean_reversion_alt(self, symbol: str) -> bool:
-        symbols = set(getattr(cfg, "ALT_MEAN_REVERSION_SYMBOLS", ["SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+
+    def _is_mean_reversion_symbol(self, symbol: str) -> bool:
+        symbols = set(getattr(cfg, "V52_MR_SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
         return bool(symbol and symbol in symbols)
 
-    def _apply_directional_setup_scaling(self, symbol: str, base_risk_multiplier: float, adx_h: float, drift: float, volume_meta: dict | None = None, trade_type: str = "", side: str = "", market_state: str = "", trend_quality_meta: dict | None = None) -> tuple[float, dict]:
-        flags = {"core_strong_setup": False, "core_very_strong_setup": False, "directional_setup_strength": "normal", "smart_scaling_pass": False}
-        if not bool(getattr(cfg, "ENABLE_DIRECTIONAL_RISK_SCALING", True)):
-            return float(base_risk_multiplier), flags
-        scaling_symbols = set(getattr(cfg, "DIRECTIONAL_SCALING_SYMBOLS", ["BTCUSDT", "ETHUSDT"]) or [])
-        if symbol not in scaling_symbols:
-            return float(base_risk_multiplier), flags
+    def _mr_risk_multiplier(self, symbol: str) -> float:
+        if symbol == "ETHUSDT":
+            return float(getattr(cfg, "V54_ETH_MR_RISK_MULTIPLIER", getattr(cfg, "V53_ETH_MR_RISK_MULTIPLIER", 0.15)))
+        core = set(getattr(cfg, "V52_MR_CORE_SYMBOLS", ["BTCUSDT", "ETHUSDT"]) or [])
+        if symbol in core:
+            return float(getattr(cfg, "V54_MR_RISK_MULTIPLIER_CORE", getattr(cfg, "V52_MR_RISK_MULTIPLIER_CORE", 0.45)))
+        return float(getattr(cfg, "V54_MR_RISK_MULTIPLIER_ALT", getattr(cfg, "V52_MR_RISK_MULTIPLIER_ALT", 0.35)))
 
-        if bool(getattr(cfg, "SMART_SCALING_ONLY_IN_TREND", True)) and market_state != "trend":
-            flags["smart_scaling_reason"] = "non_trend_market_state"
-            return float(base_risk_multiplier), flags
-
-        if trade_type == "impulse" and not bool(getattr(cfg, "SMART_SCALING_ALLOW_FOR_IMPULSE", True)):
-            flags["smart_scaling_reason"] = "impulse_disabled"
-            return float(base_risk_multiplier), flags
-        if trade_type == "continuation" and not bool(getattr(cfg, "SMART_SCALING_ALLOW_FOR_CONTINUATION", True)):
-            flags["smart_scaling_reason"] = "continuation_disabled"
-            return float(base_risk_multiplier), flags
-        if trade_type == "cont_compression" and not bool(getattr(cfg, "SMART_SCALING_ALLOW_FOR_CONT_COMPRESSION", True)):
-            flags["smart_scaling_reason"] = "cont_compression_disabled"
-            return float(base_risk_multiplier), flags
-
-        trend_quality_meta = trend_quality_meta or {}
-        volume_meta = volume_meta or {}
-        impulse_score = float(volume_meta.get("impulse_score", 0.0) or 0.0)
-        ema20_crosses = int(trend_quality_meta.get("ema20_crosses", 99) or 99)
-        mean_wickiness = float(trend_quality_meta.get("mean_wickiness", 1.0) or 1.0)
-        mean_body_ratio = float(trend_quality_meta.get("mean_body_ratio", 0.0) or 0.0)
-        ema20_slope_pct = float(trend_quality_meta.get("ema20_slope_pct", 0.0) or 0.0)
-        ema50_slope_pct = float(trend_quality_meta.get("ema50_slope_pct", 0.0) or 0.0)
-
-        if bool(getattr(cfg, "ENABLE_SMART_DIRECTIONAL_SCALING", True)):
-            max_crosses = int(getattr(cfg, "SMART_SCALING_MAX_EMA20_CROSSES", 1))
-            max_wickiness = float(getattr(cfg, "SMART_SCALING_MAX_WICKINESS", 0.52))
-            min_body_ratio = float(getattr(cfg, "SMART_SCALING_MIN_BODY_RATIO", 0.40))
-            min_ema20_slope = float(getattr(cfg, "SMART_SCALING_MIN_EMA20_SLOPE_PCT", 0.0038))
-            min_ema50_slope = float(getattr(cfg, "SMART_SCALING_MIN_EMA50_SLOPE_PCT", 0.0020))
-            min_atr_pct = float(getattr(cfg, "SMART_SCALING_MIN_ATR_PCT", 0.0016))
-            clean_trend = ema20_crosses <= max_crosses and mean_wickiness <= max_wickiness and mean_body_ratio >= min_body_ratio
-            slope_trend = ema20_slope_pct >= min_ema20_slope and ema50_slope_pct >= min_ema50_slope
-            if not (clean_trend and slope_trend and float(getattr(self, "_last_atr_pct_h", 0.0) or 0.0) >= min_atr_pct):
-                flags["smart_scaling_reason"] = "trend_quality_not_clean_enough"
-                return float(base_risk_multiplier), flags
-            flags["smart_scaling_pass"] = True
-
-        strong_adx = float(getattr(cfg, "STRONG_SETUP_MIN_ADX", 26.0))
-        very_strong_adx = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_ADX", 32.0))
-        strong_drift = float(getattr(cfg, "STRONG_SETUP_MIN_DRIFT_PCT", 0.0075))
-        very_strong_drift = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_DRIFT_PCT", 0.0110))
-        strong_impulse = float(getattr(cfg, "STRONG_SETUP_MIN_VOLUME_IMPULSE", 0.85))
-        very_strong_impulse = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_VOLUME_IMPULSE", 0.98))
-
-        if side == "short":
-            strong_adx += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_ADX", 2.0))
-            very_strong_adx += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_ADX", 2.0))
-            strong_drift += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_DRIFT_PCT", 0.0015))
-            very_strong_drift += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_DRIFT_PCT", 0.0015))
-            strong_impulse += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_IMPULSE", 0.05))
-            very_strong_impulse += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_IMPULSE", 0.05))
-
-        risk_mult = float(base_risk_multiplier)
-        if float(adx_h) >= very_strong_adx and float(drift) >= very_strong_drift and impulse_score >= very_strong_impulse:
-            risk_mult *= float(getattr(cfg, "VERY_STRONG_SETUP_RISK_MULT", 2.20))
-            flags.update({"core_strong_setup": True, "core_very_strong_setup": True, "directional_setup_strength": "very_strong"})
-        elif float(adx_h) >= strong_adx and float(drift) >= strong_drift and impulse_score >= strong_impulse:
-            risk_mult *= float(getattr(cfg, "STRONG_SETUP_RISK_MULT", 1.60))
-            flags.update({"core_strong_setup": True, "core_very_strong_setup": False, "directional_setup_strength": "strong"})
-        else:
-            flags["smart_scaling_reason"] = "base_thresholds_not_met"
-        return risk_mult, flags
-
-    def _check_alt_mean_reversion_entry(self, symbol: str, market_state: str, recent: pd.DataFrame, candle: pd.Series, atr_ltf: float) -> tuple[str | None, dict]:
-        if not bool(getattr(cfg, "ALT_MEAN_REVERSION_ENABLED", True)):
+    def _check_v52_mean_reversion_entry(self, symbol: str, market_state: str, recent: pd.DataFrame, candle: pd.Series, atr_ltf: float) -> tuple[str | None, dict]:
+        if not bool(getattr(cfg, "V52_MEAN_REVERSION_ENABLED", True)):
             return None, {"reason": "disabled"}
-        if not self._is_mean_reversion_alt(symbol):
-            return None, {"reason": "not_alt_reversion_symbol"}
-        allow_states = set()
-        if bool(getattr(cfg, "ALT_MEAN_REVERSION_ALLOW_IN_RANGE", True)):
-            allow_states.add("range")
-        if bool(getattr(cfg, "ALT_MEAN_REVERSION_ALLOW_IN_TRANSITION", True)):
-            allow_states.add("transition")
+        if not self._is_mean_reversion_symbol(symbol):
+            return None, {"reason": "symbol_not_enabled"}
+
+        core = set(getattr(cfg, "V52_MR_CORE_SYMBOLS", ["BTCUSDT", "ETHUSDT"]) or [])
+        is_core = symbol in core
+        if is_core:
+            allow_states = set(getattr(cfg, "V53_MR_ALLOWED_STATES_CORE", ["range"]) or ["range"])
+        else:
+            allow_states = set(getattr(cfg, "V52_MR_ALLOWED_STATES", ["range", "transition"]) or ["range", "transition"])
         if market_state not in allow_states:
             return None, {"reason": "market_state_not_allowed", "market_state": market_state}
-        if atr_ltf <= 0 or recent is None or len(recent) < 5:
+        if atr_ltf <= 0 or recent is None or len(recent) < 20:
             return None, {"reason": "not_enough_data"}
-        try:
-            open_ = float(candle.get("open", float("nan")))
-            high = float(candle.get("high", float("nan")))
-            low = float(candle.get("low", float("nan")))
-            close = float(candle.get("close", float("nan")))
-            ema20 = float(candle.get("EMA20", float("nan")))
-            rsi = float(candle.get("RSI", float("nan")))
-            volume = float(candle.get("volume", float("nan")))
-            adx_ltf = float(candle.get("ADX", float("nan")))
-            adx_htf = float(candle.get("HTF_ADX", float("nan")))
-            htf_ema20 = float(candle.get("HTF_EMA20", float("nan")))
-            htf_ema50 = float(candle.get("HTF_EMA50", float("nan")))
-            htf_rsi = float(candle.get("HTF_RSI", float("nan")))
-            atr_pct = (atr_ltf / close) if close > 0 else 0.0
-        except Exception:
-            return None, {"reason": "bad_candle_values"}
-        import math
-        if any(math.isnan(x) for x in [open_, high, low, close, ema20, rsi, volume, adx_ltf, adx_htf, htf_ema20, htf_ema50, htf_rsi]):
+
+        def _f(name: str, default: float = 0.0) -> float:
+            try:
+                return float(candle.get(name, default))
+            except Exception:
+                return float(default)
+
+        open_ = _f("open", float("nan"))
+        high = _f("high", float("nan"))
+        low = _f("low", float("nan"))
+        close = _f("close", float("nan"))
+        ema20 = _f("EMA20", float("nan"))
+        rsi = _f("RSI", float("nan"))
+        volume = _f("volume", float("nan"))
+        adx_ltf = _f("ADX", float("nan"))
+        adx_htf = _f("HTF_ADX", float("nan"))
+        htf_ema20 = _f("HTF_EMA20", float("nan"))
+        htf_ema50 = _f("HTF_EMA50", float("nan"))
+        htf_rsi = _f("HTF_RSI", float("nan"))
+        vals = [open_, high, low, close, ema20, rsi, volume, adx_ltf, adx_htf, htf_ema20, htf_ema50, htf_rsi]
+        if any(pd.isna(v) for v in vals) or close <= 0:
             return None, {"reason": "nan_values"}
+
+        z_window = int(getattr(cfg, "V52_MR_Z_WINDOW", 20))
+        bb_mult = float(getattr(cfg, "V52_MR_BB_STD", 2.0))
+        closes = recent["close"].astype(float).tail(max(z_window, 20))
+        vols = recent["volume"].astype(float).tail(12) if "volume" in recent.columns else pd.Series(dtype=float)
+        ma = float(closes.mean()) if len(closes) else close
+        std = float(closes.std(ddof=0)) if len(closes) else 0.0
+        if std <= 1e-9:
+            return None, {"reason": "std_too_low"}
+        zscore = (close - ma) / std
+        bb_lower = ma - bb_mult * std
+        bb_upper = ma + bb_mult * std
+        dev_atr = (close - ema20) / atr_ltf
         candle_range = max(high - low, 1e-9)
-        body_ratio = abs(close - open_) / candle_range
         close_pos = (close - low) / candle_range
-        upper_wick = max(0.0, high - max(open_, close))
-        lower_wick = max(0.0, min(open_, close) - low)
-        upper_wick_ratio = upper_wick / candle_range
-        lower_wick_ratio = lower_wick / candle_range
-        vol_ma = float(recent["volume"].astype(float).tail(8).mean()) if "volume" in recent.columns else 0.0
+        upper_wick_ratio = max(0.0, high - max(open_, close)) / candle_range
+        lower_wick_ratio = max(0.0, min(open_, close) - low) / candle_range
+        vol_ma = float(vols.mean()) if len(vols) else volume
         vol_ratio = (volume / vol_ma) if vol_ma > 0 else 1.0
-        stretch_atr = (close - ema20) / atr_ltf
-        min_stretch = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_STRETCH_ATR", float(getattr(cfg, "ALT_REV_MIN_STRETCH_ATR", 2.10))))
-        long_rsi_max = float(cfg.get_symbol_param_float(symbol, "ALT_REV_RSI_LONG_MAX", float(getattr(cfg, "ALT_REV_RSI_LONG_MAX", 27.0))))
-        short_rsi_min = float(cfg.get_symbol_param_float(symbol, "ALT_REV_RSI_SHORT_MIN", float(getattr(cfg, "ALT_REV_RSI_SHORT_MIN", 73.0))))
-        min_close_pos_long = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_CLOSE_POS_LONG", float(getattr(cfg, "ALT_REV_MIN_CLOSE_POS_LONG", 0.60))))
-        max_close_pos_short = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_CLOSE_POS_SHORT", float(getattr(cfg, "ALT_REV_MAX_CLOSE_POS_SHORT", 0.40))))
-        min_body_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_BODY_RATIO", float(getattr(cfg, "ALT_REV_MIN_BODY_RATIO", 0.28))))
-        min_vol_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_VOL_RATIO", float(getattr(cfg, "ALT_REV_MIN_VOL_RATIO", 1.02))))
-        max_htf_adx = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_HTF_ADX", float(getattr(cfg, "ALT_REV_MAX_HTF_ADX", 18.0))))
-        max_ltf_adx = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_LTF_ADX", float(getattr(cfg, "ALT_REV_MAX_LTF_ADX", 22.0))))
-        min_atr_pct = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_ATR_PCT", float(getattr(cfg, "ALT_REV_MIN_ATR_PCT", 0.0025))))
-        require_reversal = bool(getattr(cfg, "ALT_REV_REQUIRE_REVERSAL_CANDLE", True))
-        min_wick_rejection = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MIN_WICK_REJECTION", float(getattr(cfg, "ALT_REV_MIN_WICK_REJECTION", 0.20))))
-        max_htf_drift = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_HTF_DRIFT_PCT", float(getattr(cfg, "ALT_REV_MAX_HTF_DRIFT_PCT", 0.010))))
-        max_htf_ema_spread = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_HTF_EMA_SPREAD_PCT", float(getattr(cfg, "ALT_REV_MAX_HTF_EMA_SPREAD_PCT", 0.010))))
-        max_price_to_htf_ema20 = float(cfg.get_symbol_param_float(symbol, "ALT_REV_MAX_PRICE_TO_HTF_EMA20_PCT", float(getattr(cfg, "ALT_REV_MAX_PRICE_TO_HTF_EMA20_PCT", 0.030))))
-        htf_rsi_min = float(cfg.get_symbol_param_float(symbol, "ALT_REV_HTF_RSI_MIN", float(getattr(cfg, "ALT_REV_HTF_RSI_MIN", 40.0))))
-        htf_rsi_max = float(cfg.get_symbol_param_float(symbol, "ALT_REV_HTF_RSI_MAX", float(getattr(cfg, "ALT_REV_HTF_RSI_MAX", 60.0))))
-        htf_ema_spread_pct = abs(htf_ema20 - htf_ema50) / close if close > 0 else 0.0
-        price_to_htf_ema20_pct = abs(close - htf_ema20) / close if close > 0 else 0.0
-        htf_drift_pct = abs(htf_ema20 - htf_ema50) / max(abs(htf_ema50), 1e-9)
+        htf_spread_pct = abs(htf_ema20 - htf_ema50) / close
+
+        max_htf_adx = float(getattr(cfg, "V52_MR_MAX_HTF_ADX", 20.0 if is_core else 22.0))
+        max_ltf_adx = float(getattr(cfg, "V52_MR_MAX_LTF_ADX", 24.0 if is_core else 26.0))
+        max_htf_spread = float(getattr(cfg, "V52_MR_MAX_HTF_EMA_SPREAD_PCT", 0.008 if is_core else 0.012))
+        htf_rsi_min = float(getattr(cfg, "V52_MR_HTF_RSI_MIN", 42.0))
+        htf_rsi_max = float(getattr(cfg, "V52_MR_HTF_RSI_MAX", 58.0))
+        if adx_htf > max_htf_adx or adx_ltf > max_ltf_adx:
+            return None, {"reason": "adx_too_high", "adx_htf": adx_htf, "adx_ltf": adx_ltf}
+        if htf_spread_pct > max_htf_spread:
+            return None, {"reason": "htf_spread_too_wide", "htf_spread_pct": htf_spread_pct}
+        if not (htf_rsi_min <= htf_rsi <= htf_rsi_max):
+            return None, {"reason": "htf_rsi_not_neutral", "htf_rsi": htf_rsi}
+
+        long_rsi_max = float(getattr(cfg, "V52_MR_RSI_LONG_MAX", 34.0 if is_core else 36.0))
+        short_rsi_min = float(getattr(cfg, "V52_MR_RSI_SHORT_MIN", 66.0 if is_core else 64.0))
+        z_thresh = float(getattr(cfg, "V52_MR_Z_THRESHOLD", 1.8 if is_core else 1.6))
+        dev_thresh = float(getattr(cfg, "V52_MR_DEV_ATR_THRESHOLD", 1.4 if is_core else 1.2))
+        min_vol_ratio = float(getattr(cfg, "V52_MR_MIN_VOL_RATIO", 0.85))
+        min_close_pos_long = float(getattr(cfg, "V52_MR_MIN_CLOSE_POS_LONG", 0.50))
+        max_close_pos_short = float(getattr(cfg, "V52_MR_MAX_CLOSE_POS_SHORT", 0.50))
+        min_reject_wick = float(getattr(cfg, "V52_MR_MIN_REJECTION_WICK", 0.10))
+        allow_short_core = bool(getattr(cfg, "V52_MR_ALLOW_SHORT_CORE", False))
+        allow_short_alt = bool(getattr(cfg, "V52_MR_ALLOW_SHORT_ALT", False))
+        allow_short = allow_short_core if is_core else allow_short_alt
+
+        long_extreme = (zscore <= -z_thresh and (close <= bb_lower or dev_atr <= -dev_thresh))
+        short_extreme = (zscore >= z_thresh and (close >= bb_upper or dev_atr >= dev_thresh))
+        long_reversal = close_pos >= min_close_pos_long or lower_wick_ratio >= min_reject_wick
+        short_reversal = close_pos <= max_close_pos_short or upper_wick_ratio >= min_reject_wick
+        long_ok = long_extreme and rsi <= long_rsi_max and vol_ratio >= min_vol_ratio and long_reversal
+        short_ok = allow_short and short_extreme and rsi >= short_rsi_min and vol_ratio >= min_vol_ratio and short_reversal
+
         meta = {
-            "stretch_atr": stretch_atr,
+            "market_state": market_state,
+            "zscore": zscore,
+            "bb_lower": bb_lower,
+            "bb_upper": bb_upper,
+            "dev_atr": dev_atr,
             "rsi": rsi,
-            "close_pos": close_pos,
-            "body_ratio": body_ratio,
             "vol_ratio": vol_ratio,
             "adx_ltf": adx_ltf,
             "adx_htf": adx_htf,
-            "atr_pct": atr_pct,
-            "market_state": market_state,
-            "htf_ema_spread_pct": htf_ema_spread_pct,
-            "price_to_htf_ema20_pct": price_to_htf_ema20_pct,
-            "htf_drift_pct": htf_drift_pct,
             "htf_rsi": htf_rsi,
+            "htf_spread_pct": htf_spread_pct,
+            "is_core": is_core,
         }
-        if market_state == "transition":
-            min_stretch *= 1.08
-            long_rsi_max = min(long_rsi_max, 33.0)
-            short_rsi_min = max(short_rsi_min, 67.0)
-            max_htf_adx = min(max_htf_adx, float(getattr(cfg, "ALT_REV_MAX_HTF_ADX_TRANSITION", max_htf_adx)))
-            max_ltf_adx = min(max_ltf_adx, float(getattr(cfg, "ALT_REV_MAX_LTF_ADX_TRANSITION", max_ltf_adx)))
-            max_htf_drift = min(max_htf_drift, float(getattr(cfg, "ALT_REV_TRANSITION_MAX_HTF_DRIFT_PCT", max_htf_drift)))
-            max_htf_ema_spread = min(max_htf_ema_spread, float(getattr(cfg, "ALT_REV_TRANSITION_MAX_HTF_EMA_SPREAD_PCT", max_htf_ema_spread)))
-            max_price_to_htf_ema20 = min(max_price_to_htf_ema20, float(getattr(cfg, "ALT_REV_TRANSITION_MAX_PRICE_TO_HTF_EMA20_PCT", max_price_to_htf_ema20)))
-            htf_rsi_min = max(htf_rsi_min, float(getattr(cfg, "ALT_REV_TRANSITION_HTF_RSI_MIN", htf_rsi_min)))
-            htf_rsi_max = min(htf_rsi_max, float(getattr(cfg, "ALT_REV_TRANSITION_HTF_RSI_MAX", htf_rsi_max)))
-        if adx_htf > max_htf_adx or adx_ltf > max_ltf_adx:
-            return None, {**meta, "reason": "adx_too_high"}
-        if atr_pct < min_atr_pct:
-            return None, {**meta, "reason": "atr_pct_too_low"}
-        if htf_drift_pct > max_htf_drift:
-            return None, {**meta, "reason": "htf_drift_too_high"}
-        if htf_ema_spread_pct > max_htf_ema_spread:
-            return None, {**meta, "reason": "htf_ema_spread_too_wide"}
-        if price_to_htf_ema20_pct > max_price_to_htf_ema20:
-            return None, {**meta, "reason": "price_too_far_from_htf_ema20"}
-        if not (htf_rsi_min <= htf_rsi <= htf_rsi_max):
-            return None, {**meta, "reason": "htf_rsi_not_neutral"}
-        # Reversal candle is now a quality bonus instead of a hard gate for phase 2.
-        long_reversal_ok = (close > open_ and lower_wick_ratio >= min_wick_rejection) or lower_wick_ratio >= (min_wick_rejection * 1.35)
-        short_reversal_ok = (close < open_ and upper_wick_ratio >= min_wick_rejection) or upper_wick_ratio >= (min_wick_rejection * 1.35)
-        long_ok = stretch_atr <= -min_stretch and rsi <= long_rsi_max and close_pos >= min_close_pos_long and body_ratio >= min_body_ratio and vol_ratio >= min_vol_ratio
-        short_ok = stretch_atr >= min_stretch and rsi >= short_rsi_min and close_pos <= max_close_pos_short and body_ratio >= min_body_ratio and vol_ratio >= min_vol_ratio
-        if require_reversal:
-            long_ok = long_ok and long_reversal_ok
-            short_ok = short_ok and short_reversal_ok
         if long_ok:
-            return "buy", {**meta, "reason": "oversold_reversion", "lower_wick_ratio": lower_wick_ratio, "reversal_bonus": bool(long_reversal_ok)}
+            return "buy", {**meta, "reason": "controlled_mean_reversion_long"}
         if short_ok:
-            return "sell", {**meta, "reason": "overbought_reversion", "upper_wick_ratio": upper_wick_ratio, "reversal_bonus": bool(short_reversal_ok)}
-        return None, {**meta, "reason": "no_reversion_setup"}
+            return "sell", {**meta, "reason": "controlled_mean_reversion_short"}
+        return None, {**meta, "reason": "no_controlled_mr_setup"}
 
     def _extract_bar_timestamp(self, df: pd.DataFrame):
         """Пытается достать timestamp последней свечи из open_time или DatetimeIndex."""
@@ -1523,6 +1456,96 @@ class MTFBreakoutStrategy(BaseStrategy):
 
         return self._btc_short_context_ok(symbol=symbol, regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=btc_score)
 
+    def _apply_directional_setup_scaling(self, symbol: str, base_risk_multiplier: float, adx_h: float, drift: float, volume_meta: dict | None = None, trade_type: str = "", side: str = "", market_state: str = "", trend_quality_meta: dict | None = None) -> tuple[float, dict]:
+        flags = {"core_strong_setup": False, "core_very_strong_setup": False, "directional_setup_strength": "normal", "smart_scaling_pass": False, "v6_boost_applied": False}
+        if not bool(getattr(cfg, "ENABLE_DIRECTIONAL_RISK_SCALING", True)):
+            return float(base_risk_multiplier), flags
+        if bool(getattr(cfg, "V6_BOOST_LONG_ONLY", True)) and side == "short":
+            return float(base_risk_multiplier), flags
+        scaling_symbols = set(getattr(cfg, "DIRECTIONAL_SCALING_SYMBOLS", ["BTCUSDT", "ETHUSDT"]) or [])
+        if symbol not in scaling_symbols:
+            return float(base_risk_multiplier), flags
+
+        if bool(getattr(cfg, "SMART_SCALING_ONLY_IN_TREND", True)) and market_state != "trend":
+            flags["smart_scaling_reason"] = "non_trend_market_state"
+            return float(base_risk_multiplier), flags
+
+        if trade_type == "impulse" and not bool(getattr(cfg, "SMART_SCALING_ALLOW_FOR_IMPULSE", True)):
+            flags["smart_scaling_reason"] = "impulse_disabled"
+            return float(base_risk_multiplier), flags
+        if trade_type == "continuation" and not bool(getattr(cfg, "SMART_SCALING_ALLOW_FOR_CONTINUATION", True)):
+            flags["smart_scaling_reason"] = "continuation_disabled"
+            return float(base_risk_multiplier), flags
+        if trade_type == "cont_compression" and not bool(getattr(cfg, "SMART_SCALING_ALLOW_FOR_CONT_COMPRESSION", True)):
+            flags["smart_scaling_reason"] = "cont_compression_disabled"
+            return float(base_risk_multiplier), flags
+
+        trend_quality_meta = trend_quality_meta or {}
+        volume_meta = volume_meta or {}
+        impulse_score = float(volume_meta.get("impulse_score", 0.0) or 0.0)
+        ema20_crosses = int(trend_quality_meta.get("ema20_crosses", 99) or 99)
+        mean_wickiness = float(trend_quality_meta.get("mean_wickiness", 1.0) or 1.0)
+        mean_body_ratio = float(trend_quality_meta.get("mean_body_ratio", 0.0) or 0.0)
+        ema20_slope_pct = float(trend_quality_meta.get("ema20_slope_pct", 0.0) or 0.0)
+        ema50_slope_pct = float(trend_quality_meta.get("ema50_slope_pct", 0.0) or 0.0)
+
+        if bool(getattr(cfg, "ENABLE_SMART_DIRECTIONAL_SCALING", True)):
+            max_crosses = int(getattr(cfg, "SMART_SCALING_MAX_EMA20_CROSSES", 1))
+            max_wickiness = float(getattr(cfg, "SMART_SCALING_MAX_WICKINESS", 0.52))
+            min_body_ratio = float(getattr(cfg, "SMART_SCALING_MIN_BODY_RATIO", 0.40))
+            min_ema20_slope = float(getattr(cfg, "SMART_SCALING_MIN_EMA20_SLOPE_PCT", 0.0038))
+            min_ema50_slope = float(getattr(cfg, "SMART_SCALING_MIN_EMA50_SLOPE_PCT", 0.0020))
+            min_atr_pct = float(getattr(cfg, "SMART_SCALING_MIN_ATR_PCT", 0.0016))
+            clean_trend = ema20_crosses <= max_crosses and mean_wickiness <= max_wickiness and mean_body_ratio >= min_body_ratio
+            slope_trend = ema20_slope_pct >= min_ema20_slope and ema50_slope_pct >= min_ema50_slope
+            if not (clean_trend and slope_trend and float(getattr(self, "_last_atr_pct_h", 0.0) or 0.0) >= min_atr_pct):
+                flags["smart_scaling_reason"] = "trend_quality_not_clean_enough"
+                return float(base_risk_multiplier), flags
+            flags["smart_scaling_pass"] = True
+
+        strong_adx = float(getattr(cfg, "STRONG_SETUP_MIN_ADX", 26.0))
+        very_strong_adx = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_ADX", 32.0))
+        strong_drift = float(getattr(cfg, "STRONG_SETUP_MIN_DRIFT_PCT", 0.0075))
+        very_strong_drift = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_DRIFT_PCT", 0.0110))
+        strong_impulse = float(getattr(cfg, "STRONG_SETUP_MIN_VOLUME_IMPULSE", 0.85))
+        very_strong_impulse = float(getattr(cfg, "VERY_STRONG_SETUP_MIN_VOLUME_IMPULSE", 0.98))
+
+        if side == "short":
+            strong_adx += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_ADX", 2.0))
+            very_strong_adx += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_ADX", 2.0))
+            strong_drift += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_DRIFT_PCT", 0.0015))
+            very_strong_drift += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_DRIFT_PCT", 0.0015))
+            strong_impulse += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_IMPULSE", 0.05))
+            very_strong_impulse += float(getattr(cfg, "SMART_SCALING_SHORT_EXTRA_MIN_IMPULSE", 0.05))
+
+        risk_mult = float(base_risk_multiplier)
+        if float(adx_h) >= very_strong_adx and float(drift) >= very_strong_drift and impulse_score >= very_strong_impulse:
+            risk_mult *= float(getattr(cfg, "VERY_STRONG_SETUP_RISK_MULT", 2.20))
+            flags.update({"core_strong_setup": True, "core_very_strong_setup": True, "directional_setup_strength": "very_strong"})
+        elif float(adx_h) >= strong_adx and float(drift) >= strong_drift and impulse_score >= strong_impulse:
+            risk_mult *= float(getattr(cfg, "STRONG_SETUP_RISK_MULT", 1.60))
+            flags.update({"core_strong_setup": True, "core_very_strong_setup": False, "directional_setup_strength": "strong"})
+        else:
+            flags["smart_scaling_reason"] = "base_thresholds_not_met"
+
+        if (
+            bool(getattr(cfg, "V6_ENABLE_BTC_BOOST", True))
+            and symbol in set(getattr(cfg, "V6_BOOST_SYMBOLS", ["BTCUSDT"]) or [])
+            and trade_type in set(getattr(cfg, "V6_BOOST_TRADE_TYPES", ["impulse", "continuation", "cont_compression"]) or [])
+            and market_state == "trend"
+            and side == "long"
+        ):
+            min_adx = float(getattr(cfg, "V6_BOOST_MIN_HTF_ADX", 27.0))
+            min_drift = float(getattr(cfg, "V6_BOOST_MIN_DRIFT_PCT", 0.0080))
+            min_impulse = float(getattr(cfg, "V6_BOOST_MIN_IMPULSE_SCORE", 0.95))
+            if float(adx_h) >= min_adx and float(drift) >= min_drift and impulse_score >= min_impulse:
+                boost = float(getattr(cfg, "V6_BOOST_MULT_VERY_STRONG", 1.20)) if flags.get("core_very_strong_setup") else float(getattr(cfg, "V6_BOOST_MULT_STRONG", 1.12))
+                risk_mult *= boost
+                flags["v6_boost_applied"] = True
+                flags["v6_boost_mult"] = boost
+
+        return risk_mult, flags
+
     def _check_directional_regime_gate(self, symbol: str, side: str, trade_type: str, regime: str, market_state: str, adx_h: float, atr_pct_h: float, drift: float, rsi_h: float) -> tuple[bool, dict]:
         if not bool(cfg.get_symbol_param(symbol, "MARKET_REGIME_DIRECTIONAL_GATE_ENABLED", getattr(cfg, "MARKET_REGIME_DIRECTIONAL_GATE_ENABLED", True))):
             return True, {"enabled": False}
@@ -2068,10 +2091,16 @@ class MTFBreakoutStrategy(BaseStrategy):
         long_trigger = range_high * (1.0 + buf)
         short_trigger = range_low * (1.0 - buf)
 
-        alt_rev_signal, alt_rev_meta = self._check_alt_mean_reversion_entry(symbol=symbol, market_state=market_state, recent=recent, candle=last, atr_ltf=atr_ltf)
-        if alt_rev_signal is not None:
-            logger.debug("[MTF] ALT REV %s state=%s meta=%s", alt_rev_signal.upper(), market_state, alt_rev_meta)
-            return self._set_signal(alt_rev_signal, trade_type="alt_reversion", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "ALT_REV_RISK_MULTIPLIER", float(getattr(cfg, "ALT_REV_RISK_MULTIPLIER", 0.60)))), market_state=market_state, alt_reversion_meta=alt_rev_meta, side="long" if alt_rev_signal == "buy" else "short")
+        mr_signal, mr_meta = self._check_v52_mean_reversion_entry(symbol=symbol, market_state=market_state, recent=recent, candle=last, atr_ltf=atr_ltf)
+        if mr_signal is not None:
+            if symbol == "ETHUSDT" and mr_signal == "sell" and bool(getattr(cfg, "V54_ETH_DISABLE_SHORTS", True)):
+                mr_signal = None
+            else:
+                logger.debug("[MTF] MR %s state=%s meta=%s", mr_signal.upper(), market_state, mr_meta)
+                return self._set_signal(mr_signal, trade_type="mean_reversion", risk_multiplier=self._mr_risk_multiplier(symbol), market_state=market_state, mean_reversion_meta=mr_meta, side="long" if mr_signal == "buy" else "short")
+
+        if symbol == "ETHUSDT" and bool(getattr(cfg, "V54_ETH_MR_ONLY", True)):
+            return self._set_signal(None)
 
         if market_state in {"range", "transition"} and self._symbol_flag(symbol, "ENABLE_FAKEOUT", False):
             fake_long_ok, fake_long_meta = self._check_fakeout_reversal_entry(symbol=symbol, df=df, recent=recent, side="long", range_high=range_high, range_low=range_low, atr_ltf=atr_ltf, adx_h=adx_h)
