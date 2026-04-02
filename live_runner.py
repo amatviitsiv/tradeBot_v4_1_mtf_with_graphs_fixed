@@ -551,10 +551,14 @@ class LiveRunner:
             logger.info("[RUNNER] equity<=0, skip opening %s", symbol)
             return
 
-        stop_distance_abs = atr_sl_mult * atr
-        stop_distance_pct = stop_distance_abs / price * 100.0
+        initial_stop = calc_initial_stop_price(price, atr, side, symbol, None, trade_type=trade_type, market_state=market_state)
+        stop_distance_pct = abs(price - initial_stop) / price * 100.0
+        if stop_distance_pct <= 0:
+            logger.info("[RUNNER] invalid stop distance for %s", symbol)
+            return
+
         risk_multiplier = self._symbol_risk_multiplier(symbol)
-        eff_risk_per_trade = risk_per_trade * risk_multiplier
+        eff_risk_per_trade = risk_per_trade * risk_multiplier * trade_risk_mult
         notional, qty = self._risk.calc_futures_size_from_risk(
             equity=equity,
             price=price,
@@ -589,10 +593,7 @@ class LiveRunner:
                 logger.exception("[RUNNER] failed to send order error notification for %s", symbol)
             return
 
-        if side == "long":
-            stop_loss = price - atr_sl_mult * atr
-        else:
-            stop_loss = price + atr_sl_mult * atr
+        stop_loss = initial_stop
         tp1 = calc_tp1_price(price, atr, side, symbol)
 
         pos = PositionState(
