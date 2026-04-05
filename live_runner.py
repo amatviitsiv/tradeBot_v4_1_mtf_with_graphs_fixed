@@ -343,9 +343,29 @@ class LiveRunner:
         logger.debug("[RUNNER] calling strategy for %s, len(df_mtf)=%d", symbol, len(df_mtf))
         signal = signal_from_indicators(df_mtf)
         logger.debug("[RUNNER] strategy returned signal=%r for %s", signal, symbol)
+        sig_meta = {}
+        trade_risk_mult = 1.0
+        signal_side = "long" if signal == "buy" else ("short" if signal == "sell" else None)
         try:
             sig_meta = getattr(get_active_strategy(), "last_signal_meta", {}) or {}
-            trade_risk_mult = float(sig_meta.get("risk_multiplier", 1.0) or 1.0)
+            trade_risk_mult = float(sig_meta.get("execution_risk_multiplier", sig_meta.get("risk_multiplier", 1.0)) or 1.0)
+            if signal_side == "short":
+                if bool(sig_meta.get("v80_short_control_applied", False)):
+                    trade_risk_mult *= float(sig_meta.get("v80_short_control_mult", 1.0) or 1.0)
+                if bool(sig_meta.get("v81_short_adjustment_applied", False)):
+                    trade_risk_mult *= float(sig_meta.get("v81_short_adjustment_mult", 1.0) or 1.0)
+                if bool(getattr(config, "V813_GLOBAL_SHORT_RISK_ENABLED", True)):
+                    trade_risk_mult *= float(getattr(config, "V813_GLOBAL_SHORT_BASE_MULT", 1.0) or 1.0)
+                    bad_states = set(getattr(config, "V813_GLOBAL_SHORT_BAD_MARKET_STATES", ["chop", "flat", "range"]) or ["chop", "flat", "range"])
+                    signal_market_state = str(sig_meta.get("market_state", "") or "")
+                    signal_regime = str(sig_meta.get("regime", "") or "")
+                    bad_context = signal_market_state in bad_states
+                    if (not bad_context) and bool(getattr(config, "V813_GLOBAL_SHORT_REQUIRE_BEAR_REGIME", True)) and signal_regime != "bear":
+                        bad_context = True
+                    if bad_context:
+                        trade_risk_mult *= float(getattr(config, "V813_GLOBAL_SHORT_BAD_MARKET_MULT", 0.72) or 0.72)
+                        if not bool(sig_meta.get("strong_setup", False)):
+                            trade_risk_mult *= float(getattr(config, "V813_GLOBAL_SHORT_WEAK_SETUP_MULT", 0.90) or 0.90)
         except Exception:
             trade_risk_mult = 1.0
 
@@ -551,12 +571,13 @@ class LiveRunner:
             logger.info("[RUNNER] equity<=0, skip opening %s", symbol)
             return
 
+        trade_type = str(sig_meta.get("trade_type", "unknown") or "unknown")
+        market_state = str(sig_meta.get("market_state", "unknown") or "unknown")
         initial_stop = calc_initial_stop_price(price, atr, side, symbol, None, trade_type=trade_type, market_state=market_state)
         stop_distance_pct = abs(price - initial_stop) / price * 100.0
         if stop_distance_pct <= 0:
-            logger.info("[RUNNER] invalid stop distance for %s", symbol)
+            logger.info("[RUNNER] invalid stop distance for %s (price=%.5f stop=%.5f)", symbol, price, initial_stop)
             return
-
         risk_multiplier = self._symbol_risk_multiplier(symbol)
         eff_risk_per_trade = risk_per_trade * risk_multiplier * trade_risk_mult
         notional, qty = self._risk.calc_futures_size_from_risk(
