@@ -249,6 +249,39 @@ class MTFBreakoutStrategy(BaseStrategy):
         ratio_req = float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RS_RATIO_LONG", float(getattr(cfg, "ALT_STRONG_SETUP_RS_RATIO_LONG", 1.0)))) if side == "long" else float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RS_RATIO_SHORT", float(getattr(cfg, "ALT_STRONG_SETUP_RS_RATIO_SHORT", 1.0))))
         return float(adx_h) >= min_adx and float(drift) >= min_drift and float(volume_meta.get("impulse_score", 0.0) or 0.0) >= min_impulse and ((ratio >= ratio_req) if side == "long" else (ratio <= ratio_req))
 
+    def _alt_setup_tier(self, symbol: str, side: str, trade_type: str, adx_h: float, drift: float, volume_meta: dict | None = None, rs_meta: dict | None = None, alt_meta: dict | None = None) -> str:
+        if not self._is_alt_symbol(symbol):
+            return "not_alt"
+        side = str(side or "").lower()
+        trade_type = str(trade_type or "").lower()
+        volume_meta = volume_meta or {}
+        rs_meta = rs_meta or {}
+        alt_meta = alt_meta or {}
+        if self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side=side):
+            return "strong"
+        impulse_score = float(volume_meta.get("impulse_score", 0.0) or 0.0)
+        ratio = float(rs_meta.get("ratio", 1.0) or 1.0)
+        alt_score = float(alt_meta.get("score", 0.0) or 0.0)
+        if trade_type == "cont_compression":
+            min_adx = float(cfg.get_symbol_param_float(symbol, "ALT_MEDIUM_CONT_COMP_ADX", 18.0))
+            min_drift = float(cfg.get_symbol_param_float(symbol, "ALT_MEDIUM_CONT_COMP_DRIFT_PCT", 0.0042))
+            min_impulse = float(cfg.get_symbol_param_float(symbol, "ALT_MEDIUM_CONT_COMP_VOLUME_IMPULSE", 0.46))
+        else:
+            min_adx = float(cfg.get_symbol_param_float(symbol, "ALT_MEDIUM_SETUP_ADX", 19.0))
+            min_drift = float(cfg.get_symbol_param_float(symbol, "ALT_MEDIUM_SETUP_DRIFT_PCT", 0.0045))
+            min_impulse = float(cfg.get_symbol_param_float(symbol, "ALT_MEDIUM_SETUP_VOLUME_IMPULSE", 0.50))
+        if side == "long":
+            min_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_MEDIUM_SETUP_RS_RATIO_LONG", 0.9995))
+            min_alt = float(cfg.get_symbol_param_float(symbol, "ALT_MEDIUM_SETUP_MIN_ALT_SCORE_LONG", 0.42))
+            ok_ratio = ratio >= min_ratio
+        else:
+            max_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_MEDIUM_SETUP_RS_RATIO_SHORT", 1.0005))
+            min_alt = float(cfg.get_symbol_param_float(symbol, "ALT_MEDIUM_SETUP_MIN_ALT_SCORE_SHORT", 0.46))
+            ok_ratio = ratio <= max_ratio
+        if float(adx_h) >= min_adx and float(drift) >= min_drift and impulse_score >= min_impulse and alt_score >= min_alt and ok_ratio:
+            return "medium"
+        return "weak"
+
     def _relax_alt_filters(self, symbol: str, side: str, alt_ok: bool, alt_meta: dict, rs_ok: bool, rs_meta: dict) -> tuple[bool, bool, dict, dict]:
         if not self._is_alt_symbol(symbol):
             return alt_ok, rs_ok, alt_meta, rs_meta
@@ -294,6 +327,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         side = str(side or "").lower()
 
         strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side=side)
+        setup_tier = self._alt_setup_tier(symbol=symbol, side=side, trade_type=trade_type, adx_h=adx_h, drift=drift, volume_meta=volume_meta, rs_meta=rs_meta, alt_meta=alt_meta)
         alt_score = float(alt_meta.get("score", 0.0) or 0.0)
         rs_ratio = float(rs_meta.get("ratio", 1.0) or 1.0)
         btc_score = float(btc_meta.get("score", 0.0) or 0.0)
@@ -305,10 +339,10 @@ class MTFBreakoutStrategy(BaseStrategy):
                 min_alt = float(cfg.get_symbol_param_float(symbol, "ALT_V1_CONT_LONG_MIN_SCORE", float(getattr(cfg, "ALT_V1_CONT_LONG_MIN_SCORE", 0.50))))
                 min_btc = float(cfg.get_symbol_param_float(symbol, "ALT_V1_CONT_LONG_MIN_BTC_SCORE", float(getattr(cfg, "ALT_V1_CONT_LONG_MIN_BTC_SCORE", 1.00))))
                 min_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_V1_CONT_LONG_MIN_RS_RATIO", float(getattr(cfg, "ALT_V1_CONT_LONG_MIN_RS_RATIO", 1.0035))))
-                if soft_alt and not strong_setup:
-                    return False, {"reason": "alt_soft_pass_blocked", "trade_type": trade_type, "strong_setup": strong_setup, "alt_score": alt_score}
-                if soft_rs and not strong_setup:
-                    return False, {"reason": "rs_soft_pass_blocked", "trade_type": trade_type, "strong_setup": strong_setup, "rs_ratio": rs_ratio}
+                if soft_alt and not strong_setup and not (trade_type == "cont_compression" and setup_tier == "medium"):
+                    return False, {"reason": "alt_soft_pass_blocked", "trade_type": trade_type, "strong_setup": strong_setup, "alt_score": alt_score, "setup_tier": setup_tier}
+                if soft_rs and not strong_setup and not (trade_type == "cont_compression" and setup_tier == "medium"):
+                    return False, {"reason": "rs_soft_pass_blocked", "trade_type": trade_type, "strong_setup": strong_setup, "rs_ratio": rs_ratio, "setup_tier": setup_tier}
                 if alt_score < min_alt and not strong_setup:
                     return False, {"reason": "alt_score_too_low", "trade_type": trade_type, "alt_score": alt_score, "min_alt_score": min_alt}
                 if rs_ratio < min_ratio and not strong_setup:
@@ -320,22 +354,22 @@ class MTFBreakoutStrategy(BaseStrategy):
                 min_btc = float(cfg.get_symbol_param_float(symbol, "ALT_V1_CONT_SHORT_MIN_BTC_SCORE", float(getattr(cfg, "ALT_V1_CONT_SHORT_MIN_BTC_SCORE", 1.12))))
                 max_ratio = float(cfg.get_symbol_param_float(symbol, "ALT_V1_CONT_SHORT_MAX_RS_RATIO", float(getattr(cfg, "ALT_V1_CONT_SHORT_MAX_RS_RATIO", 0.9965))))
                 require_strong = bool(getattr(cfg, "ALT_V1_CONT_SHORT_REQUIRE_STRONG_SETUP", True))
-                if soft_alt:
-                    return False, {"reason": "alt_soft_pass_blocked", "trade_type": trade_type, "side": side, "alt_score": alt_score}
-                if soft_rs:
-                    return False, {"reason": "rs_soft_pass_blocked", "trade_type": trade_type, "side": side, "rs_ratio": rs_ratio}
+                if soft_alt and setup_tier == "weak":
+                    return False, {"reason": "alt_soft_pass_blocked", "trade_type": trade_type, "side": side, "alt_score": alt_score, "setup_tier": setup_tier}
+                if soft_rs and setup_tier == "weak":
+                    return False, {"reason": "rs_soft_pass_blocked", "trade_type": trade_type, "side": side, "rs_ratio": rs_ratio, "setup_tier": setup_tier}
                 if alt_score < min_alt:
                     return False, {"reason": "alt_score_too_low", "trade_type": trade_type, "side": side, "alt_score": alt_score, "min_alt_score": min_alt}
                 if rs_ratio > max_ratio:
                     return False, {"reason": "rs_ratio_not_weak_enough", "trade_type": trade_type, "side": side, "rs_ratio": rs_ratio, "max_rs_ratio": max_ratio}
                 if btc_score < min_btc:
                     return False, {"reason": "btc_context_too_weak", "trade_type": trade_type, "side": side, "btc_score": btc_score, "min_btc_score": min_btc}
-                if require_strong and not strong_setup:
-                    return False, {"reason": "strong_setup_required", "trade_type": trade_type, "side": side, "strong_setup": strong_setup}
+                if require_strong and not strong_setup and setup_tier != "medium":
+                    return False, {"reason": "strong_setup_required", "trade_type": trade_type, "side": side, "strong_setup": strong_setup, "setup_tier": setup_tier}
 
-        return True, {"passed": True, "trade_type": trade_type, "side": side, "strong_setup": strong_setup, "alt_score": alt_score, "rs_ratio": rs_ratio, "btc_score": btc_score}
+        return True, {"passed": True, "trade_type": trade_type, "side": side, "strong_setup": strong_setup, "setup_tier": setup_tier, "alt_score": alt_score, "rs_ratio": rs_ratio, "btc_score": btc_score}
 
-    def _apply_alt_risk_adjustment(self, symbol: str, side: str, trade_type: str, risk_multiplier: float, strong_setup: bool = False, regime_gate_meta: dict | None = None) -> tuple[float, dict]:
+    def _apply_alt_risk_adjustment(self, symbol: str, side: str, trade_type: str, risk_multiplier: float, strong_setup: bool = False, regime_gate_meta: dict | None = None, alt_meta: dict | None = None, rs_meta: dict | None = None, volume_meta: dict | None = None, adx_h: float = 0.0, drift: float = 0.0) -> tuple[float, dict]:
         flags = {"alt_risk_adjustment_applied": False}
         if not self._is_alt_symbol(symbol):
             return float(risk_multiplier), flags
@@ -344,17 +378,34 @@ class MTFBreakoutStrategy(BaseStrategy):
         trade_type = str(trade_type or "").lower()
         side = str(side or "").lower()
         risk_mult = float(risk_multiplier)
+        tier = self._alt_setup_tier(symbol=symbol, side=side, trade_type=trade_type, adx_h=adx_h, drift=drift, volume_meta=volume_meta, rs_meta=rs_meta, alt_meta=alt_meta)
         if trade_type in {"continuation", "cont_compression"}:
-            if side == "long" and not strong_setup:
-                mult = float(cfg.get_symbol_param_float(symbol, "ALT_V1_CONT_LONG_WEAK_RISK_MULT", float(getattr(cfg, "ALT_V1_CONT_LONG_WEAK_RISK_MULT", 0.90))))
-                risk_mult *= mult
-                flags = {"alt_risk_adjustment_applied": True, "alt_risk_adjustment_type": "cont_long_weak", "alt_risk_adjustment_mult": mult}
-            elif side == "short":
-                mult_name = "ALT_V1_CONT_SHORT_STRONG_RISK_MULT" if strong_setup else "ALT_V1_CONT_SHORT_RISK_MULT"
-                default = 0.85 if strong_setup else 0.72
+            if tier == "strong" or strong_setup:
+                if side == "short":
+                    mult = float(cfg.get_symbol_param_float(symbol, "ALT_V1_CONT_SHORT_STRONG_RISK_MULT", float(getattr(cfg, "ALT_V1_CONT_SHORT_STRONG_RISK_MULT", 0.85))))
+                    risk_mult *= mult
+                    flags = {"alt_risk_adjustment_applied": True, "alt_risk_adjustment_type": "cont_short_strong", "alt_risk_adjustment_mult": mult, "alt_setup_tier": "strong"}
+                else:
+                    flags = {"alt_risk_adjustment_applied": True, "alt_risk_adjustment_type": "cont_long_strong", "alt_risk_adjustment_mult": 1.0, "alt_setup_tier": "strong"}
+            elif tier == "medium":
+                if trade_type == "cont_compression":
+                    default = 0.78 if side == "long" else 0.70
+                    mult_name = "ALT_MEDIUM_RISK_MULT_CONT_COMP"
+                else:
+                    default = 0.60 if side == "long" else 0.62
+                    mult_name = "ALT_MEDIUM_RISK_MULT_CONT"
                 mult = float(cfg.get_symbol_param_float(symbol, mult_name, float(getattr(cfg, mult_name, default))))
                 risk_mult *= mult
-                flags = {"alt_risk_adjustment_applied": True, "alt_risk_adjustment_type": "cont_short_strong" if strong_setup else "cont_short", "alt_risk_adjustment_mult": mult}
+                flags = {"alt_risk_adjustment_applied": True, "alt_risk_adjustment_type": f"{trade_type}_{side}_medium", "alt_risk_adjustment_mult": mult, "alt_setup_tier": "medium"}
+            else:
+                if side == "long":
+                    mult = float(cfg.get_symbol_param_float(symbol, "ALT_V1_CONT_LONG_WEAK_RISK_MULT", float(getattr(cfg, "ALT_V1_CONT_LONG_WEAK_RISK_MULT", 0.90))))
+                    risk_mult *= mult
+                    flags = {"alt_risk_adjustment_applied": True, "alt_risk_adjustment_type": "cont_long_weak", "alt_risk_adjustment_mult": mult, "alt_setup_tier": "weak"}
+                else:
+                    mult = float(cfg.get_symbol_param_float(symbol, "ALT_V1_CONT_SHORT_RISK_MULT", float(getattr(cfg, "ALT_V1_CONT_SHORT_RISK_MULT", 0.72))))
+                    risk_mult *= mult
+                    flags = {"alt_risk_adjustment_applied": True, "alt_risk_adjustment_type": "cont_short_weak", "alt_risk_adjustment_mult": mult, "alt_setup_tier": "weak"}
         return risk_mult, flags
 
     def _apply_v7_direct_boost(self, symbol: str, side: str, trade_type: str, base_risk_multiplier: float, adx_h: float, drift: float, volume_meta: dict | None = None, strong_setup: bool = False, regime_gate_meta: dict | None = None) -> tuple[float, dict]:
@@ -760,6 +811,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         rs_ratio = float(rs_meta.get("ratio", 1.0) or 1.0)
         btc_score = float(btc_meta.get("score", 0.0) or 0.0)
         impulse_score = float(volume_meta.get("impulse_score", 0.0) or 0.0)
+        setup_tier = self._alt_setup_tier(symbol=symbol, side=side, trade_type=trade_type, adx_h=adx_h, drift=drift, volume_meta=volume_meta, rs_meta=rs_meta, alt_meta=alt_meta)
         soft_alt = bool(alt_meta.get("soft_pass", False))
         soft_rs = bool(rs_meta.get("soft_pass", False))
 
@@ -769,8 +821,8 @@ class MTFBreakoutStrategy(BaseStrategy):
                 allowed_states.add("transition")
             if market_state not in allowed_states:
                 return False, {"reason": "market_state_blocked", "side": side, "trade_type": trade_type, "market_state": market_state, "allowed_states": sorted(allowed_states)}
-            if bool(getattr(cfg, "ALT_V2_LONG_BLOCK_SOFT_PASSES", True)) and (soft_alt or soft_rs) and not strong_setup:
-                return False, {"reason": "soft_pass_blocked", "side": side, "trade_type": trade_type, "soft_alt": soft_alt, "soft_rs": soft_rs, "strong_setup": strong_setup}
+            if bool(getattr(cfg, "ALT_V2_LONG_BLOCK_SOFT_PASSES", True)) and (soft_alt or soft_rs) and not strong_setup and setup_tier == "weak":
+                return False, {"reason": "soft_pass_blocked", "side": side, "trade_type": trade_type, "soft_alt": soft_alt, "soft_rs": soft_rs, "strong_setup": strong_setup, "setup_tier": setup_tier}
 
             min_btc = float(cfg.get_symbol_param_float(symbol, "ALT_V2_LONG_MIN_BTC_SCORE", float(getattr(cfg, "ALT_V2_LONG_MIN_BTC_SCORE", 1.00))))
             min_alt = float(cfg.get_symbol_param_float(symbol, "ALT_V2_LONG_MIN_ALT_SCORE", float(getattr(cfg, "ALT_V2_LONG_MIN_ALT_SCORE", 0.50))))
@@ -795,8 +847,8 @@ class MTFBreakoutStrategy(BaseStrategy):
                 allowed_states.add("transition")
             if market_state not in allowed_states:
                 return False, {"reason": "market_state_blocked", "side": side, "trade_type": trade_type, "market_state": market_state, "allowed_states": sorted(allowed_states)}
-            if bool(getattr(cfg, "ALT_V2_SHORT_BLOCK_SOFT_PASSES", True)) and (soft_alt or soft_rs):
-                return False, {"reason": "soft_pass_blocked", "side": side, "trade_type": trade_type, "soft_alt": soft_alt, "soft_rs": soft_rs}
+            if bool(getattr(cfg, "ALT_V2_SHORT_BLOCK_SOFT_PASSES", True)) and (soft_alt or soft_rs) and setup_tier == "weak":
+                return False, {"reason": "soft_pass_blocked", "side": side, "trade_type": trade_type, "soft_alt": soft_alt, "soft_rs": soft_rs, "setup_tier": setup_tier}
 
             min_btc = float(cfg.get_symbol_param_float(symbol, "ALT_V2_SHORT_MIN_BTC_SCORE", float(getattr(cfg, "ALT_V2_SHORT_MIN_BTC_SCORE", 1.10))))
             min_alt = float(cfg.get_symbol_param_float(symbol, "ALT_V2_SHORT_MIN_ALT_SCORE", float(getattr(cfg, "ALT_V2_SHORT_MIN_ALT_SCORE", 0.56))))
@@ -816,8 +868,8 @@ class MTFBreakoutStrategy(BaseStrategy):
                 return False, {"reason": "alt_score_too_low", "side": side, "trade_type": trade_type, "alt_score": alt_score, "min_alt_score": min_alt}
             if rs_ratio > max_rs:
                 return False, {"reason": "rs_ratio_not_weak_enough", "side": side, "trade_type": trade_type, "rs_ratio": rs_ratio, "max_rs_ratio": max_rs}
-            if require_strong and not strong_setup:
-                return False, {"reason": "strong_setup_required", "side": side, "trade_type": trade_type, "strong_setup": strong_setup}
+            if require_strong and not strong_setup and setup_tier != "medium":
+                return False, {"reason": "strong_setup_required", "side": side, "trade_type": trade_type, "strong_setup": strong_setup, "setup_tier": setup_tier}
 
         return True, {
             "passed": True,
@@ -831,6 +883,7 @@ class MTFBreakoutStrategy(BaseStrategy):
             "drift": float(drift),
             "impulse_score": impulse_score,
             "strong_setup": bool(strong_setup),
+            "setup_tier": setup_tier,
         }
 
 
@@ -2863,7 +2916,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 if symbol == str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")) or not bool(getattr(cfg, "ALT_SHORTS_REQUIRE_STRONG_BTC_BEAR", True)):
                     btc_short_ctx_ok, btc_short_ctx_meta = self._btc_short_trade_ok(symbol=symbol, trade_type="fakeout", regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift)
                     if btc_short_ctx_ok:
-                        v85_short_ok, v85_short_flags = self._apply_v85_inline_short_suppression(symbol=symbol, trade_type="fakeout", market_state=market_state, regime=regime, btc_meta=btc_short_meta if isinstance(btc_short_meta, dict) else {}, rs_meta={}, trend_quality_meta={}, regime_gate_meta={}, strong_setup=False)
+                        v85_short_ok, v85_short_flags = self._apply_v85_inline_short_suppression(symbol=symbol, trade_type="fakeout", market_state=market_state, regime=regime, btc_meta=btc_short_ctx_meta if isinstance(btc_short_ctx_meta, dict) else {}, rs_meta={}, trend_quality_meta={}, regime_gate_meta={}, strong_setup=False)
                         if not v85_short_ok:
                             logger.debug("[MTF] skip SELL fakeout by v85 inline short suppression: %s", v85_short_flags)
                             return None
@@ -2950,11 +3003,22 @@ class MTFBreakoutStrategy(BaseStrategy):
             slope_abs = None
 
         # Volatile driftless filter: высокая ATR, но низкий наклон -> волатильная пила без направления.
+        is_alt_symbol = self._is_alt_symbol(symbol)
         volatile_slope_factor = float(getattr(cfg, "LTF_VOLATILE_SLOPE_FACTOR", 5.0))
+        local_slope_min_abs = slope_min_abs
+        local_micro_atr_pct = micro_atr_pct
+        local_volatile_slope_factor = volatile_slope_factor
+        disable_volatile_driftless = False
+        if is_alt_symbol:
+            disable_volatile_driftless = bool(getattr(cfg, "ALT_DISABLE_LTF_VOLATILE_DRIFTLESS_FILTER", True))
+            local_slope_min_abs = float(cfg.get_symbol_param_float(symbol, "ALT_LTF_SLOPE_MIN_ABS", float(getattr(cfg, "ALT_LTF_SLOPE_MIN_ABS", slope_min_abs))))
+            local_volatile_slope_factor = float(cfg.get_symbol_param_float(symbol, "ALT_LTF_VOLATILE_SLOPE_FACTOR", float(getattr(cfg, "ALT_LTF_VOLATILE_SLOPE_FACTOR", volatile_slope_factor))))
+            local_micro_atr_pct = float(cfg.get_symbol_param_float(symbol, "ALT_LTF_MICRO_ATR_PCT", float(getattr(cfg, "ALT_LTF_MICRO_ATR_PCT", micro_atr_pct))))
         if (
-            slope_abs is not None
-            and atr_pct_ltf > micro_atr_pct
-            and slope_abs < slope_min_abs * volatile_slope_factor
+            not disable_volatile_driftless
+            and slope_abs is not None
+            and atr_pct_ltf > local_micro_atr_pct
+            and slope_abs < local_slope_min_abs * local_volatile_slope_factor
         ):
             return None
 
@@ -3080,7 +3144,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                                 if strong_setup:
                                     risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
                                 risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="cont_compression", side="long", market_state=market_state, trend_quality_meta=trend_quality_meta)
-                                risk_mult, alt_risk_flags = self._apply_alt_risk_adjustment(symbol=symbol, side="long", trade_type="cont_compression", risk_multiplier=risk_mult, strong_setup=strong_setup, regime_gate_meta=regime_gate_meta)
+                                risk_mult, alt_risk_flags = self._apply_alt_risk_adjustment(symbol=symbol, side="long", trade_type="cont_compression", risk_multiplier=risk_mult, strong_setup=strong_setup, regime_gate_meta=regime_gate_meta, alt_meta=alt_meta, rs_meta=rs_meta, volume_meta=volume_meta, adx_h=adx_h, drift=drift)
                                 risk_mult, v7_flags = self._apply_v7_direct_boost(symbol=symbol, side="long", trade_type="cont_compression", base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, strong_setup=strong_setup, regime_gate_meta=regime_gate_meta)
                                 risk_mult, v78_flags = self._apply_v78_selective_risk_reduction(symbol=symbol, side="long", trade_type="cont_compression", base_risk_multiplier=risk_mult, market_state=market_state, regime=regime, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, volume_meta=volume_meta, strong_setup=strong_setup, v7_flags=v7_flags)
                                 risk_mult, v80_alt_flags = self._apply_v80_alt_engine_upgrade(symbol=symbol, side="long", trade_type="cont_compression", risk_multiplier=risk_mult, alt_meta=alt_meta, btc_meta=btc_meta, rs_meta=rs_meta, adx_h=adx_h, drift=drift, volume_meta=volume_meta, strong_setup=strong_setup, regime_gate_meta=regime_gate_meta)
@@ -3117,7 +3181,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                                     if strong_setup:
                                         risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
                                     risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="continuation", side="long", market_state=market_state, trend_quality_meta=trend_quality_meta)
-                                    risk_mult, alt_risk_flags = self._apply_alt_risk_adjustment(symbol=symbol, side="long", trade_type="continuation", risk_multiplier=risk_mult, strong_setup=strong_setup)
+                                    risk_mult, alt_risk_flags = self._apply_alt_risk_adjustment(symbol=symbol, side="long", trade_type="continuation", risk_multiplier=risk_mult, strong_setup=strong_setup, alt_meta=alt_meta, rs_meta=rs_meta, volume_meta=volume_meta, adx_h=adx_h, drift=drift)
                                     risk_mult, v7_flags = self._apply_v7_direct_boost(symbol=symbol, side="long", trade_type="continuation", base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, strong_setup=strong_setup)
                                     risk_mult, v78_flags = self._apply_v78_selective_risk_reduction(symbol=symbol, side="long", trade_type="continuation", base_risk_multiplier=risk_mult, market_state=market_state, regime=regime, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, volume_meta=volume_meta, strong_setup=strong_setup, v7_flags=v7_flags)
                                     risk_mult, v80_alt_flags = self._apply_v80_alt_engine_upgrade(symbol=symbol, side="long", trade_type="continuation", risk_multiplier=risk_mult, alt_meta=alt_meta, btc_meta=btc_meta, rs_meta=rs_meta, adx_h=adx_h, drift=drift, volume_meta=volume_meta, strong_setup=strong_setup)
@@ -3160,7 +3224,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                                 if strong_setup:
                                     risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
                                 risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="cont_compression", side="short", market_state=market_state, trend_quality_meta=trend_quality_meta)
-                                risk_mult, alt_risk_flags = self._apply_alt_risk_adjustment(symbol=symbol, side="short", trade_type="cont_compression", risk_multiplier=risk_mult, strong_setup=strong_setup)
+                                risk_mult, alt_risk_flags = self._apply_alt_risk_adjustment(symbol=symbol, side="short", trade_type="cont_compression", risk_multiplier=risk_mult, strong_setup=strong_setup, alt_meta=alt_meta, rs_meta=rs_meta, volume_meta=volume_meta, adx_h=adx_h, drift=drift)
                                 v83_short_ok, v83_short_flags = self._apply_v83_short_suppression(symbol=symbol, side="short", trade_type="cont_compression", market_state=market_state, regime=regime, btc_meta=btc_meta, rs_meta=rs_meta, trend_quality_meta=trend_quality_meta, strong_setup=strong_setup, regime_gate_meta=regime_gate_meta)
                                 if not v83_short_ok:
                                     logger.debug("[MTF] skip SELL cont_compression by v83 short suppression: %s", v83_short_flags)
@@ -3202,7 +3266,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                                     if strong_setup:
                                         risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
                                     risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="continuation", side="short", market_state=market_state, trend_quality_meta=trend_quality_meta)
-                                    risk_mult, alt_risk_flags = self._apply_alt_risk_adjustment(symbol=symbol, side="short", trade_type="continuation", risk_multiplier=risk_mult, strong_setup=strong_setup)
+                                    risk_mult, alt_risk_flags = self._apply_alt_risk_adjustment(symbol=symbol, side="short", trade_type="continuation", risk_multiplier=risk_mult, strong_setup=strong_setup, alt_meta=alt_meta, rs_meta=rs_meta, volume_meta=volume_meta, adx_h=adx_h, drift=drift)
                                     v83_short_ok, v83_short_flags = self._apply_v83_short_suppression(symbol=symbol, side="short", trade_type="continuation", market_state=market_state, regime=regime, btc_meta=btc_meta, rs_meta=rs_meta, trend_quality_meta=trend_quality_meta, strong_setup=strong_setup, regime_gate_meta=regime_gate_meta)
                                     if not v83_short_ok:
                                         logger.debug("[MTF] skip SELL continuation by v83 short suppression: %s", v83_short_flags)
