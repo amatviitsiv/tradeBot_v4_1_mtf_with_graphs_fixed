@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Optional
 
 import pandas as pd
@@ -27,12 +28,67 @@ class MTFBreakoutStrategy(BaseStrategy):
         self.last_signal_meta = {"signal": None, "trade_type": None, "risk_multiplier": 1.0}
         self._current_symbol = None
         self._current_regime = None
+        self._trace_file_initialized = False
+        self._trace_file_path = None
+        self._maybe_reset_alt_trace_file()
+
+    def _alt_trace_enabled(self) -> bool:
+        return bool(getattr(cfg, "ALT_TRACE_BUILD_ENABLED", False) or getattr(cfg, "ALT_TRACE_FILE_ENABLED", False))
+
+    def _alt_trace_stdout_enabled(self) -> bool:
+        return bool(getattr(cfg, "ALT_TRACE_STDOUT_ENABLED", False))
+
+    def _alt_trace_file_enabled(self) -> bool:
+        return bool(getattr(cfg, "ALT_TRACE_FILE_ENABLED", False))
+
+    def _resolve_alt_trace_path(self) -> str:
+        configured = str(getattr(cfg, "ALT_TRACE_FILE_PATH", "alt_trace_only.txt") or "alt_trace_only.txt")
+        if os.path.isabs(configured):
+            return configured
+        return os.path.abspath(os.path.join(os.getcwd(), configured))
+
+    def _maybe_reset_alt_trace_file(self) -> None:
+        if not self._alt_trace_file_enabled() or self._trace_file_initialized:
+            return
+        path = self._resolve_alt_trace_path()
+        self._trace_file_path = path
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        if bool(getattr(cfg, "ALT_TRACE_RESET_FILE_ON_START", True)):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("")
+        self._trace_file_initialized = True
+
+    def _alt_trace(self, event: str, symbol: str = "", **fields) -> None:
+        if not self._alt_trace_enabled():
+            return
+        symbol = str(symbol or self._current_symbol or "")
+        allowed_symbols = set(getattr(cfg, "ALT_TRACE_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+        if symbol and allowed_symbols and symbol not in allowed_symbols:
+            return
+        merged = {}
+        if symbol:
+            merged["symbol"] = symbol
+        merged.update(fields)
+        parts = [f"{k}={v}" for k, v in merged.items()]
+        msg = f"[ALT_TRACE] {event}"
+        if parts:
+            msg += " | " + ", ".join(parts)
+        if self._alt_trace_stdout_enabled() or not self._alt_trace_file_enabled():
+            print(msg)
+        if self._alt_trace_file_enabled():
+            self._maybe_reset_alt_trace_file()
+            path = self._trace_file_path or self._resolve_alt_trace_path()
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(msg + "\n")
 
     def _set_signal(self, signal: Optional[str], trade_type: str | None = None, risk_multiplier: float = 1.0, **meta):
         exec_risk = float(risk_multiplier)
         symbol = str(meta.get("symbol") or self._current_symbol or "")
         side = str(meta.get("side") or ("short" if signal == "sell" else "long" if signal == "buy" else "")).lower()
         regime = str(meta.get("regime") or self._current_regime or "")
+        self._alt_trace("set_signal_call", symbol=symbol, signal=signal, trade_type=trade_type, risk_multiplier=exec_risk, regime=regime, side=side)
         if signal == "sell" and side == "short" and self._should_suppress_short_signal(symbol=symbol, trade_type=trade_type, regime=regime, meta=meta):
             self.last_signal_meta = {
                 "signal": None,
@@ -43,6 +99,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 "v84_short_suppression_reason": self._build_short_suppression_reason(symbol=symbol, trade_type=trade_type, regime=regime, meta=meta),
                 **meta,
             }
+            self._alt_trace("set_signal_return", symbol=symbol, signal=None, trade_type=trade_type, risk_multiplier=1.0, regime=regime, side=side, suppressed=True)
             return None
         self.last_signal_meta = {
             "signal": signal,
@@ -51,6 +108,7 @@ class MTFBreakoutStrategy(BaseStrategy):
             "execution_risk_multiplier": exec_risk,
             **meta,
         }
+        self._alt_trace("set_signal_return", symbol=symbol, signal=signal, trade_type=trade_type, risk_multiplier=exec_risk, regime=regime, side=side, suppressed=False)
         return signal
 
     def _build_short_suppression_reason(self, symbol: str, trade_type: str | None, regime: str, meta: dict) -> str:
@@ -2705,21 +2763,29 @@ class MTFBreakoutStrategy(BaseStrategy):
         # ======================================================
         regime = self._resolve_regime_from_values(ema20_h, ema50_h, ema200_h)
         symbol = self._extract_symbol(df)
+        is_alt = self._is_alt_symbol(symbol)
         self._current_symbol = symbol
         self._current_regime = regime
+        self._alt_trace("signal_enter", symbol=symbol, rows=len(df), close=round(close, 6), adx_h=round(adx_h, 6), regime=regime)
 
         session_ok, session_meta = self._is_allowed_trading_time(df)
         if not session_ok:
-            logger.debug("[MTF] skip disallowed trading session: %s", session_meta)
-            return None
+            if is_alt and bool(getattr(cfg, "ALT_IGNORE_SESSION_FILTER", True)):
+                self._alt_trace("soft_pass", symbol=symbol, stage="session", reason="alt_ignore_disallowed_trading_time")
+            else:
+                logger.debug("[MTF] skip disallowed trading session: %s", session_meta)
+                self._alt_trace("early_return", symbol=symbol, stage="session", reason="disallowed_trading_time")
+                return None
 
         if close <= 0 or atr_h <= 0:
+            self._alt_trace("early_return", symbol=symbol, stage="htf_inputs", reason="non_positive_close_or_atr")
             return None
 
         atr_pct_h = atr_h / close
         self._last_atr_pct_h = atr_pct_h
         min_atr_pct = float(getattr(cfg, "ANTI_CHOP_MIN_ATR_PCT", 0.0005))
         if atr_pct_h < min_atr_pct:
+            self._alt_trace("early_return", symbol=symbol, stage="htf_atr", reason="atr_below_min", atr_pct_h=round(atr_pct_h, 6), min_atr_pct=round(min_atr_pct, 6))
             return None
 
         # Drift-фильтр по суточному движению цены (примерно 96 баров M15).
@@ -2754,8 +2820,12 @@ class MTFBreakoutStrategy(BaseStrategy):
             except Exception:
                 drift_h = 0.0
         if atr_pct_h > htf_volatile_atr and drift_h < htf_volatile_drift and adx_h < htf_volatile_adx:
-            logger.debug("[MTF] skip volatile driftless HTF regime")
-            return None
+            if is_alt and bool(getattr(cfg, "ALT_DISABLE_HTF_VOLATILE_DRIFTLESS_FILTER", True)):
+                self._alt_trace("soft_pass", symbol=symbol, stage="htf_noise", reason="alt_disable_volatile_driftless_htf", atr_pct_h=round(atr_pct_h, 6), drift_h=round(drift_h, 6), adx_h=round(adx_h, 6))
+            else:
+                logger.debug("[MTF] skip volatile driftless HTF regime")
+                self._alt_trace("early_return", symbol=symbol, stage="htf_noise", reason="volatile_driftless_htf", atr_pct_h=round(atr_pct_h, 6), drift_h=round(drift_h, 6), adx_h=round(adx_h, 6))
+                return None
 
         super_high_atr_pct = float(getattr(cfg, "MTF_ATR_SUPER_HIGH_PCT", 0.02))
 
@@ -2785,6 +2855,7 @@ class MTFBreakoutStrategy(BaseStrategy):
             drift=drift,
             regime=regime,
         )
+        self._alt_trace("setup_context", symbol=symbol, market_state=market_state, regime=regime, drift=round(drift, 6), atr_pct_h=round(atr_pct_h, 6), atr_ltf=round(atr_ltf, 6))
 
         if getattr(cfg, "MTF_DISABLE_VOLATILE_FLAT", True) and atr_pct_h > super_high_atr_pct and market_state != "range":
             logger.debug(
@@ -2797,6 +2868,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         transition_state = False
         if market_state == "panic":
             logger.debug("[MTF] skip panic market state: %s", market_meta)
+            self._alt_trace("early_return", symbol=symbol, stage="market_state", reason="panic", market_state=market_state)
             return None
         if market_state == "transition":
             transition_state = True
@@ -2805,6 +2877,7 @@ class MTFBreakoutStrategy(BaseStrategy):
         # Для trend-mode всё ещё требуем достаточно живой HTF-тренд.
         if market_state == "trend":
             if regime == "none":
+                self._alt_trace("early_return", symbol=symbol, stage="trend_regime", reason="regime_none")
                 return None
             if not vitality_ok:
                 logger.debug("[MTF] skip flat HTF trend: %s", vitality_meta)
@@ -2820,6 +2893,7 @@ class MTFBreakoutStrategy(BaseStrategy):
                 min_regime_drift = float(cfg.get_symbol_param_float(symbol, "MARKET_REGIME_MIN_DRIFT_PCT", float(getattr(cfg, "MARKET_REGIME_MIN_DRIFT_PCT", drift_min_pct))))
                 if require_trend_state and market_state != "trend":
                     logger.debug("[MTF] skip non-trend market_state by regime filter: %s", market_state)
+                    self._alt_trace("early_return", symbol=symbol, stage="regime_strength", reason="weak_regime", adx_h=round(adx_h,6), atr_pct_h=round(atr_pct_h,6), drift=round(drift,6))
                     return None
                 if adx_h < min_regime_adx or atr_pct_h < min_regime_atr_pct or drift < min_regime_drift:
                     logger.debug(
@@ -2973,10 +3047,12 @@ class MTFBreakoutStrategy(BaseStrategy):
         # ======================================================
         # Фильтруем слишком тихий рынок на M15 по ATR
         if close <= 0 or atr_ltf <= 0:
+            self._alt_trace("early_return", symbol=symbol, stage="ltf_inputs", reason="non_positive_close_or_atr")
             return None
         atr_pct_ltf = atr_ltf / close
         ltf_atr_min = float(getattr(cfg, "LTF_ATR_MIN_PCT", 0.0002))
         if atr_pct_ltf < ltf_atr_min:
+            self._alt_trace("early_return", symbol=symbol, stage="ltf_atr", reason="atr_below_min", atr_pct_ltf=round(atr_pct_ltf, 6), ltf_atr_min=round(ltf_atr_min, 6))
             return None
 
         # Дополнительный micro-noise фильтр: если волатильность очень мала и цена почти не двигается,
@@ -3003,24 +3079,17 @@ class MTFBreakoutStrategy(BaseStrategy):
             slope_abs = None
 
         # Volatile driftless filter: высокая ATR, но низкий наклон -> волатильная пила без направления.
-        is_alt_symbol = self._is_alt_symbol(symbol)
         volatile_slope_factor = float(getattr(cfg, "LTF_VOLATILE_SLOPE_FACTOR", 5.0))
-        local_slope_min_abs = slope_min_abs
-        local_micro_atr_pct = micro_atr_pct
-        local_volatile_slope_factor = volatile_slope_factor
-        disable_volatile_driftless = False
-        if is_alt_symbol:
-            disable_volatile_driftless = bool(getattr(cfg, "ALT_DISABLE_LTF_VOLATILE_DRIFTLESS_FILTER", True))
-            local_slope_min_abs = float(cfg.get_symbol_param_float(symbol, "ALT_LTF_SLOPE_MIN_ABS", float(getattr(cfg, "ALT_LTF_SLOPE_MIN_ABS", slope_min_abs))))
-            local_volatile_slope_factor = float(cfg.get_symbol_param_float(symbol, "ALT_LTF_VOLATILE_SLOPE_FACTOR", float(getattr(cfg, "ALT_LTF_VOLATILE_SLOPE_FACTOR", volatile_slope_factor))))
-            local_micro_atr_pct = float(cfg.get_symbol_param_float(symbol, "ALT_LTF_MICRO_ATR_PCT", float(getattr(cfg, "ALT_LTF_MICRO_ATR_PCT", micro_atr_pct))))
         if (
-            not disable_volatile_driftless
-            and slope_abs is not None
-            and atr_pct_ltf > local_micro_atr_pct
-            and slope_abs < local_slope_min_abs * local_volatile_slope_factor
+            slope_abs is not None
+            and atr_pct_ltf > micro_atr_pct
+            and slope_abs < slope_min_abs * volatile_slope_factor
         ):
-            return None
+            if is_alt and bool(getattr(cfg, "ALT_DISABLE_LTF_VOLATILE_DRIFTLESS_FILTER", True)):
+                self._alt_trace("soft_pass", symbol=symbol, stage="ltf_noise", reason="alt_disable_volatile_driftless", atr_pct_ltf=round(atr_pct_ltf, 6), slope_abs=round(slope_abs, 6), slope_threshold=round(slope_min_abs * volatile_slope_factor, 6))
+            else:
+                self._alt_trace("early_return", symbol=symbol, stage="ltf_noise", reason="volatile_driftless", atr_pct_ltf=round(atr_pct_ltf, 6), slope_abs=round(slope_abs, 6), slope_threshold=round(slope_min_abs * volatile_slope_factor, 6))
+                return None
 
         rsi_long_min = cfg.get_symbol_param_float(symbol, "MTF_RSI_LONG_MIN", float(getattr(cfg, "MTF_RSI_LONG_MIN", 50.0)))
         rsi_long_max = cfg.get_symbol_param_float(symbol, "MTF_RSI_LONG_MAX", float(getattr(cfg, "MTF_RSI_LONG_MAX", 85.0)))
@@ -3074,8 +3143,11 @@ class MTFBreakoutStrategy(BaseStrategy):
         continuation_states = {"trend"}
         if bool(getattr(cfg, "CONTINUATION_ALLOW_IN_TRANSITION", True)):
             continuation_states.add("transition")
+        if is_alt and bool(getattr(cfg, "ALT_CONTINUATION_ALLOW_IN_RANGE", True)):
+            continuation_states.add("range")
 
         if market_state in continuation_states or transition_state:
+            self._alt_trace("entry_path", symbol=symbol, path="continuation_block", market_state=market_state, regime=regime)
             pullback_states = {"trend"}
             if bool(getattr(cfg, "PULLBACK_TREND_ALLOW_IN_TRANSITION", False)):
                 pullback_states.add("transition")
@@ -3284,14 +3356,34 @@ class MTFBreakoutStrategy(BaseStrategy):
                             logger.debug("[MTF] skip SELL continuation by directional regime gate: %s", regime_gate_meta)
 
         if market_state != "trend":
-            return None
+            if is_alt and market_state in {"transition", "range"} and bool(getattr(cfg, "ALT_CONTINUATION_ALLOW_IN_RANGE", True)):
+                self._alt_trace("soft_pass", symbol=symbol, market_state=market_state, regime=regime, reason="alt_allow_not_trend_after_continuation")
+            else:
+                self._alt_trace("signal_fallthrough", symbol=symbol, market_state=market_state, regime=regime, reason="not_trend_after_continuation")
+                return None
 
         if volume_filter_enabled and not volume_ok and not bool(getattr(cfg, "BREAKOUT_ALLOW_WITHOUT_VOLUME_IF_CONTINUATION_ONLY", False)):
-            logger.debug("[MTF] skip weak breakout volume/momentum: %s", volume_meta)
-            return None
+            if is_alt and bool(getattr(cfg, "ALT_ALLOW_WEAK_BREAKOUT_VOLUME", True)):
+                self._alt_trace("soft_pass", symbol=symbol, stage="volume_filter", reason="alt_allow_weak_breakout_volume", impulse_score=round(float(volume_meta.get("impulse_score",0.0) or 0.0), 6))
+            else:
+                logger.debug("[MTF] skip weak breakout volume/momentum: %s", volume_meta)
+                self._alt_trace("early_return", symbol=symbol, stage="volume_filter", reason="weak_breakout_volume", impulse_score=round(float(volume_meta.get("impulse_score",0.0) or 0.0), 6))
+                return None
+
+        alt_entry_tol = float(getattr(cfg, "ALT_ENTRY_TRIGGER_TOLERANCE_PCT", 0.0035)) if is_alt else 0.0
+        alt_rsi_pad = float(getattr(cfg, "ALT_ENTRY_RSI_PAD", 6.0)) if is_alt else 0.0
+        long_entry_hit = close > long_trigger
+        short_entry_hit = close < short_trigger
+        alt_near_long = bool(is_alt and bool(getattr(cfg, "ALT_NEAR_TRIGGER_ALLOW", True)) and regime == "bull" and close >= long_trigger * (1.0 - alt_entry_tol))
+        alt_near_short = bool(is_alt and bool(getattr(cfg, "ALT_NEAR_TRIGGER_ALLOW", True)) and regime == "bear" and close <= short_trigger * (1.0 + alt_entry_tol))
+        long_rsi_ok = (rsi_long_min <= rsi_ltf <= rsi_long_max) or bool(is_alt and (rsi_long_min - alt_rsi_pad) <= rsi_ltf <= (rsi_long_max + alt_rsi_pad))
+        short_rsi_ok = (rsi_short_min <= rsi_ltf <= rsi_short_max) or bool(is_alt and (rsi_short_min - alt_rsi_pad) <= rsi_ltf <= (rsi_short_max + alt_rsi_pad))
 
         # LONG: H1 bull-тренд + подтверждённое закрытие M15 выше диапазона
-        if regime == "bull" and close > long_trigger and rsi_long_min <= rsi_ltf <= rsi_long_max:
+        if regime == "bull" and (long_entry_hit or alt_near_long) and long_rsi_ok:
+            if alt_near_long and not long_entry_hit:
+                self._alt_trace("soft_pass", symbol=symbol, stage="entry_trigger", reason="alt_near_long_trigger", close=round(close,6), trigger=round(long_trigger,6), tolerance=round(alt_entry_tol,6))
+            self._alt_trace("entry_path", symbol=symbol, path="impulse_long_candidate", close=round(close,6), trigger=round(long_trigger,6), rsi_ltf=round(rsi_ltf,4))
             btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="long")
             if not btc_ok:
                 logger.debug("[MTF] skip BUY by BTC regime filter: %s", btc_meta)
@@ -3304,8 +3396,12 @@ class MTFBreakoutStrategy(BaseStrategy):
                 symbol=symbol, df=df, side="long", trigger=long_trigger, range_high=range_high, range_low=range_low, atr_ltf=atr_ltf
             )
             if not confirm_ok:
-                logger.debug("[MTF] skip BUY by breakout confirmation: %s", confirm_meta)
-                return None
+                if is_alt and alt_near_long and bool(getattr(cfg, "ALT_NEAR_TRIGGER_ALLOW", True)):
+                    self._alt_trace("soft_pass", symbol=symbol, stage="breakout_confirmation", reason="alt_near_long_confirmation_bypass")
+                    confirm_ok = True
+                else:
+                    logger.debug("[MTF] skip BUY by breakout confirmation: %s", confirm_meta)
+                    return None
             rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="long")
             alt_ok, rs_ok, alt_meta, rs_meta = self._relax_alt_filters(symbol, "long", alt_ok, alt_meta, rs_ok, rs_meta)
             if not rs_ok:
@@ -3313,8 +3409,13 @@ class MTFBreakoutStrategy(BaseStrategy):
                 return None
             impulse_ok, impulse_meta = self._check_impulse_breakout(symbol=symbol, recent=recent, candle=last, side="long", trigger=long_trigger, atr_ltf=atr_ltf)
             if not impulse_ok:
-                logger.debug("[MTF] skip BUY by impulse breakout: %s", impulse_meta)
-                return None
+                if is_alt and alt_near_long and bool(getattr(cfg, "ALT_NEAR_TRIGGER_ALLOW", True)):
+                    self._alt_trace("soft_pass", symbol=symbol, stage="impulse_breakout", reason="alt_near_long_impulse_bypass")
+                    impulse_ok = True
+                    impulse_meta = {**(impulse_meta or {}), "soft_pass": True, "near_trigger": True}
+                else:
+                    logger.debug("[MTF] skip BUY by impulse breakout: %s", impulse_meta)
+                    return None
             if breakout_quality_enabled:
                 quality_ok, quality_meta = self._calc_breakout_candle_quality(last, atr_ltf, side="long")
                 if not quality_ok:
@@ -3357,6 +3458,10 @@ class MTFBreakoutStrategy(BaseStrategy):
                 float(quality_meta.get("lower_wick", 0.0)),
             )
             risk_mult = float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_IMPULSE", float(getattr(cfg, "RISK_MULTIPLIER_IMPULSE", 1.00))))
+            if is_alt and alt_near_long and not long_entry_hit:
+                near_mult = float(getattr(cfg, "ALT_NEAR_TRIGGER_RISK_MULT", 0.85))
+                risk_mult *= near_mult
+                self._alt_trace("soft_pass", symbol=symbol, stage="risk", reason="alt_near_long_risk_mult", risk_mult=round(risk_mult,6), near_mult=near_mult)
             if strong_setup:
                 risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
             risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="impulse", side="long", market_state=market_state, trend_quality_meta=trend_quality_meta)
@@ -3370,60 +3475,138 @@ class MTFBreakoutStrategy(BaseStrategy):
                 return self._set_signal("buy", trade_type="impulse", risk_multiplier=risk_mult, market_state=market_state, impulse_meta=impulse_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="long", strong_setup=strong_setup, **setup_flags, **v7_flags, **v78_flags, **v80_alt_flags, **v86_long_flags)
 
         # SHORT: H1 bear-тренд + подтверждённое закрытие M15 ниже диапазона
-        if regime == "bear" and close < short_trigger and rsi_short_min <= rsi_ltf <= rsi_short_max:
+        if regime == "bear" and (short_entry_hit or alt_near_short) and short_rsi_ok:
+            self._alt_trace("entry_path", symbol=symbol, path="impulse_short_candidate", close=round(close,6), trigger=round(short_trigger,6), rsi_ltf=round(rsi_ltf,4))
+            alt_force_exec_short = bool(
+                is_alt
+                and bool(getattr(cfg, "ALT_FINAL_ENTRY_EXECUTION_ALLOW", True))
+                and symbol in set(getattr(cfg, "ALT_FINAL_ENTRY_EXECUTION_SYMBOLS", ["SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+                and alt_near_short
+                and not short_entry_hit
+                and float(adx_h or 0.0) >= float(getattr(cfg, "ALT_FORCE_EXEC_MIN_ADX_H", 15.0))
+                and float(drift or 0.0) >= float(getattr(cfg, "ALT_FORCE_EXEC_MIN_DRIFT", 0.02))
+                and float((volume_meta or {}).get("impulse_score", 0.0) or 0.0) >= float(getattr(cfg, "ALT_FORCE_EXEC_MIN_IMPULSE_SCORE", 0.095))
+            )
+            alt_late_entry_short = bool(
+                is_alt
+                and bool(getattr(cfg, "ALT_LATE_ENTRY_IMPROVEMENT_ALLOW", True))
+                and symbol in set(getattr(cfg, "ALT_LATE_ENTRY_SYMBOLS", ["SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+                and alt_near_short
+                and not short_entry_hit
+                and abs(float(close or 0.0) - float(short_trigger or 0.0)) / max(abs(float(short_trigger or 0.0)), 1e-9) <= float(getattr(cfg, "ALT_LATE_ENTRY_MAX_TRIGGER_DIST_PCT", 0.0025))
+                and float(drift or 0.0) >= float(getattr(cfg, "ALT_LATE_ENTRY_MIN_DRIFT", 0.03))
+                and float(rsi_ltf or 50.0) <= float(getattr(cfg, "ALT_LATE_ENTRY_MAX_RSI_SHORT", 32.0))
+                and float(adx_h or 0.0) >= float(getattr(cfg, "ALT_LATE_ENTRY_MIN_ADX_H", 17.0))
+                and float((volume_meta or {}).get("impulse_score", 0.0) or 0.0) >= float(getattr(cfg, "ALT_LATE_ENTRY_MIN_IMPULSE_SCORE", 0.14))
+            )
+            if alt_late_entry_short:
+                self._alt_trace("soft_pass", symbol=symbol, stage="late_entry", reason="alt_late_entry_short_candidate", close=round(close,6), trigger=round(short_trigger,6), drift=round(float(drift or 0.0),6), rsi_ltf=round(float(rsi_ltf or 0.0),4))
+            if alt_near_short and not short_entry_hit:
+                self._alt_trace("soft_pass", symbol=symbol, stage="entry_trigger", reason="alt_near_short_trigger", close=round(close,6), trigger=round(short_trigger,6), tolerance=round(alt_entry_tol,6))
             btc_ok, btc_meta = self._check_btc_regime_filter(df, symbol=symbol, side="short")
             if not btc_ok:
-                logger.debug("[MTF] skip SELL by BTC regime filter: %s", btc_meta)
-                return None
+                if alt_force_exec_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="btc_regime_filter", reason="alt_force_exec_btc_regime_bypass")
+                    btc_ok = True
+                    btc_meta = btc_meta or {}
+                else:
+                    logger.debug("[MTF] skip SELL by BTC regime filter: %s", btc_meta)
+                    return None
             alt_ok, alt_meta = self._calc_alt_quality_score(symbol=symbol, recent=recent, atr_ltf=atr_ltf, side="short")
             if not alt_ok:
-                logger.debug("[MTF] skip SELL by alt quality: %s", alt_meta)
-                return None
+                if False and alt_force_exec_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="alt_quality", reason="alt_force_exec_alt_quality_bypass")
+                    alt_ok = True
+                    alt_meta = {**(alt_meta or {}), "soft_pass": True, "force_exec": True}
+                else:
+                    logger.debug("[MTF] skip SELL by alt quality: %s", alt_meta)
+                    return None
             if symbol != str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")) and bool(getattr(cfg, "ALT_SHORTS_REQUIRE_STRONG_BTC_BEAR", True)):
                 btc_short_min = float(getattr(cfg, "BTC_REGIME_MIN_SCORE_SHORT", max(float(getattr(cfg, "BTC_REGIME_MIN_SCORE", 0.95)), 1.05)))
                 if float(btc_meta.get("score", 0.0)) < btc_short_min:
-                    logger.debug("[MTF] skip SELL weak BTC bear context: %s", btc_meta)
-                    return None
+                    if alt_force_exec_short:
+                        self._alt_trace("soft_pass", symbol=symbol, stage="btc_bear_strength", reason="alt_force_exec_btc_bear_bypass", btc_score=round(float(btc_meta.get("score",0.0)),6), min_score=round(btc_short_min,6))
+                    else:
+                        logger.debug("[MTF] skip SELL weak BTC bear context: %s", btc_meta)
+                        return None
             btc_short_ctx_ok, btc_short_ctx_meta = self._btc_short_trade_ok(symbol=symbol, trade_type="continuation", regime=regime, market_state=market_state, adx_h=adx_h, rsi_h=rsi_h, drift=drift, btc_score=float(btc_meta.get("score", 0.0)))
             if not btc_short_ctx_ok:
-                logger.debug("[MTF] skip SELL by BTC short context: %s", btc_short_ctx_meta)
-                return None
+                if alt_force_exec_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="btc_short_context", reason="alt_force_exec_btc_short_ctx_bypass")
+                else:
+                    logger.debug("[MTF] skip SELL by BTC short context: %s", btc_short_ctx_meta)
+                    return None
             confirm_ok, confirm_meta = self._check_breakout_confirmation(
                 symbol=symbol, df=df, side="short", trigger=short_trigger, range_high=range_high, range_low=range_low, atr_ltf=atr_ltf
             )
             if not confirm_ok:
-                logger.debug("[MTF] skip SELL by breakout confirmation: %s", confirm_meta)
-                return None
+
+                if (is_alt and alt_near_short and bool(getattr(cfg, "ALT_NEAR_TRIGGER_ALLOW", True))) or alt_force_exec_short or alt_late_entry_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="breakout_confirmation", reason="alt_near_short_confirmation_bypass")
+                    confirm_ok = True
+                else:
+                    logger.debug("[MTF] skip SELL by breakout confirmation: %s", confirm_meta)
+                    return None
             rs_ok, rs_meta = self._check_relative_strength_filter(df=df, symbol=symbol, side="short")
             alt_ok, rs_ok, alt_meta, rs_meta = self._relax_alt_filters(symbol, "short", alt_ok, alt_meta, rs_ok, rs_meta)
             if not rs_ok:
-                logger.debug("[MTF] skip SELL by relative strength: %s", rs_meta)
-                return None
+                if False and alt_force_exec_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="relative_strength", reason="alt_force_exec_rs_bypass")
+                    rs_ok = True
+                    rs_meta = {**(rs_meta or {}), "soft_pass": True, "force_exec": True}
+                else:
+                    logger.debug("[MTF] skip SELL by relative strength: %s", rs_meta)
+                    return None
             impulse_ok, impulse_meta = self._check_impulse_breakout(symbol=symbol, recent=recent, candle=last, side="short", trigger=short_trigger, atr_ltf=atr_ltf)
             if not impulse_ok:
-                logger.debug("[MTF] skip SELL by impulse breakout: %s", impulse_meta)
-                return None
+
+                if (is_alt and alt_near_short and bool(getattr(cfg, "ALT_NEAR_TRIGGER_ALLOW", True))) or alt_force_exec_short or alt_late_entry_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="impulse_breakout", reason="alt_near_short_impulse_bypass")
+                    impulse_ok = True
+                    impulse_meta = {**(impulse_meta or {}), "soft_pass": True, "near_trigger": True, "force_exec": alt_force_exec_short, "late_entry": alt_late_entry_short}
+                else:
+                    logger.debug("[MTF] skip SELL by impulse breakout: %s", impulse_meta)
+                    return None
             if breakout_quality_enabled:
                 quality_ok, quality_meta = self._calc_breakout_candle_quality(last, atr_ltf, side="short")
                 if not quality_ok:
-                    logger.debug("[MTF] skip SELL poor breakout candle: %s", quality_meta)
-                    return None
+                    if False and alt_force_exec_short:
+                        self._alt_trace("soft_pass", symbol=symbol, stage="breakout_quality", reason="alt_force_exec_quality_bypass")
+                        quality_ok = True
+                    else:
+                        logger.debug("[MTF] skip SELL poor breakout candle: %s", quality_meta)
+                        return None
             else:
                 quality_meta = {}
 
             regime_gate_ok, regime_gate_meta = self._check_directional_regime_gate(symbol=symbol, side="short", trade_type="impulse", regime=regime, market_state=market_state, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift, rsi_h=rsi_h)
             if not regime_gate_ok:
-                logger.debug("[MTF] skip SELL impulse by directional regime gate: %s", regime_gate_meta)
-                return None
+                if False and alt_force_exec_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="directional_regime_gate", reason="alt_force_exec_regime_gate_bypass")
+                    regime_gate_ok = True
+                    regime_gate_meta = {**(regime_gate_meta or {}), "soft_pass": True, "force_exec": True}
+                else:
+                    logger.debug("[MTF] skip SELL impulse by directional regime gate: %s", regime_gate_meta)
+                    return None
             trend_quality_ok, trend_quality_meta = self._check_trend_strength_and_chop(symbol=symbol, df=df, recent=recent, side="short", trade_type="impulse", close=close, atr_ltf=atr_ltf, adx_h=adx_h, atr_pct_h=atr_pct_h, drift=drift)
             if not trend_quality_ok:
-                logger.debug("[MTF] skip SELL impulse by trend quality/chop: %s", trend_quality_meta)
-                return None
+                if False and alt_force_exec_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="trend_quality", reason="alt_force_exec_trend_quality_bypass")
+                    trend_quality_ok = True
+                    trend_quality_meta = {**(trend_quality_meta or {}), "soft_pass": True, "force_exec": True}
+                else:
+                    logger.debug("[MTF] skip SELL impulse by trend quality/chop: %s", trend_quality_meta)
+                    return None
             strong_setup = self._alt_strong_setup(symbol, adx_h, drift, volume_meta, rs_meta, side="short")
             alt_regime_ok, alt_regime_meta = self._alt_regime_filter(symbol=symbol, side="short", trade_type="impulse", market_state=market_state, alt_meta=alt_meta, rs_meta=rs_meta, btc_meta=btc_meta, adx_h=adx_h, drift=drift, volume_meta=volume_meta, strong_setup=strong_setup)
             if not alt_regime_ok:
-                logger.debug("[MTF] skip SELL impulse by alt regime filter: %s", alt_regime_meta)
-                return None
+                if False and alt_force_exec_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="alt_regime_filter", reason="alt_force_exec_alt_regime_bypass")
+                    alt_regime_ok = True
+                    alt_regime_meta = {**(alt_regime_meta or {}), "soft_pass": True, "force_exec": True}
+                else:
+                    logger.debug("[MTF] skip SELL impulse by alt regime filter: %s", alt_regime_meta)
+                    return None
             logger.debug(
                 "[MTF] SELL: state=%s close=%.2f rl=%.2f vol=%.0f vol_ema=%.0f vol_med=%.0f imp=%.3f adx_h=%.2f atr_pct_h=%.5f rsi_ltf=%.2f alt_score=%.3f btc_score=%.3f rs_ratio=%.3f exc=%.5f body=%.5f uw=%.5f lw=%.5f",
                 market_state,
@@ -3445,20 +3628,46 @@ class MTFBreakoutStrategy(BaseStrategy):
                 float(quality_meta.get("lower_wick", 0.0)),
             )
             risk_mult = float(cfg.get_symbol_param_float(symbol, "RISK_MULTIPLIER_IMPULSE", float(getattr(cfg, "RISK_MULTIPLIER_IMPULSE", 1.00))))
+            if is_alt and alt_near_short and not short_entry_hit:
+                near_mult = float(getattr(cfg, "ALT_NEAR_TRIGGER_RISK_MULT", 0.85))
+                risk_mult *= near_mult
+                self._alt_trace("soft_pass", symbol=symbol, stage="risk", reason="alt_near_short_risk_mult", risk_mult=round(risk_mult,6), near_mult=near_mult)
+
+            if alt_force_exec_short:
+                force_mult = float(getattr(cfg, "ALT_FINAL_ENTRY_EXECUTION_RISK_MULT", 0.72))
+                risk_mult *= force_mult
+                self._alt_trace("soft_pass", symbol=symbol, stage="risk", reason="alt_force_exec_risk_mult", risk_mult=round(risk_mult,6), force_mult=force_mult)
+            if alt_late_entry_short:
+                late_mult = float(getattr(cfg, "ALT_LATE_ENTRY_RISK_MULT", 0.74))
+                risk_mult *= late_mult
+                self._alt_trace("soft_pass", symbol=symbol, stage="risk", reason="alt_late_entry_risk_mult", risk_mult=round(risk_mult,6), late_mult=late_mult)
             if strong_setup:
                 risk_mult *= float(cfg.get_symbol_param_float(symbol, "ALT_STRONG_SETUP_RISK_MULT", float(getattr(cfg, "ALT_STRONG_SETUP_RISK_MULT", 1.30))))
             risk_mult, setup_flags = self._apply_directional_setup_scaling(symbol=symbol, base_risk_multiplier=risk_mult, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type="impulse", side="short", market_state=market_state, trend_quality_meta=trend_quality_meta)
             v83_short_ok, v83_short_flags = self._apply_v83_short_suppression(symbol=symbol, side="short", trade_type="impulse", market_state=market_state, regime=regime, btc_meta=btc_meta, rs_meta=rs_meta, trend_quality_meta=trend_quality_meta, strong_setup=strong_setup, regime_gate_meta=regime_gate_meta)
+
             if not v83_short_ok:
-                logger.debug("[MTF] skip SELL impulse by v83 short suppression: %s", v83_short_flags)
-                return None
+                if alt_late_entry_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="v83_short_suppression", reason="alt_late_entry_v83_bypass")
+                    v83_short_ok = True
+                    v83_short_flags = {**(v83_short_flags or {}), "soft_pass": True, "late_entry": True}
+                else:
+                    logger.debug("[MTF] skip SELL impulse by v83 short suppression: %s", v83_short_flags)
+                    return None
             risk_mult, v80_short_flags = self._apply_v80_short_control(symbol=symbol, side="short", trade_type="impulse", risk_multiplier=risk_mult, market_state=market_state, regime=regime, btc_meta=btc_meta, rs_meta=rs_meta, trend_quality_meta=trend_quality_meta, strong_setup=strong_setup, regime_gate_meta=regime_gate_meta)
             risk_mult, v81_short_flags = self._apply_v81_aggressive_short_risk(symbol=symbol, side="short", trade_type="impulse", risk_multiplier=risk_mult, market_state=market_state, regime=regime, volume_meta=volume_meta, strong_setup=strong_setup)
             risk_mult, v80_alt_flags = self._apply_v80_alt_engine_upgrade(symbol=symbol, side="short", trade_type="impulse", risk_multiplier=risk_mult, alt_meta=alt_meta, btc_meta=btc_meta, rs_meta=rs_meta, adx_h=adx_h, drift=drift, volume_meta=volume_meta, strong_setup=strong_setup)
             v85_short_ok, v85_short_flags = self._apply_v85_inline_short_suppression(symbol=symbol, trade_type="impulse", market_state=market_state, regime=regime, btc_meta=btc_meta, rs_meta=rs_meta, trend_quality_meta=trend_quality_meta, regime_gate_meta=regime_gate_meta, strong_setup=strong_setup)
+
             if not v85_short_ok:
-                logger.debug("[MTF] skip SELL impulse by v85 inline short suppression: %s", v85_short_flags)
-                return None
+                if alt_late_entry_short:
+                    self._alt_trace("soft_pass", symbol=symbol, stage="v85_inline_short_suppression", reason="alt_late_entry_v85_bypass")
+                    v85_short_ok = True
+                    v85_short_flags = {**(v85_short_flags or {}), "v85_short_suppressed": False, "late_entry": True}
+                else:
+                    logger.debug("[MTF] skip SELL impulse by v85 inline short suppression: %s", v85_short_flags)
+                    return None
             return self._set_signal("sell", trade_type="impulse", risk_multiplier=risk_mult, market_state=market_state, impulse_meta=impulse_meta, btc_short_ctx=btc_short_ctx_meta, regime_gate_meta=regime_gate_meta, trend_quality_meta=trend_quality_meta, side="short", strong_setup=strong_setup, **setup_flags, **v83_short_flags, **v80_short_flags, **v81_short_flags, **v80_alt_flags, **v85_short_flags)
 
+        self._alt_trace("signal_fallthrough", symbol=symbol, market_state=market_state, regime=regime, reason="no_entry_triggered")
         return None
