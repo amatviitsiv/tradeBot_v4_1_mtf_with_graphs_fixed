@@ -8,13 +8,6 @@ def _cfg_float(name: str, default: float, symbol: str = "") -> float:
         return float(default)
 
 
-def _cfg_int(name: str, default: int) -> int:
-    try:
-        return int(getattr(cfg, name, default))
-    except Exception:
-        return int(default)
-
-
 def _position_profile_from_values(market_state: str = "", trade_type: str = "") -> str:
     market_state = str(market_state or "").lower()
     trade_type = str(trade_type or "").lower()

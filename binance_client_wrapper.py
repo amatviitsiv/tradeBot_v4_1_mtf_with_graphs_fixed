@@ -7,7 +7,7 @@
 import asyncio
 import logging
 import random
-from typing import Any, Callable, TypeVar, Awaitable, Optional
+from typing import Any, Callable, TypeVar
 
 try:
     from binance.exceptions import BinanceAPIException, BinanceRequestException

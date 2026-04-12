@@ -16,7 +16,6 @@ from typing import Any, Dict, List, Optional
 
 from binance import AsyncClient  # type: ignore
 
-import config
 
 logger = logging.getLogger(__name__)
 

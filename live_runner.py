@@ -15,7 +15,6 @@
 import asyncio
 import logging
 from logger_setup import setup_logging
-import os
 import signal
 import time
 from typing import Dict, List
@@ -29,6 +28,7 @@ from telegram_notifier import TelegramNotifier
 from broker_futures import LiveFuturesBroker
 from binance_ws_manager import BinanceWSManager
 from strategy import signal_from_indicators
+from execution_policy import compute_trade_risk_multiplier
 from strategies import get_active_strategy
 from risk import RiskManager
 from position import PositionState
@@ -348,24 +348,11 @@ class LiveRunner:
         signal_side = "long" if signal == "buy" else ("short" if signal == "sell" else None)
         try:
             sig_meta = getattr(get_active_strategy(), "last_signal_meta", {}) or {}
-            trade_risk_mult = float(sig_meta.get("execution_risk_multiplier", sig_meta.get("risk_multiplier", 1.0)) or 1.0)
-            if signal_side == "short":
-                if bool(sig_meta.get("v80_short_control_applied", False)):
-                    trade_risk_mult *= float(sig_meta.get("v80_short_control_mult", 1.0) or 1.0)
-                if bool(sig_meta.get("v81_short_adjustment_applied", False)):
-                    trade_risk_mult *= float(sig_meta.get("v81_short_adjustment_mult", 1.0) or 1.0)
-                if bool(getattr(config, "V813_GLOBAL_SHORT_RISK_ENABLED", True)):
-                    trade_risk_mult *= float(getattr(config, "V813_GLOBAL_SHORT_BASE_MULT", 1.0) or 1.0)
-                    bad_states = set(getattr(config, "V813_GLOBAL_SHORT_BAD_MARKET_STATES", ["chop", "flat", "range"]) or ["chop", "flat", "range"])
-                    signal_market_state = str(sig_meta.get("market_state", "") or "")
-                    signal_regime = str(sig_meta.get("regime", "") or "")
-                    bad_context = signal_market_state in bad_states
-                    if (not bad_context) and bool(getattr(config, "V813_GLOBAL_SHORT_REQUIRE_BEAR_REGIME", True)) and signal_regime != "bear":
-                        bad_context = True
-                    if bad_context:
-                        trade_risk_mult *= float(getattr(config, "V813_GLOBAL_SHORT_BAD_MARKET_MULT", 0.72) or 0.72)
-                        if not bool(sig_meta.get("strong_setup", False)):
-                            trade_risk_mult *= float(getattr(config, "V813_GLOBAL_SHORT_WEAK_SETUP_MULT", 0.90) or 0.90)
+            trade_risk_mult = compute_trade_risk_multiplier(
+                sig_meta=sig_meta,
+                side=signal_side,
+                cfg=config,
+            )
         except Exception:
             trade_risk_mult = 1.0
 

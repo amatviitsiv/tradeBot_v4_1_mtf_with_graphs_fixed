@@ -12,6 +12,7 @@ if ROOT not in sys.path:
 import config as cfg
 from indicators import compute_indicators
 from strategy import signal_from_indicators
+from execution_policy import compute_trade_risk_multiplier
 from strategies import get_active_strategy
 from risk import RiskManager
 from position import PositionState as Position
@@ -555,41 +556,13 @@ class Backtester:
                 risk_multiplier = self._symbol_risk_multiplier(sym)
                 try:
                     sig_meta = getattr(get_active_strategy(), "last_signal_meta", {}) or {}
-                    trade_risk_mult = float(sig_meta.get("execution_risk_multiplier", sig_meta.get("risk_multiplier", 1.0)) or 1.0)
-                    # Explicit execution-time propagation for short-side adjustments.
-                    # This keeps backtest/live aligned even if a strategy helper updated
-                    # diagnostic flags but did not fully fold them into risk_multiplier.
-                    if side == "short":
-                        if bool(sig_meta.get("v80_short_control_applied", False)):
-                            trade_risk_mult *= float(sig_meta.get("v80_short_control_mult", 1.0) or 1.0)
-                        if bool(sig_meta.get("v81_short_adjustment_applied", False)):
-                            trade_risk_mult *= float(sig_meta.get("v81_short_adjustment_mult", 1.0) or 1.0)
-                        # Global execution-layer short haircut so every short trade
-                        # is affected even when the specific strategy branch does not
-                        # propagate a dedicated short adjustment helper.
-                        if bool(getattr(cfg, "V813_GLOBAL_SHORT_RISK_ENABLED", True)):
-                            base_mult = float(getattr(cfg, "V813_GLOBAL_SHORT_BASE_MULT", 1.0) or 1.0)
-                            trade_risk_mult *= base_mult
-                            bad_states = set(getattr(cfg, "V813_GLOBAL_SHORT_BAD_MARKET_STATES", ["chop", "flat", "range"]) or ["chop", "flat", "range"])
-                            signal_market_state = str(sig_meta.get("market_state", market_state) or market_state or "")
-                            signal_regime = str(sig_meta.get("regime", "") or "")
-                            bad_context = signal_market_state in bad_states
-                            if (not bad_context) and bool(getattr(cfg, "V813_GLOBAL_SHORT_REQUIRE_BEAR_REGIME", True)) and signal_regime != "bear":
-                                bad_context = True
-                            if bad_context:
-                                trade_risk_mult *= float(getattr(cfg, "V813_GLOBAL_SHORT_BAD_MARKET_MULT", 0.72) or 0.72)
-                                if not bool(sig_meta.get("strong_setup", False)):
-                                    trade_risk_mult *= float(getattr(cfg, "V813_GLOBAL_SHORT_WEAK_SETUP_MULT", 0.90) or 0.90)
-                        if bool(getattr(cfg, "V812_GLOBAL_SHORT_RISK_ENABLED", False)):
-                            global_short_mult = float(getattr(cfg, "V812_GLOBAL_SHORT_BASE_MULT", 1.0) or 1.0)
-                            trade_risk_mult *= global_short_mult
-                            bad_states = set(getattr(cfg, "V812_GLOBAL_SHORT_BAD_MARKET_STATES", ["chop", "flat", "range"]) or ["chop", "flat", "range"])
-                            if str(market_state or "") in bad_states:
-                                trade_risk_mult *= float(getattr(cfg, "V812_GLOBAL_SHORT_BAD_MARKET_MULT", 0.82) or 0.82)
-                            elif bool(getattr(cfg, "V812_GLOBAL_SHORT_REQUIRE_BEAR_REGIME", True)) and str(sig_meta.get("regime", "") or "") != "bear":
-                                trade_risk_mult *= float(getattr(cfg, "V812_GLOBAL_SHORT_BAD_MARKET_MULT", 0.82) or 0.82)
-                            if not bool(sig_meta.get("strong_setup", False)):
-                                trade_risk_mult *= float(getattr(cfg, "V812_GLOBAL_SHORT_WEAK_SETUP_MULT", 0.90) or 0.90)
+                    trade_risk_mult = compute_trade_risk_multiplier(
+                        sig_meta=sig_meta,
+                        side=side,
+                        cfg=cfg,
+                        market_state_fallback=market_state,
+                        enable_legacy_v812=True,
+                    )
                 except Exception:
                     trade_risk_mult = 1.0
                 eff_risk_per_trade = risk_per_trade * risk_multiplier * trade_risk_mult

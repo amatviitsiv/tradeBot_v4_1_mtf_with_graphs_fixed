@@ -1,6 +1,3 @@
-STRATEGY_NAME = "mtf_breakout"
-
-# config.py
 """
 Глобальные настройки бота (актуально: только фьючерсы Binance USDT-M).
 Текущая конфигурация рассчитана на:
@@ -10,32 +7,49 @@ STRATEGY_NAME = "mtf_breakout"
 - переключение paper / real одним флагом,
 - работу стратегий:
   * MTF Breakout (H1 тренд + M15 вход).
+
+Замечание по архитектуре:
+- выбор runtime-стратегии централизован в strategies/__init__.py;
+- STRATEGY_NAME оставлен как legacy-флаг для логов и обратной совместимости;
+- секреты и токены должны приходить из переменных окружения, а не храниться в коде.
 """
 
-
-
-# ===== РЕЖИМ ТОРГОВЛИ =====
-# False = paper trading (без реальных ордеров)
-# True  = реальная торговля (нужны ключи и аккуратность!)
-REAL_TRADING = False
-
-EQUITY_NOTIFY_INTERVAL = 600
-# API ключи для Binance (заполняешь ТОЛЬКО если REAL_TRADING = True)
 import os as _os
 
-API_KEY = "cOzVm76AAqWwFe6vvHcoZ2wB1mNhJg01DJ9GpA5ZXq12nBpGmsJdwMoXTyRVA9Hw"
-API_SECRET = "O4o0oORj7wloy6DfeuWbcOVUy9SfV8z94gSyBQF63kHyQkPPJDXlZqYmuKwmKcfX"
+def _env_str(name: str, default: str = "") -> str:
+    return _os.getenv(name, default)
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(_os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+STRATEGY_NAME = "mtf_breakout"
 FUTURES_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
+
+# Совместимые legacy-алиасы для старых мест кода.
+BINANCE_API_KEY = _env_str("BINANCE_API_KEY")
+BINANCE_API_SECRET = _env_str("BINANCE_API_SECRET")
+API_KEY = BINANCE_API_KEY
+API_SECRET = BINANCE_API_SECRET
 # ===== СПИСОК ПАР ДЛЯ ТОРГОВЛИ =====
 
 # config.py (важные куски)
 
 INITIAL_BALANCE_USDT = 5000
-
-TIMEFRAME = "1m"
-HISTORY_LIMIT = 300
-
 
 # Индикаторы тренда
 SMA_TREND_PERIOD = 200
@@ -46,7 +60,6 @@ EMA_SLOW_PERIOD = EMA_SLOW
 ATR_PERIOD = 14
 ADX_PERIOD = 14
 
-ADX_TREND_THRESHOLD = 15.0        # минимальный ADX, чтобы считать рынок трендовым
 ANTI_CHOP_MIN_ATR_PCT = 0.0005    # фильтр "слишком тихого" рынка
 
 # ===== Дополнительный market-regime фильтр для новых рыночных режимов =====
@@ -58,16 +71,12 @@ MARKET_REGIME_MIN_HTF_ADX = 18.0
 MARKET_REGIME_MIN_HTF_ATR_PCT = 0.0012
 MARKET_REGIME_MIN_DRIFT_PCT = 0.0040
 
-
-
 # === ВОЛАТИЛЬНОСТНЫЙ BREAKOUT ===
 BREAKOUT_LOOKBACK = 12          # сколько свечей смотреть назад
 BREAKOUT_BUFFER_PCT = 0.0010     # на сколько выше high/ниже low должен уйти пробой (0.1%)
 
-
 # ===== КОМИССИИ =====
 # Комиссия спота (пример: 0.1% = 0.001)
-SPOT_FEE_RATE = 0.001
 # Комиссия фьючерсов (пример: 0.04% = 0.0004)
 FUTURES_FEE_RATE = 0.0004
 
@@ -78,32 +87,7 @@ RISK_PER_TRADE = 0.02                 # 2% от equity
 # Базовое плечо. В коде можно будет делать dynamic_leverage(equity)
 FUTURES_LEVERAGE_DEFAULT = 5
 
-# ===== ЛОГИКА ОПРОСА =====
-# Как часто перезапускаем цикл оценки стратегии (в секундах)
-POLL_INTERVAL = 30.0
-
-# Раз в сколько минут слать апдейт по equity (0 = выключить)
-TELEGRAM_EQUITY_INTERVAL_MIN = 5
-
-# ===== ЛОГИ =====
-LOG_LEVEL = "INFO"
-LOG_FILE = "bot.log"
-TRADES_LOG_FILE = "trades.log"
-ERROR_LOG_FILE = "errors.log"
-LOG_MAX_BYTES = 5 * 1024 * 1024
-LOG_BACKUP_COUNT = 3
-# === Trend strategy params (Dual Trend Bot) ===
-
-
-# ATR-фильтр волатильности (% от цены)
-ATR_MIN_PCT = 0.1     # слишком тихий рынок ниже этого
-ATR_MAX_PCT = 3.0     # слишком волатильный рынок выше этого
-
-# RSI-зоны для входа
-RSI_LONG_MIN = 60.0
-RSI_LONG_MAX = 80.0
-RSI_SHORT_MAX = 40.0
-RSI_SHORT_MIN = 20.0
+# Legacy polling/logging and flat ATR/RSI thresholds removed: current runtime uses dedicated defaults and MTF/profile-specific filters.
 
 # ===== ЛИМИТЫ ПО КОЛИЧЕСТВУ ПОЗИЦИЙ =====
 # Максимальное количество одновременно открытых фьючерсных позиций
@@ -124,8 +108,6 @@ ATR_TP_MULT_2 = 12.0
 # Множитель для трейлингового стопа относительно ATR
 ATR_TS_MULT = 5.0
 
-
-BREAKOUT_VOLUME_MULT = 1.5  # volume > MA(volume) * BREAKOUT_VOLUME_MULT
 BREAKOUT_ADX_MIN = 20.0      # минимальный ADX для подтверждения пробоя
 
 # ===== Улучшенный volume / momentum фильтр для breakout =====
@@ -149,7 +131,6 @@ BREAKOUT_MIN_BODY_ATR = 0.35                # минимальный разме�
 BREAKOUT_MAX_CLOSE_FROM_EXTREME_PCT = 0.25 # закрытие должно быть в лучших 25% диапазона свечи
 BREAKOUT_MAX_WICK_BODY_RATIO = 0.80        # фитиль в сторону пробоя не должен доминировать над телом
 BREAKOUT_MAX_WICK_RANGE_RATIO = 0.35       # и не должен занимать слишком большую часть всей свечи
-
 
 # ===== MTF (H1 + M15) ПАРАМЕТРЫ =====
 # Длина диапазона на LTF (M15) для поиска пробоя
@@ -211,7 +192,6 @@ MTF_DRIFT_MIN_LOOSEN_FACTOR = 0.7
 # для ослабления порога дрейфа.
 MTF_STRONG_TREND_ADX_MARGIN = 5.0
 
-
 # Порог "сильного тренда" по дрейфу. Нужен для адаптивных фильтров (RSI/lookback).
 MTF_DRIFT_STRONG_TREND_PCT = 0.01  # 1% и более за сутки считаем сильным трендом
 
@@ -225,13 +205,11 @@ MTF_RSI_SHORT_TIGHTEN = 5.0  # на сколько понизить верхню
 # считаем, что это волатильная пила без направления и пропускаем такие сигналы.
 LTF_VOLATILE_SLOPE_FACTOR = 5.0
 
-
 # HTF volatile-trendless filter
 HTF_VOLATILE_ATR_PCT=0.004
 HTF_VOLATILE_DRIFT_PCT=0.006
 HTF_VOLATILE_ADX_MAX=22
 HTF_DRIFT_LOOKBACK_BARS = 16
-
 
 # ===== Symbol-specific params (Step 8) =====
 # Ключевые параметры стратегии можно переопределять по каждому символу,
@@ -557,8 +535,6 @@ SYMBOL_PARAM_OVERRIDES = {
     },
 }
 
-
-
 def get_symbol_param(symbol: str, param_name: str, default=None):
     """Возвращает параметр с учётом overrides по символу."""
     try:
@@ -570,20 +546,17 @@ def get_symbol_param(symbol: str, param_name: str, default=None):
         pass
     return globals().get(param_name, default)
 
-
 def get_symbol_param_float(symbol: str, param_name: str, default: float) -> float:
     try:
         return float(get_symbol_param(symbol, param_name, default))
     except Exception:
         return float(default)
 
-
 def get_symbol_param_int(symbol: str, param_name: str, default: int) -> int:
     try:
         return int(get_symbol_param(symbol, param_name, default))
     except Exception:
         return int(default)
-
 
 # ===== Фильтр “живого” HTF-тренда =====
 # Даже если EMA формально выстроены, не входим, если старший тренд уже выдыхается:
@@ -601,7 +574,6 @@ HTF_OVEREXTENSION_FILTER_ENABLED = True
 HTF_MAX_DIST_FROM_EMA20_ATR = 2.5      # максимум, насколько цена может отстоять от HTF EMA20
 HTF_MAX_DIST_FROM_EMA50_ATR = 3.5      # максимум, насколько цена может отстоять от HTF EMA50
 
-
 # ===== Cooldown после стопа / серии неудачных входов =====
 # Защита от пилы: после убыточного stop-loss по конкретному symbol + direction
 # не разрешаем сразу переоткрывать ту же идею. При серии одинаковых стопов
@@ -612,8 +584,6 @@ ENTRY_COOLDOWN_STREAK_THRESHOLD = 2              # с какого подряд 
 ENTRY_COOLDOWN_STREAK_EXTRA_BARS = 8             # доп. пауза поверх базовой при серии стопов
 ENTRY_COOLDOWN_RESET_ON_NON_LOSS_EXIT = True     # сбрасывать серию после неубыточного/прибыльного выхода
 ENTRY_COOLDOWN_BAR_SECONDS = 15 * 60             # M15 = 900 секунд
-
-
 
 # ===== BTC regime filter для альтов =====
 # Для альтов торгуем только в сторону старшего режима BTC.
@@ -626,7 +596,6 @@ BTC_REGIME_ALT_SYMBOLS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
 # Доп. ограничение: сколько однонаправленных альт-сделок можно держать одновременно.
 # 0 = без ограничения.
 BTC_REGIME_MAX_SAME_SIDE_ALT_POSITIONS = 2
-
 
 # ===== Soft BTC regime filter tuning =====
 # Делаем фильтр мягче: для альтов допускаем не только идеальное EMA20>50>200,
@@ -740,7 +709,6 @@ BTC_SHORT_CONT_MIN_DRIFT_PCT = 0.004
 BTC_SHORT_CONT_MAX_HTF_RSI = 58.0
 BTC_SHORT_CONT_MIN_BTC_SCORE = 0.95
 
-
 # ===== Risk tuning =====
 BASE_POSITION_RISK_MULTIPLIER = 1.0
 ALT_POSITION_RISK_MULTIPLIER = 0.70
@@ -773,7 +741,6 @@ ALT_V1_CONT_SHORT_REQUIRE_STRONG_SETUP = True
 ALT_V1_CONT_SHORT_RISK_MULT = 0.72
 ALT_V1_CONT_SHORT_STRONG_RISK_MULT = 0.85
 
-
 # ===== Stage 7.2: alt regime filter =====
 ALT_V2_REGIME_FILTER_ENABLED = True
 ALT_V2_LONG_MIN_BTC_SCORE = 1.00
@@ -794,12 +761,6 @@ ALT_V2_SHORT_BLOCK_SOFT_PASSES = True
 ALT_V2_SHORT_REQUIRE_STRONG_SETUP = True
 ALT_V2_SHORT_ALLOW_TRANSITION = False
 BTC_POSITION_RISK_MULTIPLIER = 1.18
-ETH_POSITION_RISK_MULTIPLIER = 0.30
-ALT_MEDIUM_RISK_MULT = 0.60
-ALT_STRONG_RISK_MULT = 1.00
-BNB_POSITION_RISK_MULTIPLIER = 0.80
-SOL_POSITION_RISK_MULTIPLIER = 0.65
-AVAX_POSITION_RISK_MULTIPLIER = 0.55
 
 # ===== Session / time filter =====
 # Не торгуем в наименее ликвидные часы.
@@ -811,68 +772,45 @@ SESSION_ALLOWED_WINDOWS = [
     (6, 23),
 ]
 
-
 # ===== Ограничение торговли при глубокой просадке (DD cooldown) =====
-# Если текущая просадка от пика эквити превышает DD_COOLDOWN_PCT,
-# стратегия перестаёт открывать новые позиции на ближайшие DD_COOLDOWN_BARS баров.
-DD_COOLDOWN_ENABLE = False
-DD_COOLDOWN_PCT = 12.0       # % просадки от пика, после которой включаем "режим восстановления"
-DD_COOLDOWN_BARS = 300       # на сколько баров вперёд блокировать новые входы
+# Legacy DD cooldown-параметры удалены: активного runtime-path для них в проекте нет.
 
 # ===== Runtime environment / credentials =====
 # Настройки окружения вычитываются из переменных среды, чтобы ключи и токены
 # не лежали в коде / репозитории. Для локального запуска удобно использовать .env.
 
-import os as _os
-
-# paper / real (можно переопределить переменной BOT_MODE)
-BOT_MODE = _os.getenv("BOT_MODE", "paper").lower()
-
-# Ключи к Binance (USDT-M futures). ОБЯЗАТЕЛЬНО задавать через окружение / .env
-BINANCE_API_KEY = _os.getenv("BINANCE_API_KEY", "cOzVm76AAqWwFe6vvHcoZ2wB1mNhJg01DJ9GpA5ZXq12nBpGmsJdwMoXTyRVA9Hw")
-BINANCE_API_SECRET = _os.getenv("BINANCE_API_SECRET", "O4o0oORj7wloy6DfeuWbcOVUy9SfV8z94gSyBQF63kHyQkPPJDXlZqYmuKwmKcfX")
-
 # Файл состояния (его можно переопределять, если нужно вести несколько ботов)
-STATE_FILE = _os.getenv("BOT_STATE_FILE", "bot_state.json")
+STATE_FILE = _env_str("BOT_STATE_FILE", "bot_state.json")
 
 # Версия стратегии/конфига — можно использовать в логах и state
-STRATEGY_VERSION = _os.getenv("STRATEGY_VERSION", "mtf_breakout_regime_range_v1")
+STRATEGY_VERSION = _env_str("STRATEGY_VERSION", "mtf_breakout_regime_range_v1")
 
 # ===== Telegram-уведомления =====
 # Если TELEGRAM_ENABLED=1 и заданы токен и chat_id, бот будет слать уведомления.
-TELEGRAM_ENABLED = _os.getenv("TELEGRAM_ENABLED", "1") == "1"
-TELEGRAM_BOT_TOKEN = _os.getenv("TELEGRAM_BOT_TOKEN", "8269222363:AAF6vM7-ydXHJjBiq42MDK4jWn5sYbIub7w")
-TELEGRAM_CHAT_ID = _os.getenv("TELEGRAM_CHAT_ID", "351630680")
-
-
+TELEGRAM_ENABLED = _env_bool("TELEGRAM_ENABLED", True)
+TELEGRAM_BOT_TOKEN = _env_str("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = _env_str("TELEGRAM_CHAT_ID")
 
 # ===== Protective layer (Step9) =====
 # Жёсткий лимит по просадке от пика equity (0 = выключено)
-HARD_MAX_DRAWDOWN_PCT = float(_os.getenv("HARD_MAX_DRAWDOWN_PCT", "0"))
+HARD_MAX_DRAWDOWN_PCT = _env_float("HARD_MAX_DRAWDOWN_PCT", 0.0)
 
 # Лимит сделок в час (по открытиям позиций); 0 = без ограничения
-MAX_TRADES_PER_HOUR = int(_os.getenv("MAX_TRADES_PER_HOUR", "20"))
+MAX_TRADES_PER_HOUR = _env_int("MAX_TRADES_PER_HOUR", 20)
 
 # Минимальный интервал между повторными входами по одному и тому же символу (анти-луп), сек
-MIN_REOPEN_INTERVAL_SEC = int(_os.getenv("MIN_REOPEN_INTERVAL_SEC", "300"))
+MIN_REOPEN_INTERVAL_SEC = _env_int("MIN_REOPEN_INTERVAL_SEC", 300)
 
 # Максимально допустимая "тишина" по WebSocket (сек); 0 = не проверять
-WS_STALE_SECONDS = int(_os.getenv("WS_STALE_SECONDS", "900"))
+WS_STALE_SECONDS = _env_int("WS_STALE_SECONDS", 900)
 
 # Отключать ли торговлю при рассинхронизации позиций биржа/локальный стейт
-POSITION_MISMATCH_DISABLE = _os.getenv("POSITION_MISMATCH_DISABLE", "1") == "1"
+POSITION_MISMATCH_DISABLE = _env_bool("POSITION_MISMATCH_DISABLE", True)
 
-# Логировать сырые сообщения WebSocket (0/1)
-WS_DEBUG = _os.getenv("WS_DEBUG", "0") == "1"
-
-# ===== Strategy debug (Step11) =====
-STRATEGY_DEBUG = _os.getenv('STRATEGY_DEBUG', '1') == '1'
-
-# ===== Live preload history (Step11.1) =====
-PRELOAD_HISTORY = _os.getenv('PRELOAD_HISTORY', '1') == '1'
-PRELOAD_15M_LIMIT = int(_os.getenv('PRELOAD_15M_LIMIT', '500'))
-PRELOAD_1H_LIMIT  = int(_os.getenv('PRELOAD_1H_LIMIT', '200'))
-
+# ===== Live preload history =====
+PRELOAD_HISTORY = _env_bool('PRELOAD_HISTORY', True)
+PRELOAD_15M_LIMIT = _env_int('PRELOAD_15M_LIMIT', 500)
+PRELOAD_1H_LIMIT  = _env_int('PRELOAD_1H_LIMIT', 200)
 
 # ===== Step 6. Улучшенное сопровождение позиции =====
 # Цель: стабильнее забирать импульс и меньше отдавать накопленную прибыль назад.
@@ -903,7 +841,6 @@ POSITION_BE_MIN_PROGRESS_AFTER_TP1_ATR_RANGE = 0.10
 BACKTEST_INTRABAR_EXIT_ORDER = "conservative"
 BACKTEST_SLIPPAGE_BPS = 1.0
 BACKTEST_APPLY_SLIPPAGE = True
-
 
 # ===== Continuation / trade-type params =====
 CONTINUATION_ALLOW_IN_TRANSITION = False
@@ -948,7 +885,6 @@ CONT_COMP_MIN_HTF_ADX = 18.0
 CONT_COMP_TOUCH_ATR = 0.45
 CONT_COMP_BREAK_PREV_FACTOR = 0.15
 
-
 # ===== v12 regime-based exit profiles =====
 # trend profile keeps v11 style runners; range/transition exits faster.
 POSITION_TP1_ATR_MULT_TREND = 8.8
@@ -986,7 +922,6 @@ POSITION_INITIAL_SL_ATR_MULT = ATR_SL_MULT
 POSITION_INITIAL_SL_ATR_MULT_TREND = ATR_SL_MULT
 POSITION_TIME_STOP_BEFORE_TP1_BARS = 0
 POSITION_TIME_STOP_BEFORE_TP1_BARS_TREND = 0
-
 
 # ===== Stage 6: BTC/ETH scaling + alt mean reversion =====
 # Усиливаем directional-сетапы на BTC/ETH через risk scaling,
@@ -1132,8 +1067,6 @@ PULLBACK_RECENT_BODY_ATR_MIN = 0.22
 PULLBACK_RECENT_BODY_ATR_MIN_SHORT = 0.26
 
 # ===== v5.3 final controls =====
-V53_ETH_MR_RISK_MULTIPLIER = 0.25
-V53_MR_ALLOWED_STATES_CORE = ["range"]
 
 # === V5.4 FINAL FIX ===
 V54_ETH_MR_ONLY = False
@@ -1182,7 +1115,6 @@ V80_ALT_STRONG_MIN_ADX = 24.0
 V80_ALT_STRONG_LONG_MIN_RS_RATIO = 1.03
 V80_ALT_STRONG_SHORT_MAX_RS_RATIO = 0.97
 
-
 V81_SHORT_RISK_ENABLED = True
 V81_SHORT_RISK_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 V81_SHORT_RISK_ALLOWED_TYPES = ["impulse", "continuation", "cont_compression", "pullback"]
@@ -1194,7 +1126,6 @@ V81_SHORT_WEAK_IMPULSE_MULT = 0.88
 V81_SHORT_BAD_MARKET_STATES = ["chop", "flat", "range"]
 V81_SHORT_REQUIRE_BEAR_REGIME = True
 
-
 # v8.1.3 execution-layer global short risk reduction
 V813_GLOBAL_SHORT_RISK_ENABLED = True
 V813_GLOBAL_SHORT_BASE_MULT = 1.0
@@ -1203,14 +1134,7 @@ V813_GLOBAL_SHORT_WEAK_SETUP_MULT = 0.90
 V813_GLOBAL_SHORT_BAD_MARKET_STATES = ["chop", "flat", "range"]
 V813_GLOBAL_SHORT_REQUIRE_BEAR_REGIME = True
 
-
 # disable legacy duplicated execution-layer short haircut
-V812_GLOBAL_SHORT_RISK_ENABLED = False
-V812_GLOBAL_SHORT_BASE_MULT = 1.0
-V812_GLOBAL_SHORT_BAD_MARKET_MULT = 1.0
-V812_GLOBAL_SHORT_WEAK_SETUP_MULT = 1.0
-V812_GLOBAL_SHORT_BAD_MARKET_STATES = ["chop", "flat", "range"]
-V812_GLOBAL_SHORT_REQUIRE_BEAR_REGIME = True
 
 # === v8.3 selective short suppression ===
 V83_SHORT_SUPPRESSION_ENABLED = True
@@ -1228,7 +1152,6 @@ V83_SHORT_REQUIRE_STRONG_SETUP_TYPES = ["impulse", "continuation", "cont_compres
 
 V831_SHORT_BAD_GATE_FRAGMENTS = ["transition", "regime_mismatch", "non_directional", "blocked"]
 V831_SHORT_MIN_REASON_COUNT = 1
-
 
 # v8.5 inline short suppression
 V85_INLINE_SHORT_SUPPRESSION_ENABLED = True
@@ -1265,13 +1188,11 @@ V86_LONG_REQUIRE_STRONG_SETUP = False
 V86_LONG_REQUIRE_STRONG_SETUP_TYPES = ["continuation", "cont_compression"]
 V86_LONG_MIN_REASON_COUNT = 3
 
-
 # ALT trace logging
 ALT_TRACE_BUILD_ENABLED = True
 ALT_TRACE_STDOUT_ENABLED = False
 ALT_TRACE_FILE_ENABLED = True
 ALT_TRACE_FILE_PATH = "alt_trace_only.txt"
-ALT_TRACE_INCLUDE_EARLY_RETURNS = True
 ALT_TRACE_RESET_FILE_ON_START = True
 ALT_TRACE_SYMBOLS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]
 
@@ -1286,7 +1207,6 @@ ALT_NEAR_TRIGGER_ALLOW = True
 ALT_ENTRY_TRIGGER_TOLERANCE_PCT = 0.0035
 ALT_ENTRY_RSI_PAD = 6.0
 ALT_NEAR_TRIGGER_RISK_MULT = 0.80
-ALT_NEAR_TRIGGER_SYMBOLS = ["SOLUSDT", "BNBUSDT", "AVAXUSDT"]
 # v2.8 final alt entry execution fix
 ALT_FINAL_ENTRY_EXECUTION_ALLOW = True
 ALT_FINAL_ENTRY_EXECUTION_SYMBOLS = ["SOLUSDT", "BNBUSDT", "AVAXUSDT"]
