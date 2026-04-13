@@ -29,6 +29,7 @@ from broker_futures import LiveFuturesBroker
 from binance_ws_manager import BinanceWSManager
 from strategy import signal_from_indicators
 from execution_policy import compute_trade_risk_multiplier
+from position_sizing_engine import compute_position_sizing_risk_pct
 from strategies import get_active_strategy
 from risk import RiskManager
 from position import PositionState
@@ -228,7 +229,7 @@ class LiveRunner:
         return df_15_idx
 
     def _count_same_side_alt_positions(self, side: str) -> int:
-        alt_symbols = set(getattr(config, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+        alt_symbols = set(getattr(config, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT"]) or [])
         return sum(1 for sym, pos in self._positions.items() if pos is not None and sym in alt_symbols and pos.side == side)
 
     def _symbol_risk_multiplier(self, symbol: str) -> float:
@@ -527,7 +528,7 @@ class LiveRunner:
                 return
 
         btc_regime_cap = int(getattr(config, "BTC_REGIME_MAX_SAME_SIDE_ALT_POSITIONS", 0) or 0)
-        alt_symbols = set(getattr(config, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+        alt_symbols = set(getattr(config, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT"]) or [])
         if btc_regime_cap > 0 and symbol in alt_symbols:
             same_side_alt_count = self._count_same_side_alt_positions(side)
             if same_side_alt_count >= btc_regime_cap:
@@ -567,11 +568,27 @@ class LiveRunner:
             return
         risk_multiplier = self._symbol_risk_multiplier(symbol)
         eff_risk_per_trade = risk_per_trade * risk_multiplier * trade_risk_mult
+        try:
+            peak_val = float(self.state.data.get("equity_peak") or equity or 0.0)
+        except Exception:
+            peak_val = float(equity or 0.0)
+        try:
+            sized_risk_per_trade, _v25_flags = compute_position_sizing_risk_pct(
+                cfg=config,
+                sig_meta=sig_meta,
+                symbol=symbol,
+                side=side,
+                base_risk_per_trade=eff_risk_per_trade,
+                equity=equity,
+                equity_peak=peak_val,
+            )
+        except Exception:
+            sized_risk_per_trade = eff_risk_per_trade
         notional, qty = self._risk.calc_futures_size_from_risk(
             equity=equity,
             price=price,
             stop_distance_pct=stop_distance_pct,
-            risk_per_trade=eff_risk_per_trade,
+            risk_per_trade=sized_risk_per_trade,
             leverage=leverage,
         )
         if notional <= 0 or qty <= 0:

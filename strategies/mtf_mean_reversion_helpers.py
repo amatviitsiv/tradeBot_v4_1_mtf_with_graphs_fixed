@@ -2,7 +2,7 @@ import pandas as pd
 
 
 def is_mean_reversion_symbol(*, cfg, symbol: str) -> bool:
-    symbols = set(getattr(cfg, "V52_MR_SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+    symbols = set(getattr(cfg, "V52_MR_SYMBOLS", ["BTCUSDT", "ETHUSDT"]) or [])
     return bool(symbol and symbol in symbols)
 
 

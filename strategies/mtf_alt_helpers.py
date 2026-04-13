@@ -3,7 +3,7 @@ import config as cfg
 
 def _is_alt_symbol(self, symbol: str) -> bool:
     btc_symbol = str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
-    alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+    alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT"]) or [])
     return bool(symbol and symbol != btc_symbol and symbol in alt_symbols)
 
 

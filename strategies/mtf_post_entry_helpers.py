@@ -84,12 +84,38 @@ def apply_standard_long_risk_stack(
         strong_setup=strong_setup,
         regime_gate_meta=regime_gate_meta,
     )
+    risk_mult, v21_flags = strategy._apply_v21_regime_aware_adjustment(
+        symbol=symbol,
+        side="long",
+        trade_type=trade_type,
+        base_risk_multiplier=risk_mult,
+        market_state=market_state,
+        regime=regime,
+        adx_h=adx_h,
+        drift=drift,
+        volume_meta=volume_meta,
+        strong_setup=strong_setup,
+    )
+    risk_mult, v24_flags = strategy._apply_v24_profit_engine_adjustment(
+        symbol=symbol,
+        side="long",
+        trade_type=trade_type,
+        base_risk_multiplier=risk_mult,
+        market_state=market_state,
+        regime=regime,
+        adx_h=adx_h,
+        drift=drift,
+        volume_meta=volume_meta,
+        strong_setup=strong_setup,
+    )
     return risk_mult, {
         **(setup_flags or {}),
         **(alt_risk_flags or {}),
         **(v7_flags or {}),
         **(v78_flags or {}),
         **(v80_alt_flags or {}),
+        **(v21_flags or {}),
+        **(v24_flags or {}),
     }
 
 

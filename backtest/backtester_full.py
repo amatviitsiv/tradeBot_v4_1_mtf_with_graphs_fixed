@@ -13,6 +13,7 @@ import config as cfg
 from indicators import compute_indicators
 from strategy import signal_from_indicators
 from execution_policy import compute_trade_risk_multiplier
+from position_sizing_engine import compute_position_sizing_risk_pct
 from strategies import get_active_strategy
 from risk import RiskManager
 from position import PositionState as Position
@@ -142,7 +143,7 @@ class Backtester:
         return out
 
     def _count_same_side_alt_positions(self, positions: Dict[str, Optional[Position]], side: str) -> int:
-        alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+        alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT"]) or [])
         return sum(1 for sym, pos in positions.items() if pos is not None and sym in alt_symbols and pos.side == side)
 
     def _symbol_risk_multiplier(self, sym: str) -> float:
@@ -328,6 +329,7 @@ class Backtester:
         stop_loss_streaks: Dict[str, Dict[str, int]] = {s: {"long": 0, "short": 0} for s in symbols}
         balance = self.initial_balance
         equity_curve = []
+        equity_peak = float(self.initial_balance)
 
         risk_per_trade = float(getattr(cfg, "RISK_PER_TRADE", 0.01))
         leverage = int(getattr(cfg, "FUTURES_LEVERAGE_DEFAULT", 5))
@@ -391,6 +393,7 @@ class Backtester:
                     pnl = (pos.entry_price - price) * pos.qty
                 equity += pnl
             equity_curve.append(equity)
+            equity_peak = max(equity_peak, float(equity))
 
             with open("equity_curve.csv", "a") as f:
                 f.write(f"{equity}\n")
@@ -536,7 +539,7 @@ class Backtester:
                 atr_sl_mult = float(cfg.get_symbol_param(sym, "ATR_SL_MULT", getattr(cfg, "ATR_SL_MULT", 4.0)))
 
                 btc_regime_cap = int(getattr(cfg, "BTC_REGIME_MAX_SAME_SIDE_ALT_POSITIONS", 0) or 0)
-                alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT"]) or [])
+                alt_symbols = set(getattr(cfg, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT"]) or [])
                 if btc_regime_cap > 0 and sym in alt_symbols:
                     same_side_alt_count = self._count_same_side_alt_positions(positions, side)
                     if same_side_alt_count >= btc_regime_cap:
@@ -566,11 +569,23 @@ class Backtester:
                 except Exception:
                     trade_risk_mult = 1.0
                 eff_risk_per_trade = risk_per_trade * risk_multiplier * trade_risk_mult
+                try:
+                    sized_risk_per_trade, _v25_flags = compute_position_sizing_risk_pct(
+                        cfg=cfg,
+                        sig_meta=sig_meta,
+                        symbol=sym,
+                        side=side,
+                        base_risk_per_trade=eff_risk_per_trade,
+                        equity=equity,
+                        equity_peak=equity_peak,
+                    )
+                except Exception:
+                    sized_risk_per_trade = eff_risk_per_trade
                 notional, qty = self.risk.calc_futures_size_from_risk(
                     equity=equity,
                     price=price,
                     stop_distance_pct=stop_distance_pct,
-                    risk_per_trade=eff_risk_per_trade,
+                    risk_per_trade=sized_risk_per_trade,
                     leverage=leverage,
                 )
                 if notional <= 0 or qty <= 0:
@@ -826,8 +841,6 @@ def run_yearly_batch_backtests(project_root: Optional[str] = None, out_filename:
     ]
     symbol_groups = [
         ["BTCUSDT"],
-        ["BTCUSDT", "ETHUSDT"],
-        ["SOLUSDT", "BNBUSDT", "AVAXUSDT"],
     ]
 
     output_path = os.path.join(project_root, out_filename)

@@ -236,3 +236,126 @@ def _apply_directional_setup_scaling(self, symbol: str, base_risk_multiplier: fl
             flags["v6_boost_mult"] = boost
 
     return risk_mult, flags
+
+
+def _apply_v21_regime_aware_adjustment(self, symbol: str, side: str, trade_type: str, base_risk_multiplier: float, market_state: str = "", regime: str = "", adx_h: float = 0.0, drift: float = 0.0, volume_meta: dict | None = None, strong_setup: bool = False) -> tuple[float, dict]:
+    flags = {"v21_regime_adjustment_applied": False}
+    risk_mult = float(base_risk_multiplier)
+    if not bool(getattr(cfg, "V21_REGIME_AWARE_ENABLED", True)):
+        return risk_mult, flags
+    allowed_symbols = set(getattr(cfg, "V21_REGIME_AWARE_SYMBOLS", ["BTCUSDT", "ETHUSDT"]) or ["BTCUSDT", "ETHUSDT"])
+    if symbol not in allowed_symbols:
+        return risk_mult, flags
+    allowed_types = {str(v).lower() for v in (getattr(cfg, "V21_REGIME_AWARE_TYPES", ["impulse", "continuation"]) or ["impulse", "continuation"])}
+    trade_type = str(trade_type or "").lower()
+    if trade_type not in allowed_types or str(side or "").lower() != "long":
+        return risk_mult, flags
+
+    market_state = str(market_state or "").lower()
+    regime = str(regime or "").lower()
+    impulse_score = float((volume_meta or {}).get("impulse_score", 0.0) or 0.0)
+
+    # Strong-trend upside: reward only clean BTC/ETH long momentum, without touching weak regimes.
+    if market_state == "trend" and regime == "bull":
+        if symbol == "BTCUSDT":
+            boost_adx = float(cfg.get_symbol_param_float(symbol, "V21_BTC_BOOST_MIN_ADX", float(getattr(cfg, "V21_BTC_BOOST_MIN_ADX", 28.0))))
+            boost_drift = float(cfg.get_symbol_param_float(symbol, "V21_BTC_BOOST_MIN_DRIFT_PCT", float(getattr(cfg, "V21_BTC_BOOST_MIN_DRIFT_PCT", 0.0078))))
+            boost_impulse = float(cfg.get_symbol_param_float(symbol, "V21_BTC_BOOST_MIN_IMPULSE", float(getattr(cfg, "V21_BTC_BOOST_MIN_IMPULSE", 0.92))))
+            if float(adx_h) >= boost_adx and float(drift) >= boost_drift and impulse_score >= boost_impulse and bool(strong_setup):
+                mult = float(cfg.get_symbol_param_float(symbol, "V21_BTC_IMPULSE_BOOST_MULT", float(getattr(cfg, "V21_BTC_IMPULSE_BOOST_MULT", 1.08)))) if trade_type == "impulse" else float(cfg.get_symbol_param_float(symbol, "V21_BTC_CONT_BOOST_MULT", float(getattr(cfg, "V21_BTC_CONT_BOOST_MULT", 1.04))))
+                risk_mult *= mult
+                flags.update({"v21_regime_adjustment_applied": True, "v21_regime_adjustment_type": "strong_trend_boost", "v21_regime_adjustment_mult": mult})
+                return risk_mult, flags
+        elif symbol == "ETHUSDT":
+            boost_adx = float(cfg.get_symbol_param_float(symbol, "V21_ETH_BOOST_MIN_ADX", float(getattr(cfg, "V21_ETH_BOOST_MIN_ADX", 24.0))))
+            boost_drift = float(cfg.get_symbol_param_float(symbol, "V21_ETH_BOOST_MIN_DRIFT_PCT", float(getattr(cfg, "V21_ETH_BOOST_MIN_DRIFT_PCT", 0.0058))))
+            if float(adx_h) >= boost_adx and float(drift) >= boost_drift and impulse_score >= 0.90 and bool(strong_setup):
+                mult = float(cfg.get_symbol_param_float(symbol, "V21_ETH_TREND_BOOST_MULT", float(getattr(cfg, "V21_ETH_TREND_BOOST_MULT", 1.02))))
+                risk_mult *= mult
+                flags.update({"v21_regime_adjustment_applied": True, "v21_regime_adjustment_type": "eth_trend_boost", "v21_regime_adjustment_mult": mult})
+                return risk_mult, flags
+
+    # Mid/weak regime protection: keep trading but size down instead of overcommitting.
+    if market_state in {"transition", "range", "chop", "flat"} or regime in {"bear", "sideways"}:
+        if symbol == "BTCUSDT":
+            mult = float(cfg.get_symbol_param_float(symbol, "V21_BTC_TRANSITION_CONT_MULT", float(getattr(cfg, "V21_BTC_TRANSITION_CONT_MULT", 0.88)))) if trade_type == "continuation" else float(cfg.get_symbol_param_float(symbol, "V21_BTC_TRANSITION_IMPULSE_MULT", float(getattr(cfg, "V21_BTC_TRANSITION_IMPULSE_MULT", 0.94))))
+        else:
+            mult = float(cfg.get_symbol_param_float(symbol, "V21_ETH_WEAK_REGIME_MULT", float(getattr(cfg, "V21_ETH_WEAK_REGIME_MULT", 0.84))))
+        risk_mult *= mult
+        flags.update({"v21_regime_adjustment_applied": True, "v21_regime_adjustment_type": "weak_regime_haircut", "v21_regime_adjustment_mult": mult})
+        return risk_mult, flags
+
+    # Trend but not clean enough: protect weak years by reducing borderline continuation.
+    if market_state == "trend" and regime == "bull":
+        if symbol == "BTCUSDT" and trade_type == "continuation":
+            soft_adx = float(cfg.get_symbol_param_float(symbol, "V21_BTC_CONT_SOFT_MIN_ADX", float(getattr(cfg, "V21_BTC_CONT_SOFT_MIN_ADX", 24.0))))
+            soft_drift = float(cfg.get_symbol_param_float(symbol, "V21_BTC_CONT_SOFT_MIN_DRIFT_PCT", float(getattr(cfg, "V21_BTC_CONT_SOFT_MIN_DRIFT_PCT", 0.0062))))
+            if float(adx_h) < soft_adx or float(drift) < soft_drift or impulse_score < 0.86:
+                mult = float(cfg.get_symbol_param_float(symbol, "V21_BTC_CONT_SOFT_HAIRCUT", float(getattr(cfg, "V21_BTC_CONT_SOFT_HAIRCUT", 0.90))))
+                risk_mult *= mult
+                flags.update({"v21_regime_adjustment_applied": True, "v21_regime_adjustment_type": "btc_cont_soft_haircut", "v21_regime_adjustment_mult": mult})
+                return risk_mult, flags
+        if symbol == "ETHUSDT":
+            soft_adx = float(cfg.get_symbol_param_float(symbol, "V21_ETH_SOFT_MIN_ADX", float(getattr(cfg, "V21_ETH_SOFT_MIN_ADX", 22.5))))
+            soft_drift = float(cfg.get_symbol_param_float(symbol, "V21_ETH_SOFT_MIN_DRIFT_PCT", float(getattr(cfg, "V21_ETH_SOFT_MIN_DRIFT_PCT", 0.0054))))
+            if float(adx_h) < soft_adx or float(drift) < soft_drift or not bool(strong_setup):
+                mult = float(cfg.get_symbol_param_float(symbol, "V21_ETH_SOFT_HAIRCUT", float(getattr(cfg, "V21_ETH_SOFT_HAIRCUT", 0.90))))
+                risk_mult *= mult
+                flags.update({"v21_regime_adjustment_applied": True, "v21_regime_adjustment_type": "eth_soft_haircut", "v21_regime_adjustment_mult": mult})
+                return risk_mult, flags
+
+    return risk_mult, flags
+
+
+def _apply_v24_profit_engine_adjustment(self, symbol: str, side: str, trade_type: str, base_risk_multiplier: float, market_state: str = "", regime: str = "", adx_h: float = 0.0, drift: float = 0.0, volume_meta: dict | None = None, strong_setup: bool = False) -> tuple[float, dict]:
+    flags = {"v24_profit_engine_applied": False}
+    risk_mult = float(base_risk_multiplier)
+    if not bool(getattr(cfg, "V24_PROFIT_ENGINE_ENABLED", True)):
+        return risk_mult, flags
+    allowed_symbols = set(getattr(cfg, "V24_PROFIT_ENGINE_SYMBOLS", ["BTCUSDT"]) or ["BTCUSDT"])
+    if symbol not in allowed_symbols:
+        return risk_mult, flags
+    if str(side or "").lower() != "long":
+        return risk_mult, flags
+    allowed_types = {str(v).lower() for v in (getattr(cfg, "V24_PROFIT_ENGINE_TYPES", ["impulse", "continuation"]) or ["impulse", "continuation"])}
+    trade_type = str(trade_type or "").lower()
+    if trade_type not in allowed_types:
+        return risk_mult, flags
+
+    market_state = str(market_state or "").lower()
+    regime = str(regime or "").lower()
+    impulse_score = float((volume_meta or {}).get("impulse_score", 0.0) or 0.0)
+
+    strong_state = market_state == "trend" and regime == "bull"
+    very_strong_adx = float(cfg.get_symbol_param_float(symbol, "V24_VERY_STRONG_MIN_ADX", float(getattr(cfg, "V24_VERY_STRONG_MIN_ADX", 30.0))))
+    very_strong_drift = float(cfg.get_symbol_param_float(symbol, "V24_VERY_STRONG_MIN_DRIFT_PCT", float(getattr(cfg, "V24_VERY_STRONG_MIN_DRIFT_PCT", 0.0082))))
+    very_strong_impulse = float(cfg.get_symbol_param_float(symbol, "V24_VERY_STRONG_MIN_IMPULSE", float(getattr(cfg, "V24_VERY_STRONG_MIN_IMPULSE", 0.96))))
+    strong_adx = float(cfg.get_symbol_param_float(symbol, "V24_STRONG_MIN_ADX", float(getattr(cfg, "V24_STRONG_MIN_ADX", 27.0))))
+    strong_drift = float(cfg.get_symbol_param_float(symbol, "V24_STRONG_MIN_DRIFT_PCT", float(getattr(cfg, "V24_STRONG_MIN_DRIFT_PCT", 0.0070))))
+    strong_impulse = float(cfg.get_symbol_param_float(symbol, "V24_STRONG_MIN_IMPULSE", float(getattr(cfg, "V24_STRONG_MIN_IMPULSE", 0.86))))
+
+    if strong_state and bool(strong_setup):
+        if float(adx_h) >= very_strong_adx and float(drift) >= very_strong_drift and impulse_score >= very_strong_impulse:
+            mult = float(cfg.get_symbol_param_float(symbol, "V24_VERY_STRONG_MULT", float(getattr(cfg, "V24_VERY_STRONG_MULT", 1.12))))
+            if trade_type == "continuation":
+                mult = min(mult, float(cfg.get_symbol_param_float(symbol, "V24_CONT_CAP_MULT", float(getattr(cfg, "V24_CONT_CAP_MULT", 1.08)))))
+            risk_mult *= mult
+            flags.update({"v24_profit_engine_applied": True, "v24_profit_engine_type": "very_strong_boost", "v24_profit_engine_mult": mult})
+            return risk_mult, flags
+        if float(adx_h) >= strong_adx and float(drift) >= strong_drift and impulse_score >= strong_impulse:
+            mult = float(cfg.get_symbol_param_float(symbol, "V24_STRONG_MULT", float(getattr(cfg, "V24_STRONG_MULT", 1.06))))
+            if trade_type == "continuation":
+                mult = min(mult, float(cfg.get_symbol_param_float(symbol, "V24_CONT_CAP_MULT", float(getattr(cfg, "V24_CONT_CAP_MULT", 1.08)))))
+            risk_mult *= mult
+            flags.update({"v24_profit_engine_applied": True, "v24_profit_engine_type": "strong_boost", "v24_profit_engine_mult": mult})
+            return risk_mult, flags
+
+    if trade_type == "continuation":
+        weak_adx = float(cfg.get_symbol_param_float(symbol, "V24_WEAK_CONT_MAX_ADX", float(getattr(cfg, "V24_WEAK_CONT_MAX_ADX", 23.0))))
+        weak_drift = float(cfg.get_symbol_param_float(symbol, "V24_WEAK_CONT_MAX_DRIFT_PCT", float(getattr(cfg, "V24_WEAK_CONT_MAX_DRIFT_PCT", 0.0058))))
+        weak_impulse = float(cfg.get_symbol_param_float(symbol, "V24_WEAK_CONT_MAX_IMPULSE", float(getattr(cfg, "V24_WEAK_CONT_MAX_IMPULSE", 0.78))))
+        if market_state != "trend" or regime != "bull" or float(adx_h) <= weak_adx or float(drift) <= weak_drift or impulse_score <= weak_impulse or not bool(strong_setup):
+            mult = float(cfg.get_symbol_param_float(symbol, "V24_WEAK_CONT_HAIRCUT", float(getattr(cfg, "V24_WEAK_CONT_HAIRCUT", 0.92))))
+            risk_mult *= mult
+            flags.update({"v24_profit_engine_applied": True, "v24_profit_engine_type": "weak_cont_haircut", "v24_profit_engine_mult": mult})
+    return risk_mult, flags
