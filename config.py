@@ -41,8 +41,8 @@ STRATEGY_NAME = "mtf_breakout"
 FUTURES_SYMBOLS = ["BTCUSDT"]
 
 # Совместимые legacy-алиасы для старых мест кода.
-BINANCE_API_KEY = _env_str("BINANCE_API_KEY")
-BINANCE_API_SECRET = _env_str("BINANCE_API_SECRET")
+BINANCE_API_KEY = "cOzVm76AAqWwFe6vvHcoZ2wB1mNhJg01DJ9GpA5ZXq12nBpGmsJdwMoXTyRVA9Hw"
+BINANCE_API_SECRET = "O4o0oORj7wloy6DfeuWbcOVUy9SfV8z94gSyBQF63kHyQkPPJDXlZqYmuKwmKcfX"
 API_KEY = BINANCE_API_KEY
 API_SECRET = BINANCE_API_SECRET
 # ===== СПИСОК ПАР ДЛЯ ТОРГОВЛИ =====
@@ -757,8 +757,8 @@ STRATEGY_VERSION = _env_str("STRATEGY_VERSION", "mtf_breakout_regime_range_v1")
 # ===== Telegram-уведомления =====
 # Если TELEGRAM_ENABLED=1 и заданы токен и chat_id, бот будет слать уведомления.
 TELEGRAM_ENABLED = _env_bool("TELEGRAM_ENABLED", True)
-TELEGRAM_BOT_TOKEN = _env_str("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = _env_str("TELEGRAM_CHAT_ID")
+TELEGRAM_BOT_TOKEN = "8269222363:AAF6vM7-ydXHJjBiq42MDK4jWn5sYbIub7w"
+TELEGRAM_CHAT_ID = "351630680"
 
 # ===== Protective layer (Step9) =====
 # Жёсткий лимит по просадке от пика equity (0 = выключено)
