@@ -70,6 +70,8 @@ def check_v52_mean_reversion_entry(*, cfg, symbol: str, market_state: str, recen
     close_pos = (close - low) / candle_range
     upper_wick_ratio = max(0.0, high - max(open_, close)) / candle_range
     lower_wick_ratio = max(0.0, min(open_, close) - low) / candle_range
+    body_atr = abs(close - open_) / max(atr_ltf, 1e-9)
+    progress_from_low_atr = max(close - low, 0.0) / max(atr_ltf, 1e-9)
     vol_ma = float(vols.mean()) if len(vols) else volume
     vol_ratio = (volume / vol_ma) if vol_ma > 0 else 1.0
     htf_spread_pct = abs(htf_ema20 - htf_ema50) / close
@@ -102,7 +104,18 @@ def check_v52_mean_reversion_entry(*, cfg, symbol: str, market_state: str, recen
     short_extreme = (zscore >= z_thresh and (close >= bb_upper or dev_atr >= dev_thresh))
     long_reversal = close_pos >= min_close_pos_long or lower_wick_ratio >= min_reject_wick
     short_reversal = close_pos <= max_close_pos_short or upper_wick_ratio >= min_reject_wick
-    long_ok = long_extreme and rsi <= long_rsi_max and vol_ratio >= min_vol_ratio and long_reversal
+
+    anti_knife_enabled = bool(getattr(cfg, "BTC_MR_ANTI_KNIFE_ENABLED", True)) if symbol == "BTCUSDT" else False
+    anti_knife_require_green = bool(getattr(cfg, "BTC_MR_ANTI_KNIFE_REQUIRE_GREEN_CANDLE", True))
+    anti_knife_max_body_atr = float(getattr(cfg, "BTC_MR_ANTI_KNIFE_MAX_BODY_ATR", 0.95))
+    anti_knife_max_neg_progress_atr = float(getattr(cfg, "BTC_MR_ANTI_KNIFE_MAX_NEG_PROGRESS_ATR", 0.55))
+    anti_knife_ok = True
+    if anti_knife_enabled:
+        anti_knife_ok = body_atr <= anti_knife_max_body_atr and progress_from_low_atr <= anti_knife_max_neg_progress_atr
+        if anti_knife_require_green and close < open_:
+            anti_knife_ok = False
+
+    long_ok = long_extreme and rsi <= long_rsi_max and vol_ratio >= min_vol_ratio and long_reversal and anti_knife_ok
     short_ok = allow_short and short_extreme and rsi >= short_rsi_min and vol_ratio >= min_vol_ratio and short_reversal
 
     meta = {
@@ -118,6 +131,9 @@ def check_v52_mean_reversion_entry(*, cfg, symbol: str, market_state: str, recen
         "htf_rsi": htf_rsi,
         "htf_spread_pct": htf_spread_pct,
         "is_core": is_core,
+        "body_atr": body_atr,
+        "progress_from_low_atr": progress_from_low_atr,
+        "anti_knife_ok": anti_knife_ok,
     }
     if long_ok:
         return "buy", {**meta, "reason": "controlled_mean_reversion_long"}

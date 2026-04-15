@@ -45,6 +45,22 @@ def _profile_cfg_float(base_name: str, default: float, pos=None, symbol: str = "
     return _cfg_float(base_name, default, symbol)
 
 
+
+
+def _is_btc_stage7_strong_trend_pos(pos=None, symbol: str = "") -> bool:
+    if pos is None:
+        return False
+    symbol = symbol or getattr(pos, "symbol", "")
+    if symbol != "BTCUSDT":
+        return False
+    if not bool(_cfg_float("BTC_STAGE7_STRONG_EXIT_ENABLED", 0.0, symbol)):
+        return False
+    if not bool(getattr(pos, "strong_setup", False)):
+        return False
+    allowed = cfg.get_symbol_param(symbol, "BTC_STAGE7_STRONG_TRADE_TYPES", getattr(cfg, "BTC_STAGE7_STRONG_TRADE_TYPES", [])) or []
+    allowed = {str(v).lower() for v in allowed}
+    return str(getattr(pos, "trade_type", "") or "").lower() in allowed
+
 def calc_tp1_price(entry_price: float, atr: float, side: str, symbol: str = "", pos=None) -> float:
     tp1_mult = _profile_cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0, symbol), pos, symbol)
     if side == "long":
@@ -151,6 +167,38 @@ def should_take_tp1(pos, price: float) -> bool:
     return pos.tp1 is not None and ((pos.side == "long" and price >= pos.tp1) or (pos.side == "short" and price <= pos.tp1))
 
 
+def maybe_apply_profit_lock(pos, price: float, atr: float) -> bool:
+    if atr <= 0:
+        return False
+    symbol = getattr(pos, "symbol", "")
+    only_after_tp1 = bool(getattr(cfg, "POSITION_PROFIT_LOCK_ONLY_AFTER_TP1", False)) or bool(_cfg_float("POSITION_PROFIT_LOCK_ONLY_AFTER_TP1", 0.0, symbol))
+    if only_after_tp1 and not getattr(pos, "tp1_hit", False):
+        return False
+    trigger_atr = _profile_cfg_float("POSITION_PROFIT_LOCK_TRIGGER_ATR", 0.0, pos, symbol)
+    lock_atr = _profile_cfg_float("POSITION_PROFIT_LOCK_ATR", 0.0, pos, symbol)
+    if _is_btc_stage7_strong_trend_pos(pos, symbol):
+        trigger_atr += _cfg_float("BTC_STAGE7_STRONG_EXIT_PROFIT_LOCK_TRIGGER_BONUS_ATR", 0.0, symbol)
+    if trigger_atr <= 0 or lock_atr <= 0:
+        return False
+    if pos.side == "long":
+        move_atr = (price - pos.entry_price) / atr
+        if move_atr < trigger_atr:
+            return False
+        lock_stop = pos.entry_price + lock_atr * atr
+        if pos.stop_loss is None or lock_stop > pos.stop_loss:
+            pos.stop_loss = lock_stop
+            return True
+    else:
+        move_atr = (pos.entry_price - price) / atr
+        if move_atr < trigger_atr:
+            return False
+        lock_stop = pos.entry_price - lock_atr * atr
+        if pos.stop_loss is None or lock_stop < pos.stop_loss:
+            pos.stop_loss = lock_stop
+            return True
+    return False
+
+
 def on_tp1_hit(pos, price: float, atr: float) -> None:
     if atr <= 0:
         atr = 0.0
@@ -182,6 +230,8 @@ def maybe_activate_trailing(pos, price: float, atr: float) -> bool:
         if not getattr(pos, "tp1_hit", False):
             return False
     activation_atr = _profile_cfg_float("POSITION_TRAILING_ACTIVATION_ATR", _profile_cfg_float("POSITION_TP1_ATR_MULT", _cfg_float("ATR_TP_MULT_1", 8.0, symbol), pos, symbol), pos, symbol)
+    if _is_btc_stage7_strong_trend_pos(pos, symbol):
+        activation_atr += _cfg_float("BTC_STAGE7_STRONG_EXIT_TRAIL_ACTIVATION_BONUS_ATR", 0.0, symbol)
     if activation_atr <= 0:
         return False
     if getattr(pos, "trail_active", False):
@@ -215,6 +265,8 @@ def update_trailing_stop(pos, atr: float) -> bool:
     symbol = getattr(pos, "symbol", "")
     trail_mult = _profile_cfg_float("POSITION_TRAILING_ATR_MULT", _cfg_float("ATR_TS_MULT", 4.0, symbol), pos, symbol)
     trail_step_atr = _profile_cfg_float("POSITION_TRAILING_STEP_ATR", 0.0, pos, symbol)
+    if _is_btc_stage7_strong_trend_pos(pos, symbol):
+        trail_mult += _cfg_float("BTC_STAGE7_STRONG_EXIT_TRAIL_MULT_BONUS", 0.0, symbol)
     if pos.side == "long":
         candidate = float(peak) - trail_mult * atr
         if pos.stop_loss is not None:
@@ -263,6 +315,70 @@ def mark_tp1_bar(pos, bar_index: int | None) -> None:
         pos.tp1_bar_index = int(bar_index)
     except Exception:
         pass
+
+
+def _bars_since_open(pos, bar_index: int | None) -> int | None:
+    if bar_index is None:
+        return None
+    open_bar_index = getattr(pos, "open_time", None)
+    if open_bar_index is None:
+        return None
+    try:
+        return int(bar_index) - int(float(open_bar_index))
+    except Exception:
+        return None
+
+
+def _move_atr_from_entry(pos, price: float, atr: float) -> float:
+    if atr <= 0:
+        return 0.0
+    if pos.side == "long":
+        return (float(price) - float(pos.entry_price)) / atr
+    return (float(pos.entry_price) - float(price)) / atr
+
+
+def _adverse_move_atr_from_entry(pos, price: float, atr: float) -> float:
+    return max(0.0, -_move_atr_from_entry(pos, price, atr))
+
+
+def should_force_exit_weak_trade(pos, price: float, atr: float, bar_index: int | None) -> bool:
+    if atr <= 0:
+        return False
+    symbol = getattr(pos, "symbol", "")
+    only_before_tp1 = bool(_cfg_float("POSITION_EARLY_EXIT_ONLY_BEFORE_TP1", 1.0, symbol))
+    if only_before_tp1 and getattr(pos, "tp1_hit", False):
+        return False
+    bars_limit = int(_profile_cfg_float("POSITION_EARLY_EXIT_BARS", 0.0, pos, symbol))
+    if _is_btc_stage7_strong_trend_pos(pos, symbol):
+        bars_limit += int(_cfg_float("BTC_STAGE7_STRONG_EXIT_EARLY_EXIT_BARS_BONUS", 0.0, symbol))
+    if bars_limit <= 0:
+        return False
+    age_bars = _bars_since_open(pos, bar_index)
+    if age_bars is None or age_bars < bars_limit:
+        return False
+    min_progress_atr = _profile_cfg_float("POSITION_EARLY_EXIT_MIN_PROGRESS_ATR", 0.0, pos, symbol)
+    if _is_btc_stage7_strong_trend_pos(pos, symbol):
+        min_progress_atr = max(0.0, min_progress_atr - _cfg_float("BTC_STAGE7_STRONG_EXIT_EARLY_EXIT_PROGRESS_RELAX_ATR", 0.0, symbol))
+    return _move_atr_from_entry(pos, price, atr) < min_progress_atr
+
+
+def should_cut_adverse_trade_early(pos, price: float, atr: float) -> bool:
+    if atr <= 0:
+        return False
+    symbol = getattr(pos, "symbol", "")
+    only_before_tp1 = bool(_cfg_float("POSITION_EARLY_CUT_ONLY_BEFORE_TP1", 1.0, symbol))
+    if only_before_tp1 and getattr(pos, "tp1_hit", False):
+        return False
+    adverse_cut_atr = _profile_cfg_float("POSITION_EARLY_CUT_LOSS_ATR", 0.0, pos, symbol)
+    if _is_btc_stage7_strong_trend_pos(pos, symbol):
+        adverse_cut_atr += _cfg_float("BTC_STAGE7_STRONG_EXIT_EARLY_CUT_LOSS_BONUS_ATR", 0.0, symbol)
+    if adverse_cut_atr <= 0:
+        return False
+    max_progress_atr = _profile_cfg_float("POSITION_EARLY_CUT_MAX_PROGRESS_ATR", 0.0, pos, symbol)
+    adverse_move = _adverse_move_atr_from_entry(pos, price, atr)
+    if adverse_move < adverse_cut_atr:
+        return False
+    return _move_atr_from_entry(pos, price, atr) <= max_progress_atr
 
 
 def should_time_stop_before_tp1(pos, bar_index: int | None) -> bool:

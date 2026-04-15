@@ -319,7 +319,8 @@ def check_continuation_entry(symbol: str, df: pd.DataFrame, side: str, atr_ltf: 
     touch_atr = cfg.get_symbol_param_float(symbol, "CONTINUATION_TOUCH_ATR", float(getattr(cfg, "CONTINUATION_TOUCH_ATR", 0.28)))
     body_atr = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_BODY_ATR", float(getattr(cfg, "CONTINUATION_MIN_BODY_ATR", 0.38)))
     close_pos_min = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_CLOSE_POS", float(getattr(cfg, "CONTINUATION_MIN_CLOSE_POS", 0.62)))
-    require_prev_pullback = bool(getattr(cfg, "CONTINUATION_REQUIRE_PREV_PULLBACK", True))
+    require_prev_pullback = cfg.get_symbol_param_float(symbol, "CONTINUATION_REQUIRE_PREV_PULLBACK", float(bool(getattr(cfg, "CONTINUATION_REQUIRE_PREV_PULLBACK", True)))) > 0.5
+    strong_bypass_prev_pullback = cfg.get_symbol_param_float(symbol, "CONTINUATION_STRONG_BYPASS_PREV_PULLBACK", 0.0) > 0.5
     min_htf_adx = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_HTF_ADX", float(getattr(cfg, "CONTINUATION_MIN_HTF_ADX", 21.0)))
     min_vol_ratio = cfg.get_symbol_param_float(symbol, "CONTINUATION_MIN_VOL_RATIO", float(getattr(cfg, "CONTINUATION_MIN_VOL_RATIO", 0.98)))
     soft_rejection = cfg.get_symbol_param_float(symbol, "CONTINUATION_SOFT_REJECTION", 0.0) > 0.5

@@ -85,6 +85,9 @@ def run_v22_nontrend_engine(*, cfg, symbol: str, market_state: str, regime: str,
     # 2) Range reclaim long: small long-only engine for flat/weak bull context.
     if regime != "bull":
         return None, None, 1.0, {"reason": "reclaim_requires_bull", "mr_reason": mr_meta.get("reason") if isinstance(mr_meta, dict) else None}
+    reclaim_allowed_states = set(getattr(cfg, "BTC_RECLAIM_ALLOWED_STATES", ["range", "flat"]) if symbol == "BTCUSDT" else ["range", "transition"])
+    if market_state not in reclaim_allowed_states:
+        return None, None, 1.0, {"reason": "reclaim_state_blocked", "market_state": market_state}
 
     close = _safe_float(candle.get("close"))
     open_ = _safe_float(candle.get("open"), close)
@@ -105,6 +108,7 @@ def run_v22_nontrend_engine(*, cfg, symbol: str, market_state: str, regime: str,
     candle_range = max(high - low, 1e-9)
     body_atr = abs(close - open_) / max(atr_ltf, 1e-9)
     close_pos = (close - low) / candle_range
+    progress_from_low_atr = max(close - low, 0.0) / max(atr_ltf, 1e-9)
     ema_reclaim_pct = (close - ema20) / close
     wickiness = calc_recent_wickiness(recent)
     false_breakout_ratio = calc_false_breakout_ratio(recent, lookback=min(10, max(6, len(recent) // 4)))
@@ -135,6 +139,15 @@ def run_v22_nontrend_engine(*, cfg, symbol: str, market_state: str, regime: str,
     rsi_max = float(getattr(cfg, "V22_RECLAIM_RSI_MAX_BTC", 56.0)) if symbol == "BTCUSDT" else float(getattr(cfg, "V22_RECLAIM_RSI_MAX_ETH", 55.0))
     htf_rsi_min = float(getattr(cfg, "V22_RECLAIM_HTF_RSI_MIN_BTC", 48.0)) if symbol == "BTCUSDT" else float(getattr(cfg, "V22_RECLAIM_HTF_RSI_MIN_ETH", 50.0))
 
+    anti_knife_ok = True
+    if symbol == "BTCUSDT" and bool(getattr(cfg, "BTC_MR_ANTI_KNIFE_ENABLED", True)):
+        anti_knife_max_body_atr = float(getattr(cfg, "BTC_MR_ANTI_KNIFE_MAX_BODY_ATR", 0.95))
+        anti_knife_max_neg_progress_atr = float(getattr(cfg, "BTC_MR_ANTI_KNIFE_MAX_NEG_PROGRESS_ATR", 0.55))
+        anti_knife_require_green = bool(getattr(cfg, "BTC_MR_ANTI_KNIFE_REQUIRE_GREEN_CANDLE", True))
+        anti_knife_ok = body_atr <= anti_knife_max_body_atr and progress_from_low_atr <= anti_knife_max_neg_progress_atr
+        if anti_knife_require_green and close < open_:
+            anti_knife_ok = False
+
     reasons: list[str] = []
     if htf_adx > max_adx:
         reasons.append("adx_too_high")
@@ -156,6 +169,8 @@ def run_v22_nontrend_engine(*, cfg, symbol: str, market_state: str, regime: str,
         reasons.append("rsi_not_balanced")
     if htf_rsi < htf_rsi_min:
         reasons.append("htf_rsi_too_low")
+    if not anti_knife_ok:
+        reasons.append("anti_knife_blocked")
 
     meta = {
         "engine": "v22_reclaim",

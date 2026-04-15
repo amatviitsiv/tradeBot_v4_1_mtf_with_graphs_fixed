@@ -81,6 +81,9 @@ class MTFBreakoutStrategy(BaseStrategy):
         self._trace_file_initialized = False
         self._trace_file_path = None
         self._last_atr_pct_h = 0.0
+        self._current_market_state = "unknown"
+        self._current_adx_h = 0.0
+        self._current_drift = 0.0
         self._maybe_reset_alt_trace_file()
 
     def _apply_directional_setup_scaling(self, symbol: str, base_risk_multiplier: float, adx_h: float, drift: float, volume_meta: dict | None = None, trade_type: str = "", side: str = "", market_state: str = "", trend_quality_meta: dict | None = None) -> tuple[float, dict]:
@@ -160,30 +163,213 @@ class MTFBreakoutStrategy(BaseStrategy):
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(msg + "\n")
 
+    def _should_block_btc_profit_mode_signal(self, signal: Optional[str], trade_type: str | None, meta: dict) -> tuple[bool, str]:
+        symbol = str(meta.get("symbol") or self._current_symbol or "")
+        if signal != "buy" or symbol != "BTCUSDT":
+            return False, ""
+        tt = str(trade_type or "").lower()
+        market_state = str(meta.get("market_state") or getattr(self, "_current_market_state", "unknown") or "unknown").lower()
+        adx_h = float(meta.get("adx_h") or getattr(self, "_current_adx_h", 0.0) or 0.0)
+        drift = float(meta.get("drift") or getattr(self, "_current_drift", 0.0) or 0.0)
+
+        range_engine_enabled = bool(cfg.get_symbol_param_bool(symbol, "BTC_RANGE_ENGINE_ENABLED", bool(getattr(cfg, "BTC_RANGE_ENGINE_ENABLED", False))))
+        range_types = cfg.get_symbol_param(symbol, "BTC_RANGE_ALLOWED_TYPES", getattr(cfg, "BTC_RANGE_ALLOWED_TYPES", [])) or []
+        range_types = {str(x).lower() for x in range_types}
+        if range_engine_enabled and tt in range_types:
+            allowed_states = cfg.get_symbol_param(symbol, "BTC_RANGE_ALLOWED_MARKET_STATES", getattr(cfg, "BTC_RANGE_ALLOWED_MARKET_STATES", [])) or []
+            allowed_states = {str(x).lower() for x in allowed_states}
+            max_adx = float(cfg.get_symbol_param_float(symbol, "BTC_RANGE_MAX_ADX_H", float(getattr(cfg, "BTC_RANGE_MAX_ADX_H", 999.0))))
+            max_drift = float(cfg.get_symbol_param_float(symbol, "BTC_RANGE_MAX_DRIFT_PCT", float(getattr(cfg, "BTC_RANGE_MAX_DRIFT_PCT", 999.0))))
+            if allowed_states and market_state not in allowed_states:
+                return True, f"btc_range_bad_state:{market_state}"
+            if adx_h > max_adx or drift > max_drift:
+                return True, f"btc_range_too_trendy:adx={adx_h:.2f},drift={drift:.5f}"
+            return False, ""
+
+        if not bool(cfg.get_symbol_param_bool(symbol, "BTC_NO_TRADE_FILTER_ENABLED", bool(getattr(cfg, "BTC_NO_TRADE_FILTER_ENABLED", False)))):
+            return False, ""
+        allowed_types = cfg.get_symbol_param(symbol, "BTC_NO_TRADE_ALLOWED_TYPES", getattr(cfg, "BTC_NO_TRADE_ALLOWED_TYPES", [])) or []
+        allowed_types = {str(x).lower() for x in allowed_types}
+        if allowed_types and tt and tt not in allowed_types:
+            return True, f"btc_trade_type_blocked:{tt}"
+        blocked_states = cfg.get_symbol_param(symbol, "BTC_NO_TRADE_BLOCKED_MARKET_STATES", getattr(cfg, "BTC_NO_TRADE_BLOCKED_MARKET_STATES", [])) or []
+        blocked_states = {str(x).lower() for x in blocked_states}
+        if market_state in blocked_states:
+            return True, f"btc_bad_market_state:{market_state}"
+        min_adx = float(cfg.get_symbol_param_float(symbol, "BTC_NO_TRADE_MIN_ADX_H", float(getattr(cfg, "BTC_NO_TRADE_MIN_ADX_H", 0.0))))
+        min_drift = float(cfg.get_symbol_param_float(symbol, "BTC_NO_TRADE_MIN_DRIFT_PCT", float(getattr(cfg, "BTC_NO_TRADE_MIN_DRIFT_PCT", 0.0))))
+        if tt == "continuation":
+            min_adx = float(cfg.get_symbol_param_float(symbol, "BTC_CONTINUATION_NO_TRADE_MIN_ADX_H", float(getattr(cfg, "BTC_CONTINUATION_NO_TRADE_MIN_ADX_H", min_adx))))
+            min_drift = float(cfg.get_symbol_param_float(symbol, "BTC_CONTINUATION_NO_TRADE_MIN_DRIFT_PCT", float(getattr(cfg, "BTC_CONTINUATION_NO_TRADE_MIN_DRIFT_PCT", min_drift))))
+        elif tt == "impulse":
+            min_adx = float(cfg.get_symbol_param_float(symbol, "BTC_IMPULSE_NO_TRADE_MIN_ADX_H", min_adx))
+            min_drift = float(cfg.get_symbol_param_float(symbol, "BTC_IMPULSE_NO_TRADE_MIN_DRIFT_PCT", min_drift))
+            allowed_states = cfg.get_symbol_param(symbol, "BTC_IMPULSE_ALLOWED_MARKET_STATES", getattr(cfg, "BTC_IMPULSE_ALLOWED_MARKET_STATES", ["trend"])) or ["trend"]
+            allowed_states = {str(x).lower() for x in allowed_states}
+            if allowed_states and market_state not in allowed_states:
+                return True, f"btc_impulse_bad_state:{market_state}"
+            if bool(cfg.get_symbol_param_bool(symbol, "BTC_IMPULSE_REQUIRE_STRONG_SETUP", bool(getattr(cfg, "BTC_IMPULSE_REQUIRE_STRONG_SETUP", False)))) and not bool(meta.get("strong_setup", False)):
+                return True, "btc_impulse_requires_strong_setup"
+            impulse_meta = meta.get("impulse_meta") or {}
+            try:
+                imp_atr = max(float(impulse_meta.get("atr", 0.0) or 0.0), 1e-9)
+                body_atr = float(impulse_meta.get("body", 0.0) or 0.0) / imp_atr
+                range_atr = float(impulse_meta.get("range", 0.0) or 0.0) / imp_atr
+                close_pos = float(impulse_meta.get("close_pos", 0.0) or 0.0)
+            except Exception:
+                body_atr = 0.0
+                range_atr = 0.0
+                close_pos = 0.0
+            max_body_atr = float(cfg.get_symbol_param_float(symbol, "BTC_IMPULSE_ANTI_SPIKE_MAX_BODY_ATR", float(getattr(cfg, "BTC_IMPULSE_ANTI_SPIKE_MAX_BODY_ATR", 999.0))))
+            max_range_atr = float(cfg.get_symbol_param_float(symbol, "BTC_IMPULSE_ANTI_SPIKE_MAX_RANGE_ATR", float(getattr(cfg, "BTC_IMPULSE_ANTI_SPIKE_MAX_RANGE_ATR", 999.0))))
+            min_close_pos_imp = float(cfg.get_symbol_param_float(symbol, "BTC_IMPULSE_ANTI_SPIKE_MIN_CLOSE_POS", float(getattr(cfg, "BTC_IMPULSE_ANTI_SPIKE_MIN_CLOSE_POS", 0.0))))
+            if body_atr > max_body_atr or range_atr > max_range_atr or close_pos < min_close_pos_imp:
+                return True, f"btc_impulse_spike:block body_atr={body_atr:.2f},range_atr={range_atr:.2f},close_pos={close_pos:.2f}"
+        elif tt == "pullback":
+            min_adx = float(cfg.get_symbol_param_float(symbol, "BTC_PULLBACK_NO_TRADE_MIN_ADX_H", min_adx))
+            min_drift = float(cfg.get_symbol_param_float(symbol, "BTC_PULLBACK_NO_TRADE_MIN_DRIFT_PCT", min_drift))
+        if adx_h < min_adx or drift < min_drift:
+            return True, f"btc_weak_{tt or 'market'}:adx={adx_h:.2f},drift={drift:.5f}"
+        return False, ""
+
+    def _tune_btc_profit_mode_risk(self, signal: Optional[str], trade_type: str | None, risk_multiplier: float, meta: dict) -> tuple[float, dict]:
+        symbol = str(meta.get("symbol") or self._current_symbol or "")
+        tuned = float(risk_multiplier)
+        flags: dict = {}
+        if signal != "buy" or symbol != "BTCUSDT":
+            return tuned, flags
+        tt = str(trade_type or "").lower()
+        adx_h = float(meta.get("adx_h") or getattr(self, "_current_adx_h", 0.0) or 0.0)
+        drift = float(meta.get("drift") or getattr(self, "_current_drift", 0.0) or 0.0)
+        strong_setup = bool(meta.get("strong_setup", False))
+        strong_types = cfg.get_symbol_param(symbol, "BTC_STAGE7_STRONG_TRADE_TYPES", getattr(cfg, "BTC_STAGE7_STRONG_TRADE_TYPES", [])) or []
+        strong_types = {str(x).lower() for x in strong_types}
+        strong_min_adx = float(cfg.get_symbol_param_float(symbol, "BTC_STAGE7_STRONG_MIN_ADX_H", float(getattr(cfg, "BTC_STAGE7_STRONG_MIN_ADX_H", 0.0))))
+        strong_min_drift = float(cfg.get_symbol_param_float(symbol, "BTC_STAGE7_STRONG_MIN_DRIFT_PCT", float(getattr(cfg, "BTC_STAGE7_STRONG_MIN_DRIFT_PCT", 0.0))))
+        strong_risk_mult = float(cfg.get_symbol_param_float(symbol, "BTC_STAGE7_STRONG_RISK_MULT", float(getattr(cfg, "BTC_STAGE7_STRONG_RISK_MULT", 1.0))))
+        weak_cont_mult = float(cfg.get_symbol_param_float(symbol, "BTC_STAGE7_WEAK_CONTINUATION_RISK_MULT", float(getattr(cfg, "BTC_STAGE7_WEAK_CONTINUATION_RISK_MULT", 1.0))))
+        weak_cont_min_adx = float(cfg.get_symbol_param_float(symbol, "BTC_STAGE7_WEAK_CONT_MIN_ADX_H", float(getattr(cfg, "BTC_STAGE7_WEAK_CONT_MIN_ADX_H", strong_min_adx))))
+        weak_cont_min_drift = float(cfg.get_symbol_param_float(symbol, "BTC_STAGE7_WEAK_CONT_MIN_DRIFT_PCT", float(getattr(cfg, "BTC_STAGE7_WEAK_CONT_MIN_DRIFT_PCT", strong_min_drift))))
+        range_engine_enabled = bool(cfg.get_symbol_param_bool(symbol, "BTC_RANGE_ENGINE_ENABLED", bool(getattr(cfg, "BTC_RANGE_ENGINE_ENABLED", False))))
+        range_types = cfg.get_symbol_param(symbol, "BTC_RANGE_ALLOWED_TYPES", getattr(cfg, "BTC_RANGE_ALLOWED_TYPES", [])) or []
+        range_types = {str(x).lower() for x in range_types}
+        range_risk_mult = float(cfg.get_symbol_param_float(symbol, "BTC_RANGE_RISK_MULT", float(getattr(cfg, "BTC_RANGE_RISK_MULT", 1.0))))
+        if range_engine_enabled and tt in range_types:
+            tuned *= range_risk_mult
+            flags.update({"btc_stage8_range_engine": True, "btc_stage8_range_risk_mult": range_risk_mult, "btc_stage7_tier": "range_engine"})
+        elif tt in strong_types and strong_setup and adx_h >= strong_min_adx and drift >= strong_min_drift and strong_risk_mult > 1.0:
+            tuned *= strong_risk_mult
+            flags.update({"btc_stage7_risk_tuned": True, "btc_stage7_tier": "strong_trend", "btc_stage7_risk_mult": strong_risk_mult})
+        elif tt == "continuation" and ((not strong_setup) or adx_h < weak_cont_min_adx or drift < weak_cont_min_drift) and weak_cont_mult < 1.0:
+            tuned *= weak_cont_mult
+            flags.update({"btc_stage7_risk_tuned": True, "btc_stage7_tier": "weak_continuation", "btc_stage7_risk_mult": weak_cont_mult})
+        return tuned, flags
+
+    def _check_stage10v2_basic_btc_mr(self, *, symbol: str, market_state: str, recent: pd.DataFrame, candle: pd.Series, atr_ltf: float, adx_h: float, drift: float, bar_index: int) -> tuple[str | None, dict]:
+        if symbol != "BTCUSDT" or not bool(cfg.get_symbol_param_bool(symbol, "BTC_STAGE10V2_BASIC_MR_ENABLED", bool(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_ENABLED", False)))):
+            return None, {"reason": "disabled"}
+        cooldown_bars = int(cfg.get_symbol_param_int(symbol, "BTC_STAGE10V2_BASIC_MR_COOLDOWN_BARS", int(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_COOLDOWN_BARS", 96))))
+        if bar_index - int(getattr(self, "_last_btc_stage10v2_mr_bar_index", -10**9)) < cooldown_bars:
+            return None, {"reason": "cooldown_active"}
+        allowed_states = set(cfg.get_symbol_param(symbol, "BTC_STAGE10V2_BASIC_MR_ALLOWED_STATES", getattr(cfg, "BTC_STAGE10V2_BASIC_MR_ALLOWED_STATES", ["range", "flat", "chop"])) or [])
+        if market_state not in allowed_states:
+            return None, {"reason": "market_state_not_allowed", "market_state": market_state}
+        if atr_ltf <= 0 or recent is None or len(recent) < 20:
+            return None, {"reason": "not_enough_data"}
+        if adx_h > float(cfg.get_symbol_param_float(symbol, "BTC_STAGE10V2_BASIC_MR_MAX_ADX_H", float(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_MAX_ADX_H", 16.5)))):
+            return None, {"reason": "adx_too_high", "adx_h": adx_h}
+        if abs(drift) > float(cfg.get_symbol_param_float(symbol, "BTC_STAGE10V2_BASIC_MR_MAX_DRIFT_PCT", float(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_MAX_DRIFT_PCT", 0.0032)))):
+            return None, {"reason": "drift_too_high", "drift": drift}
+        open_ = float(candle.get("open", float("nan")))
+        high = float(candle.get("high", float("nan")))
+        low = float(candle.get("low", float("nan")))
+        close = float(candle.get("close", float("nan")))
+        ema20 = float(candle.get("EMA20", float("nan")))
+        rsi = float(candle.get("RSI", float("nan")))
+        volume = float(candle.get("volume", float("nan")))
+        if any(pd.isna(v) for v in [open_, high, low, close, ema20, rsi, volume]) or close <= 0:
+            return None, {"reason": "nan_values"}
+        candle_range = max(high - low, 1e-9)
+        close_pos = (close - low) / candle_range
+        lower_wick_ratio = max(0.0, min(open_, close) - low) / candle_range
+        body_atr = abs(close - open_) / max(atr_ltf, 1e-9)
+        neg_progress_atr = max(open_ - close, 0.0) / max(atr_ltf, 1e-9)
+        dev_atr = (ema20 - close) / max(atr_ltf, 1e-9)
+        vols = recent["volume"].astype(float).tail(12) if "volume" in recent.columns else pd.Series(dtype=float)
+        vol_ma = float(vols.mean()) if len(vols) else volume
+        vol_ratio = (volume / vol_ma) if vol_ma > 0 else 1.0
+        require_green = bool(cfg.get_symbol_param_bool(symbol, "BTC_STAGE10V2_BASIC_MR_REQUIRE_GREEN_CANDLE", bool(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_REQUIRE_GREEN_CANDLE", True))))
+        if require_green and close < open_:
+            return None, {"reason": "not_green"}
+        if rsi > float(cfg.get_symbol_param_float(symbol, "BTC_STAGE10V2_BASIC_MR_RSI_LONG_MAX", float(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_RSI_LONG_MAX", 31.0)))):
+            return None, {"reason": "rsi_not_oversold", "rsi": rsi}
+        if dev_atr < float(cfg.get_symbol_param_float(symbol, "BTC_STAGE10V2_BASIC_MR_MIN_DEV_ATR", float(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_MIN_DEV_ATR", 1.10)))):
+            return None, {"reason": "not_far_from_mean", "dev_atr": dev_atr}
+        if close_pos < float(cfg.get_symbol_param_float(symbol, "BTC_STAGE10V2_BASIC_MR_MIN_CLOSE_POS", float(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_MIN_CLOSE_POS", 0.62)))):
+            return None, {"reason": "close_pos_too_low", "close_pos": close_pos}
+        if lower_wick_ratio < float(cfg.get_symbol_param_float(symbol, "BTC_STAGE10V2_BASIC_MR_MIN_REJECT_WICK", float(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_MIN_REJECT_WICK", 0.16)))):
+            return None, {"reason": "wick_too_small", "lower_wick_ratio": lower_wick_ratio}
+        if body_atr > float(cfg.get_symbol_param_float(symbol, "BTC_STAGE10V2_BASIC_MR_MAX_BODY_ATR", float(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_MAX_BODY_ATR", 0.42)))):
+            return None, {"reason": "body_too_large", "body_atr": body_atr}
+        if neg_progress_atr > float(cfg.get_symbol_param_float(symbol, "BTC_STAGE10V2_BASIC_MR_MAX_NEG_PROGRESS_ATR", float(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_MAX_NEG_PROGRESS_ATR", 0.28)))):
+            return None, {"reason": "negative_progress_too_large", "neg_progress_atr": neg_progress_atr}
+        if vol_ratio < float(cfg.get_symbol_param_float(symbol, "BTC_STAGE10V2_BASIC_MR_MIN_VOL_RATIO", float(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_MIN_VOL_RATIO", 0.92)))):
+            return None, {"reason": "vol_ratio_too_low", "vol_ratio": vol_ratio}
+        return "buy", {"reason": "stage10v2_basic_btc_mr", "rsi": rsi, "dev_atr": dev_atr, "close_pos": close_pos, "lower_wick_ratio": lower_wick_ratio, "body_atr": body_atr, "neg_progress_atr": neg_progress_atr, "vol_ratio": vol_ratio}
+
     def _set_signal(self, signal: Optional[str], trade_type: str | None = None, risk_multiplier: float = 1.0, **meta):
         exec_risk = float(risk_multiplier)
         symbol = str(meta.get("symbol") or self._current_symbol or "")
         side = str(meta.get("side") or ("short" if signal == "sell" else "long" if signal == "buy" else "")).lower()
         regime = str(meta.get("regime") or self._current_regime or "")
         self._alt_trace("set_signal_call", symbol=symbol, signal=signal, trade_type=trade_type, risk_multiplier=exec_risk, regime=regime, side=side)
-        if signal == "sell" and side == "short" and self._should_suppress_short_signal(symbol=symbol, trade_type=trade_type, regime=regime, meta=meta):
+        if signal == "sell" and side == "short":
+            disable_all_btc_shorts = bool(cfg.get_symbol_param_bool(symbol, "BTC_DISABLE_ALL_SHORTS", bool(getattr(cfg, "BTC_DISABLE_ALL_SHORTS", False))))
+            if symbol == "BTCUSDT" and disable_all_btc_shorts:
+                self.last_signal_meta = {
+                    "signal": None,
+                    "trade_type": trade_type,
+                    "risk_multiplier": 1.0,
+                    "execution_risk_multiplier": 1.0,
+                    "v84_short_suppressed": True,
+                    "v84_short_suppression_reason": "btc_disable_all_shorts",
+                    **meta,
+                }
+                self._alt_trace("set_signal_return", symbol=symbol, signal=None, trade_type=trade_type, risk_multiplier=1.0, regime=regime, side=side, suppressed=True)
+                return None
+            if self._should_suppress_short_signal(symbol=symbol, trade_type=trade_type, regime=regime, meta=meta):
+                self.last_signal_meta = {
+                    "signal": None,
+                    "trade_type": trade_type,
+                    "risk_multiplier": 1.0,
+                    "execution_risk_multiplier": 1.0,
+                    "v84_short_suppressed": True,
+                    "v84_short_suppression_reason": self._build_short_suppression_reason(symbol=symbol, trade_type=trade_type, regime=regime, meta=meta),
+                    **meta,
+                }
+                self._alt_trace("set_signal_return", symbol=symbol, signal=None, trade_type=trade_type, risk_multiplier=1.0, regime=regime, side=side, suppressed=True)
+                return None
+        block_btc_profit_mode, block_reason = self._should_block_btc_profit_mode_signal(signal=signal, trade_type=trade_type, meta=meta)
+        if block_btc_profit_mode:
             self.last_signal_meta = {
                 "signal": None,
                 "trade_type": trade_type,
                 "risk_multiplier": 1.0,
                 "execution_risk_multiplier": 1.0,
-                "v84_short_suppressed": True,
-                "v84_short_suppression_reason": self._build_short_suppression_reason(symbol=symbol, trade_type=trade_type, regime=regime, meta=meta),
+                "btc_no_trade_filtered": True,
+                "btc_no_trade_reason": block_reason,
                 **meta,
             }
-            self._alt_trace("set_signal_return", symbol=symbol, signal=None, trade_type=trade_type, risk_multiplier=1.0, regime=regime, side=side, suppressed=True)
+            self._alt_trace("set_signal_return", symbol=symbol, signal=None, trade_type=trade_type, risk_multiplier=1.0, regime=regime, side=side, suppressed=True, reason=block_reason)
             return None
+        exec_risk, btc_stage7_flags = self._tune_btc_profit_mode_risk(signal=signal, trade_type=trade_type, risk_multiplier=exec_risk, meta=meta)
         self.last_signal_meta = {
             "signal": signal,
             "trade_type": trade_type,
             "risk_multiplier": exec_risk,
             "execution_risk_multiplier": exec_risk,
             **meta,
+            **btc_stage7_flags,
         }
         self._alt_trace("set_signal_return", symbol=symbol, signal=signal, trade_type=trade_type, risk_multiplier=exec_risk, regime=regime, side=side, suppressed=False)
         return signal
@@ -1163,6 +1349,9 @@ class MTFBreakoutStrategy(BaseStrategy):
         market_state = precheck["market_state"]
         market_meta = precheck["market_meta"]
         transition_state = bool(precheck["transition_state"])
+        self._current_market_state = str(market_state or "unknown")
+        self._current_adx_h = float(adx_h)
+        self._current_drift = float(drift)
 
         # ======================================================
         # 2) LTF breakout (M15)
@@ -1203,6 +1392,12 @@ class MTFBreakoutStrategy(BaseStrategy):
         buf = cfg.get_symbol_param_float(symbol, "BREAKOUT_BUFFER_PCT", float(getattr(cfg, "BREAKOUT_BUFFER_PCT", 0.001)))
         long_trigger = range_high * (1.0 + buf)
         short_trigger = range_low * (1.0 - buf)
+
+        bar_index = len(df) - 1
+        stage10v2_mr_signal, stage10v2_mr_meta = self._check_stage10v2_basic_btc_mr(symbol=symbol, market_state=market_state, recent=recent, candle=last, atr_ltf=atr_ltf, adx_h=adx_h, drift=drift, bar_index=bar_index)
+        if stage10v2_mr_signal is not None:
+            self._last_btc_stage10v2_mr_bar_index = bar_index
+            return self._set_signal(stage10v2_mr_signal, trade_type="mean_reversion", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "BTC_STAGE10V2_BASIC_MR_RISK_MULT", float(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_RISK_MULT", 0.48)))), market_state=market_state, regime=regime, mean_reversion_meta=stage10v2_mr_meta, side="long")
 
         v22_signal, v22_trade_type, v22_risk_mult, v22_meta = run_v22_nontrend_engine(cfg=cfg, symbol=symbol, market_state=market_state, regime=regime, recent=recent, candle=last, atr_ltf=atr_ltf, adx_h=adx_h, drift=drift)
         if v22_signal is not None:

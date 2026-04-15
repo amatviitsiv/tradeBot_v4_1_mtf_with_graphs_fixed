@@ -3,6 +3,7 @@ import os
 import sys
 import numpy as np
 import pandas as pd
+from collections import Counter
 from typing import Any, Dict, List, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,11 +22,14 @@ from position_management import (
     calc_initial_stop_price,
     calc_tp1_price,
     maybe_move_to_break_even,
+    maybe_apply_profit_lock,
     maybe_activate_trailing,
     on_tp1_hit,
     should_take_tp1,
     should_close_on_trailing,
     should_time_stop_before_tp1,
+    should_force_exit_weak_trade,
+    should_cut_adverse_trade_early,
     should_time_stop_after_tp1,
     tp1_fraction,
     update_peak_price,
@@ -109,6 +113,81 @@ class Backtester:
             if pos.trailing_stop is not None and high >= float(pos.trailing_stop):
                 return "trailing_stop", float(pos.trailing_stop)
         return None, None
+
+    def _can_pyramid_position(self, sym: str, pos: Position, price: float, atr: float, signal: str, sig_meta: Dict[str, Any]) -> bool:
+        if pos is None or pos.qty <= 0 or atr <= 0 or price <= 0:
+            return False
+        if sym != "BTCUSDT":
+            return False
+        if not bool(cfg.get_symbol_param_bool(sym, "BTC_PYRAMIDING_ENABLED", bool(getattr(cfg, "BTC_PYRAMIDING_ENABLED", False)))):
+            return False
+        max_adds = int(cfg.get_symbol_param_int(sym, "BTC_PYRAMID_MAX_ADDS", int(getattr(cfg, "BTC_PYRAMID_MAX_ADDS", 1))))
+        if int(getattr(pos, "pyramid_level", 0) or 0) >= max_adds:
+            return False
+        wanted_signal = "buy" if pos.side == "long" else "sell"
+        if signal != wanted_signal:
+            return False
+        if bool(getattr(pos, "trail_active", False)):
+            return False
+        if bool(getattr(pos, "tp1_hit", False)) and not bool(cfg.get_symbol_param_bool(sym, "BTC_PYRAMID_ALLOW_AFTER_TP1", bool(getattr(cfg, "BTC_PYRAMID_ALLOW_AFTER_TP1", True)))):
+            return False
+        allowed = {str(x).lower() for x in (cfg.get_symbol_param(sym, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", getattr(cfg, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", ["continuation", "cont_compression", "impulse"])) or [])}
+        trade_type = str(sig_meta.get("trade_type", "") or "").lower()
+        if allowed and trade_type not in allowed:
+            return False
+        if bool(cfg.get_symbol_param_bool(sym, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", bool(getattr(cfg, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", True)))) and not bool(sig_meta.get("strong_setup", False)):
+            return False
+        adx_h = float(sig_meta.get("adx_h", 0.0) or 0.0)
+        drift = abs(float(sig_meta.get("drift", 0.0) or 0.0))
+        if adx_h < float(cfg.get_symbol_param_float(sym, "BTC_PYRAMID_MIN_ADX_H", float(getattr(cfg, "BTC_PYRAMID_MIN_ADX_H", 24.0)))):
+            return False
+        if drift < float(cfg.get_symbol_param_float(sym, "BTC_PYRAMID_MIN_DRIFT", float(getattr(cfg, "BTC_PYRAMID_MIN_DRIFT", 0.0012)))):
+            return False
+        min_progress_atr = float(cfg.get_symbol_param_float(sym, "BTC_PYRAMID_MIN_PROGRESS_ATR", float(getattr(cfg, "BTC_PYRAMID_MIN_PROGRESS_ATR", 0.45))))
+        progress = (price - float(pos.entry_price)) / atr if pos.side == "long" else (float(pos.entry_price) - price) / atr
+        return progress >= min_progress_atr
+
+    def _apply_pyramid_addition(self, sym: str, pos: Position, price: float, atr: float, equity: float, side: str, sig_meta: Dict[str, Any]) -> Position:
+        risk_fraction = float(cfg.get_symbol_param_float(sym, "BTC_PYRAMID_RISK_FRACTION", float(getattr(cfg, "BTC_PYRAMID_RISK_FRACTION", 0.55))))
+        leverage = int(getattr(cfg, "FUTURES_LEVERAGE_DEFAULT", 5))
+        trade_type = str(sig_meta.get("trade_type", getattr(pos, "trade_type", "continuation")) or "continuation")
+        market_state = str(sig_meta.get("market_state", getattr(pos, "market_state", "unknown")) or "unknown")
+        initial_stop = calc_initial_stop_price(price, atr, side, sym, pos, trade_type=trade_type, market_state=market_state)
+        stop_distance_pct = abs(price - initial_stop) / price * 100.0
+        if stop_distance_pct <= 0:
+            return pos
+        base_risk_per_trade = float(getattr(cfg, "RISK_PER_TRADE", 0.01))
+        risk_multiplier = self._symbol_risk_multiplier(sym)
+        trade_risk_mult = 1.0
+        try:
+            trade_risk_mult = compute_trade_risk_multiplier(sig_meta=sig_meta, side=side, cfg=cfg, market_state_fallback=market_state, enable_legacy_v812=True)
+        except Exception:
+            trade_risk_mult = 1.0
+        eff_risk_per_trade = base_risk_per_trade * risk_multiplier * trade_risk_mult * max(0.05, risk_fraction)
+        try:
+            sized_risk_per_trade, _ = compute_position_sizing_risk_pct(cfg=cfg, sig_meta=sig_meta, symbol=sym, side=side, base_risk_per_trade=eff_risk_per_trade, equity=equity, equity_peak=equity)
+        except Exception:
+            sized_risk_per_trade = eff_risk_per_trade
+        notional, qty = self.risk.calc_futures_size_from_risk(equity=equity, price=price, stop_distance_pct=stop_distance_pct, risk_per_trade=sized_risk_per_trade, leverage=leverage)
+        if notional <= 0 or qty <= 0:
+            return pos
+        old_qty = float(pos.qty)
+        new_qty = old_qty + float(qty)
+        if new_qty <= 0:
+            return pos
+        pos.entry_price = ((float(pos.entry_price) * old_qty) + (float(price) * float(qty))) / new_qty
+        pos.qty = new_qty
+        pos.notional = float(pos.entry_price) * float(pos.qty)
+        pos.stop_loss = initial_stop
+        pos.tp1 = calc_tp1_price(float(pos.entry_price), atr, side, sym, pos)
+        pos.peak_price = max(float(getattr(pos, "peak_price", price) or price), float(price)) if side == "long" else min(float(getattr(pos, "peak_price", price) or price), float(price))
+        pos.trailing_stop = None
+        pos.trail_active = False
+        pos.be_moved = False
+        pos.pyramid_level = int(getattr(pos, "pyramid_level", 0) or 0) + 1
+        pos.trade_type = trade_type
+        pos.market_state = market_state
+        return pos
 
     # ------------------------------------------------------------------
     def _attach_btc_regime_columns(self, out: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
@@ -247,6 +326,9 @@ class Backtester:
                 "trail_active_trades": 0,
                 "partial_close_count": len(self.partial_closes),
                 "partial_close_pnl": float(sum(x["pnl"] for x in self.partial_closes)) if self.partial_closes else 0.0,
+                "trade_type_rows": [],
+                "exit_reason_rows": [],
+                "trade_type_exit_rows": [],
             }
 
         pnls = [float(t.get("trade_pnl_total", t["pnl"])) for t in self.closed_trades]
@@ -270,6 +352,7 @@ class Backtester:
         expectancy = avg_trade
         tp1_hit_rate = (tp1_hit_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
         partial_close_pnl = float(sum(x["pnl"] for x in self.partial_closes)) if self.partial_closes else 0.0
+        diagnostics = self._build_trade_diagnostics() if bool(getattr(cfg, "BACKTEST_INCLUDE_TRADE_DIAGNOSTICS", True)) else {"trade_type_rows": [], "exit_reason_rows": [], "trade_type_exit_rows": []}
 
         return {
             "total_trades": total_trades,
@@ -292,6 +375,41 @@ class Backtester:
             "trail_active_trades": trail_active_trades,
             "partial_close_count": len(self.partial_closes),
             "partial_close_pnl": partial_close_pnl,
+            "trade_type_rows": diagnostics.get("trade_type_rows", []),
+            "exit_reason_rows": diagnostics.get("exit_reason_rows", []),
+            "trade_type_exit_rows": diagnostics.get("trade_type_exit_rows", []),
+        }
+
+    def _build_trade_diagnostics(self) -> Dict[str, Any]:
+        type_counter = Counter()
+        type_pnl = Counter()
+        exit_counter = Counter()
+        exit_pnl = Counter()
+        combo_counter = Counter()
+        combo_pnl = Counter()
+
+        for trade in self.closed_trades:
+            trade_type = str(trade.get("trade_type", "unknown") or "unknown").lower()
+            reason = str(trade.get("reason", "unknown") or "unknown").lower()
+            pnl = float(trade.get("trade_pnl_total", trade.get("pnl", 0.0)) or 0.0)
+            combo = f"{trade_type}->{reason}"
+            type_counter[trade_type] += 1
+            type_pnl[trade_type] += pnl
+            exit_counter[reason] += 1
+            exit_pnl[reason] += pnl
+            combo_counter[combo] += 1
+            combo_pnl[combo] += pnl
+
+        def _fmt(counter: Counter, pnl_counter: Counter) -> list[str]:
+            rows = []
+            for key, count in sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])):
+                rows.append(f"{key}:{count}:{pnl_counter.get(key, 0.0):.4f}")
+            return rows
+
+        return {
+            "trade_type_rows": _fmt(type_counter, type_pnl),
+            "exit_reason_rows": _fmt(exit_counter, exit_pnl),
+            "trade_type_exit_rows": _fmt(combo_counter, combo_pnl),
         }
 
     # ------------------------------------------------------------------
@@ -440,12 +558,25 @@ class Backtester:
                 # 2) Обновляем MFE по экстремуму свечи и двигаем BE / trailing по лучшей цене внутри бара.
                 update_peak_price(pos, favorable_price, i)
                 maybe_move_to_break_even(pos, favorable_price, atr)
+                maybe_apply_profit_lock(pos, favorable_price, atr)
 
                 # 3) Runner включаем только после дополнительного прогресса за TP1.
                 maybe_activate_trailing(pos, favorable_price, atr)
                 update_trailing_stop(pos, atr)
 
-                # 3.2) Для continuation/range/fakeout идея должна сработать быстрее.
+                # 3.2) Слабую/непоехавшую идею режем раньше полного стопа.
+                if should_cut_adverse_trade_early(pos, price, atr):
+                    balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="early_cut_loss", bar_index=i)
+                    reset_stop_streak(sym, pos.side)
+                    positions[sym] = None
+                    continue
+
+                if should_force_exit_weak_trade(pos, price, atr, i):
+                    balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="weak_trade_exit", bar_index=i)
+                    reset_stop_streak(sym, pos.side)
+                    positions[sym] = None
+                    continue
+
                 if should_time_stop_before_tp1(pos, i):
                     balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="time_stop_before_tp1", bar_index=i)
                     reset_stop_streak(sym, pos.side)
@@ -490,6 +621,14 @@ class Backtester:
                 if pos.side == "short" and sig == "buy":
                     balance, _ = self._close_position(balance, sym, pos, price, return_pnl=True, reason="reverse_signal", bar_index=i)
                     positions[sym] = None
+                    continue
+
+                try:
+                    sig_meta = getattr(get_active_strategy(), "last_signal_meta", {}) or {}
+                except Exception:
+                    sig_meta = {}
+                if self._can_pyramid_position(sym, pos, price, atr, sig, sig_meta):
+                    positions[sym] = self._apply_pyramid_addition(sym, pos, price, atr, equity, pos.side, sig_meta)
                     continue
 
             # пересчитываем equity после возможных закрытий
@@ -822,8 +961,15 @@ def _format_result_block(year: str, symbols: list[str], history: int, max_len: i
         f"Partial closes: {stats.get('partial_close_count', 0)}",
         f"Partial close PnL: {stats.get('partial_close_pnl', 0.0):.4f} USDT",
         f"Net AvgTrade (with partials): {stats.get('avg_trade', 0.0):.4f} USDT",
-        "",
     ]
+    if bool(getattr(cfg, "BACKTEST_INCLUDE_TRADE_DIAGNOSTICS", True)):
+        trade_type_rows = stats.get("trade_type_rows", []) or []
+        exit_reason_rows = stats.get("exit_reason_rows", []) or []
+        trade_type_exit_rows = stats.get("trade_type_exit_rows", []) or []
+        lines.append("TradeType stats: " + ("; ".join(trade_type_rows) if trade_type_rows else "n/a"))
+        lines.append("ExitReason stats: " + ("; ".join(exit_reason_rows) if exit_reason_rows else "n/a"))
+        lines.append("TradeType->Exit stats: " + ("; ".join(trade_type_exit_rows) if trade_type_exit_rows else "n/a"))
+    lines.append("")
     return "\n".join(lines)
 
 
