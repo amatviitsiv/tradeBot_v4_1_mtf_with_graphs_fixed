@@ -42,7 +42,8 @@ class StateManager:
             "balances": {},
             "equity_peak": None,
             "realized_pnl": 0.0,
-            "strategy_version": getattr(config, "STRATEGY_VERSION", "")
+            "strategy_version": getattr(config, "STRATEGY_VERSION", ""),
+            "entry_cooldowns": {},
         }
 
     # ===== Базовые операции с файлом =====
@@ -138,3 +139,34 @@ class StateManager:
             cur = 0.0
         self.data["realized_pnl"] = cur + float(pnl_delta)
         self.save()
+
+
+    # ===== Cooldown по повторным входам =====
+
+    def get_entry_cooldown(self, symbol: str, side: str) -> Dict[str, Any]:
+        """Вернуть состояние cooldown для пары symbol+side."""
+        store = self.data.get("entry_cooldowns") or {}
+        sym_store = store.get(symbol) or {}
+        side_store = sym_store.get(side) or {}
+        return {
+            "until_ts": float(side_store.get("until_ts", 0.0) or 0.0),
+            "stop_streak": int(side_store.get("stop_streak", 0) or 0),
+            "last_reason": side_store.get("last_reason"),
+        }
+
+    def set_entry_cooldown(self, symbol: str, side: str, until_ts: float, stop_streak: int, last_reason: Optional[str] = None) -> None:
+        """Сохранить cooldown для пары symbol+side."""
+        self.data.setdefault("entry_cooldowns", {})
+        self.data["entry_cooldowns"].setdefault(symbol, {})
+        self.data["entry_cooldowns"][symbol][side] = {
+            "until_ts": float(until_ts),
+            "stop_streak": int(stop_streak),
+            "last_reason": last_reason,
+        }
+        self.save()
+
+    def reset_entry_cooldown_streak(self, symbol: str, side: str, keep_until_ts: bool = False) -> None:
+        """Сбросить серию стопов, сохранив или очистив активный cooldown."""
+        current = self.get_entry_cooldown(symbol, side)
+        until_ts = current.get("until_ts", 0.0) if keep_until_ts else 0.0
+        self.set_entry_cooldown(symbol, side, until_ts=until_ts, stop_streak=0, last_reason=None)

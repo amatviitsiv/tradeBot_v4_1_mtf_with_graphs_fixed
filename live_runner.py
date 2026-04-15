@@ -15,9 +15,9 @@
 import asyncio
 import logging
 from logger_setup import setup_logging
-import os
 import signal
 import time
+from contextlib import suppress
 from typing import Dict, List
 
 import pandas as pd
@@ -29,9 +29,29 @@ from telegram_notifier import TelegramNotifier
 from broker_futures import LiveFuturesBroker
 from binance_ws_manager import BinanceWSManager
 from strategy import signal_from_indicators
+from execution_policy import compute_trade_risk_multiplier
+from position_sizing_engine import compute_position_sizing_risk_pct
+from strategies import get_active_strategy
 from risk import RiskManager
 from position import PositionState
 from indicators import compute_indicators  # type: ignore
+from position_management import (
+    calc_tp1_price,
+    maybe_move_to_break_even,
+    maybe_apply_profit_lock,
+    maybe_activate_trailing,
+    on_tp1_hit,
+    should_take_tp1,
+    should_close_on_trailing,
+    tp1_fraction,
+    update_peak_price,
+    update_trailing_stop,
+    mark_tp1_bar,
+    should_time_stop_after_tp1,
+    should_force_exit_weak_trade,
+    should_cut_adverse_trade_early,
+    should_close_runner_on_stall,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -64,6 +84,10 @@ class LiveRunner:
         self._last_kline_ts: Dict[str, float] = {}
         # лимит сделок в час (0 = без лимита)
         self._max_trades_per_hour: int = int(getattr(config, "MAX_TRADES_PER_HOUR", 0) or 0)
+        # cooldown после убыточных stop-loss по symbol + direction
+        self._entry_cooldowns: Dict[str, Dict[str, float]] = {}
+        self._stop_loss_streaks: Dict[str, Dict[str, int]] = {}
+        self._latest_bar_open_time_ms: Dict[str, float] = {}
     async def _init_broker(self) -> None:
         """Инициализация брокера и проверка API ключей."""
         api_key = getattr(config, "BINANCE_API_KEY", "") or getattr(config, "API_KEY", "")
@@ -75,6 +99,68 @@ class LiveRunner:
         broker = await LiveFuturesBroker.create(api_key=api_key, api_secret=api_secret)
         self._broker = broker
         logger.info("[RUNNER] LiveFuturesBroker initialized")
+
+    async def _sync_exchange_leverage(self) -> None:
+        if self._broker is None:
+            return
+        if not bool(getattr(config, "LIVE_SYNC_LEVERAGE_ON_START", True)):
+            return
+        leverage = int(getattr(config, "FUTURES_LEVERAGE_DEFAULT", 5) or 5)
+        retries = max(1, int(getattr(config, "LIVE_SET_LEVERAGE_RETRIES", 3) or 3))
+        for symbol in self.symbols:
+            ok = False
+            last_error = None
+            for _ in range(retries):
+                try:
+                    await self._broker.set_leverage(symbol, leverage)
+                    ok = True
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.exception("[RUNNER] failed to sync leverage for %s: %s", symbol, e)
+                    await asyncio.sleep(1)
+            if ok:
+                logger.info("[RUNNER] leverage synced for %s => %sx", symbol, leverage)
+            elif last_error is not None:
+                logger.error("[RUNNER] leverage sync failed for %s after retries: %s", symbol, last_error)
+        if bool(getattr(config, "LIVE_NOTIFY_LEVERAGE_SYNC", True)):
+            with suppress(Exception):
+                self.notifier.notify_error("leverage_sync", f"Live leverage synced to {leverage}x for {self.symbols}")
+
+    async def _protect_open_positions_live(self) -> None:
+        if self._broker is None or not bool(getattr(config, "LIVE_PROTECTIVE_USE_MARK_PRICE", True)):
+            return
+        for symbol, pos in list(self._positions.items()):
+            if pos is None or float(getattr(pos, "qty", 0.0) or 0.0) <= 0:
+                continue
+            try:
+                mark_price = await self._broker.get_mark_price(symbol)
+            except Exception as e:
+                logger.exception("[RUNNER] failed to get mark price for %s: %s", symbol, e)
+                continue
+            if not mark_price or mark_price <= 0:
+                continue
+            try:
+                if pos.stop_loss is not None:
+                    if pos.side == "long" and mark_price <= pos.stop_loss:
+                        logger.warning("[RUNNER] protective stop by mark price for %s at %.4f (sl=%.4f)", symbol, mark_price, pos.stop_loss)
+                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_stop_mark")
+                        continue
+                    if pos.side == "short" and mark_price >= pos.stop_loss:
+                        logger.warning("[RUNNER] protective stop by mark price for %s at %.4f (sl=%.4f)", symbol, mark_price, pos.stop_loss)
+                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_stop_mark")
+                        continue
+                if pos.trailing_stop is not None:
+                    if pos.side == "long" and mark_price <= pos.trailing_stop:
+                        logger.warning("[RUNNER] protective trailing stop by mark price for %s at %.4f (trail=%.4f)", symbol, mark_price, pos.trailing_stop)
+                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_trailing_mark")
+                        continue
+                    if pos.side == "short" and mark_price >= pos.trailing_stop:
+                        logger.warning("[RUNNER] protective trailing stop by mark price for %s at %.4f (trail=%.4f)", symbol, mark_price, pos.trailing_stop)
+                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_trailing_mark")
+                        continue
+            except Exception as e:
+                logger.exception("[RUNNER] protective close check failed for %s: %s", symbol, e)
 
     async def _preload_history(self) -> None:
         """Подгрузить историю (15m/1h) через REST, чтобы стратегия не ждала часы на прогрев."""
@@ -102,7 +188,7 @@ class LiveRunner:
                         "volume": float(r[5]),
                     })
                 except Exception:
-                    continue
+                    return
             df = pd.DataFrame(rows)
             return df
 
@@ -178,6 +264,56 @@ class LiveRunner:
         self._data_1h[symbol] = df
 
 
+    def _attach_btc_regime_columns(self, df_15_idx: pd.DataFrame) -> pd.DataFrame:
+        btc_symbol = str(getattr(config, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
+        df_btc_1h = self._data_1h.get(btc_symbol)
+        htf_cols = ["SMA_TREND", "EMA20", "EMA50", "EMA200", "ATR", "ADX", "RSI"]
+
+        if df_btc_1h is None or df_btc_1h.empty:
+            for col in htf_cols:
+                df_15_idx[f"BTC_HTF_{col}"] = pd.NA
+            df_15_idx["BTC_close"] = pd.NA
+            return df_15_idx
+
+        try:
+            df_btc_1h_ind = compute_indicators(df_btc_1h.copy())
+            if "open_time" not in df_btc_1h_ind.columns:
+                raise ValueError("BTC HTF open_time missing")
+            df_btc_1h_ind = df_btc_1h_ind.set_index("open_time")
+            if df_btc_1h_ind.index.has_duplicates:
+                df_btc_1h_ind = df_btc_1h_ind[~df_btc_1h_ind.index.duplicated(keep="last")].sort_index()
+            df_btc_sync = df_btc_1h_ind.reindex(df_15_idx.index, method="pad")
+            for col in htf_cols:
+                out_col = f"BTC_HTF_{col}"
+                df_15_idx[out_col] = df_btc_sync[col] if col in df_btc_sync.columns else pd.NA
+            df_15_idx["BTC_close"] = df_btc_sync["close"] if "close" in df_btc_sync.columns else pd.NA
+        except Exception as e:
+            logger.exception("[RUNNER] failed to attach BTC regime columns: %s", e)
+            for col in htf_cols:
+                df_15_idx[f"BTC_HTF_{col}"] = pd.NA
+            df_15_idx["BTC_close"] = pd.NA
+        return df_15_idx
+
+    def _count_same_side_alt_positions(self, side: str) -> int:
+        alt_symbols = set(getattr(config, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT"]) or [])
+        return sum(1 for sym, pos in self._positions.items() if pos is not None and sym in alt_symbols and pos.side == side)
+
+    def _symbol_risk_multiplier(self, symbol: str) -> float:
+        try:
+            symbol = str(symbol or '').upper()
+            specific = config.get_symbol_param(symbol, 'RISK_MULTIPLIER', None)
+            if specific is not None:
+                return max(0.0, float(specific))
+            if symbol == 'BTCUSDT':
+                return max(0.0, float(getattr(config, 'BTC_POSITION_RISK_MULTIPLIER', getattr(config, 'BASE_POSITION_RISK_MULTIPLIER', 1.0))))
+            alt_symbols = set(getattr(config, 'BTC_REGIME_ALT_SYMBOLS', []) or [])
+            if symbol in alt_symbols:
+                key = symbol.replace('USDT', '') + '_POSITION_RISK_MULTIPLIER'
+                return max(0.0, float(getattr(config, key, getattr(config, 'ALT_POSITION_RISK_MULTIPLIER', 0.7))))
+        except Exception:
+            pass
+        return max(0.0, float(getattr(config, 'BASE_POSITION_RISK_MULTIPLIER', 1.0)))
+
     async def _run_strategy_if_ready(self, symbol: str) -> None:
         """Запускается при закрытии M15 свечи.
 
@@ -237,7 +373,9 @@ class LiveRunner:
                 else:
                     df_15_idx[hcol] = pd.NA
 
+            df_15_idx = self._attach_btc_regime_columns(df_15_idx)
             df_mtf = df_15_idx.reset_index()
+            df_mtf["symbol"] = symbol
             # считаем LTF-индикаторы (ATR/RSI и др.)
             df_mtf = compute_indicators(df_mtf)
         except Exception as e:
@@ -249,6 +387,10 @@ class LiveRunner:
 
         i = len(df_mtf) - 1
         row = df_mtf.iloc[-1]
+        try:
+            self._latest_bar_open_time_ms[symbol] = float(row.get("open_time", 0.0) or 0.0)
+        except Exception:
+            self._latest_bar_open_time_ms[symbol] = 0.0
 
         try:
             price = float(row["close"])
@@ -262,14 +404,24 @@ class LiveRunner:
         # --- базовые параметры из конфига ---
         risk_per_trade = float(getattr(config, "RISK_PER_TRADE", 0.01))
         leverage = int(getattr(config, "FUTURES_LEVERAGE_DEFAULT", 5))
-        atr_sl_mult = float(getattr(config, "ATR_SL_MULT", 4.0))
-        atr_tp_mult_1 = float(getattr(config, "ATR_TP_MULT_1", 8.0))
-        atr_ts_mult = float(getattr(config, "ATR_TS_MULT", 4.0))
+        atr_sl_mult = float(config.get_symbol_param(symbol, "ATR_SL_MULT", getattr(config, "ATR_SL_MULT", 4.0)))
 
         # Текущий сигнал стратегии (по полной истории df_mtf)
         logger.debug("[RUNNER] calling strategy for %s, len(df_mtf)=%d", symbol, len(df_mtf))
         signal = signal_from_indicators(df_mtf)
         logger.debug("[RUNNER] strategy returned signal=%r for %s", signal, symbol)
+        sig_meta = {}
+        trade_risk_mult = 1.0
+        signal_side = "long" if signal == "buy" else ("short" if signal == "sell" else None)
+        try:
+            sig_meta = getattr(get_active_strategy(), "last_signal_meta", {}) or {}
+            trade_risk_mult = compute_trade_risk_multiplier(
+                sig_meta=sig_meta,
+                side=signal_side,
+                cfg=config,
+            )
+        except Exception:
+            trade_risk_mult = 1.0
 
         # --- оценка текущей equity и обновление пика ---
         equity = 0.0
@@ -334,42 +486,44 @@ class LiveRunner:
             if closed:
                 return
 
-            # Первая цель по прибыли (частичный выход + перевод в безубыток + включение трейлинга)
-            if pos.tp1 is not None and pos.qty > 0:
-                if pos.side == "long" and price >= pos.tp1:
-                    await self._close_fraction_live(symbol, pos, price, fraction=0.5, reason="tp1")
-                    pos.stop_loss = pos.entry_price
-                    new_ts = price - atr_ts_mult * atr
-                    if pos.trailing_stop is None or new_ts > pos.trailing_stop:
-                        pos.trailing_stop = new_ts
-                    pos.tp1 = None
-                    self._update_position_state(symbol, pos)
-                elif pos.side == "short" and price <= pos.tp1:
-                    await self._close_fraction_live(symbol, pos, price, fraction=0.5, reason="tp1")
-                    pos.stop_loss = pos.entry_price
-                    new_ts = price + atr_ts_mult * atr
-                    if pos.trailing_stop is None or new_ts < pos.trailing_stop:
-                        pos.trailing_stop = new_ts
-                    pos.tp1 = None
-                    self._update_position_state(symbol, pos)
+            update_peak_price(pos, price, i)
+            maybe_move_to_break_even(pos, price, atr)
+            maybe_apply_profit_lock(pos, price, atr)
 
-            # Трейлинговый стоп
-            if pos.trailing_stop is not None and pos.qty > 0:
-                if pos.side == "long":
-                    new_ts = price - atr_ts_mult * atr
-                    if new_ts > pos.trailing_stop:
-                        pos.trailing_stop = new_ts
-                    if price <= pos.trailing_stop:
-                        await self._close_position_live(symbol, pos, price, reason="trailing_stop")
-                        return
-                else:
-                    new_ts = price + atr_ts_mult * atr
-                    if new_ts < pos.trailing_stop:
-                        pos.trailing_stop = new_ts
-                    if price >= pos.trailing_stop:
-                        await self._close_position_live(symbol, pos, price, reason="trailing_stop")
-                        return
+            # Первая цель по прибыли: фиксируем меньшую часть раньше и оставляем хвост под тренд
+            if pos.tp1 is not None and pos.qty > 0 and should_take_tp1(pos, price):
+                tp1_frac = tp1_fraction(pos)
+                if tp1_frac >= 1.0:
+                    await self._close_position_live(symbol, pos, price, reason="tp1_full")
+                    return
+                await self._close_fraction_live(symbol, pos, price, fraction=tp1_frac, reason="tp1")
+                on_tp1_hit(pos, price, atr)
+                mark_tp1_bar(pos, i)
                 self._update_position_state(symbol, pos)
+
+            # Менее шумный трейлинг: ведём его от лучшей достигнутой цены
+            maybe_activate_trailing(pos, price, atr)
+            update_trailing_stop(pos, atr)
+            if pos.trailing_stop is not None and pos.qty > 0 and should_close_on_trailing(pos, price):
+                await self._close_position_live(symbol, pos, price, reason="trailing_stop")
+                return
+            self._update_position_state(symbol, pos)
+
+            if pos.qty > 0 and should_cut_adverse_trade_early(pos, price, atr):
+                await self._close_position_live(symbol, pos, price, reason="early_cut_loss")
+                return
+
+            if pos.qty > 0 and should_force_exit_weak_trade(pos, price, atr, i):
+                await self._close_position_live(symbol, pos, price, reason="weak_trade_exit")
+                return
+
+            if pos.qty > 0 and should_close_runner_on_stall(pos, i):
+                await self._close_position_live(symbol, pos, price, reason="runner_stall")
+                return
+
+            if pos.qty > 0 and should_time_stop_after_tp1(pos, i):
+                await self._close_position_live(symbol, pos, price, reason="time_stop_after_tp1")
+                return
 
             # Ограничение максимального времени жизни позиции (тайм-стоп)
             mtf_max_bars = int(getattr(config, "MTF_MAX_BARS_IN_POSITION", 0) or 0)
@@ -391,12 +545,33 @@ class LiveRunner:
                     await self._close_position_live(symbol, pos, price, reason="reverse_signal")
                     return
 
+            if self._can_pyramid_position(symbol, pos, price, atr, signal, sig_meta):
+                added = await self._apply_pyramid_addition_live(symbol, pos, price, atr, equity, pos.side, sig_meta, i)
+                if added:
+                    return
+
             # Если позиция открыта и не закрылась по условиям — новых входов по этому символу не делаем
             return
 
         # ===== 2. Открытие новой позиции по сигналу =====
         if signal not in {"buy", "sell"}:
             return
+
+        side = "long" if signal == "buy" else "short"
+
+        # cooldown после stop-loss по тому же symbol + direction
+        if bool(getattr(config, "ENTRY_COOLDOWN_AFTER_STOP_ENABLED", True)):
+            now_ts = max(time.time(), float(self._latest_bar_open_time_ms.get(symbol, 0.0) or 0.0) / 1000.0)
+            cooldown_until = self._get_entry_cooldown_ts(symbol, side)
+            if cooldown_until > now_ts:
+                remain_sec = cooldown_until - now_ts
+                logger.info(
+                    "[RUNNER] cooldown active for %s %s: %.0fs remaining, skip entry",
+                    symbol,
+                    side,
+                    remain_sec,
+                )
+                return
 
         # если risk guard отключил торговлю — новые позиции не открываем
         if self._trading_disabled:
@@ -432,6 +607,20 @@ class LiveRunner:
                 )
                 return
 
+        btc_regime_cap = int(getattr(config, "BTC_REGIME_MAX_SAME_SIDE_ALT_POSITIONS", 0) or 0)
+        alt_symbols = set(getattr(config, "BTC_REGIME_ALT_SYMBOLS", ["ETHUSDT"]) or [])
+        if btc_regime_cap > 0 and symbol in alt_symbols:
+            same_side_alt_count = self._count_same_side_alt_positions(side)
+            if same_side_alt_count >= btc_regime_cap:
+                logger.info(
+                    "[RUNNER] BTC regime alt cap reached for %s side=%s: %s/%s",
+                    symbol,
+                    side,
+                    same_side_alt_count,
+                    btc_regime_cap,
+                )
+                return
+
         # Ограничение по количеству одновременных позиций
         open_count = sum(1 for p in self._positions.values() if p is not None)
         max_positions = int(getattr(config, "MAX_OPEN_POSITIONS", 3))
@@ -450,20 +639,42 @@ class LiveRunner:
             logger.info("[RUNNER] equity<=0, skip opening %s", symbol)
             return
 
-        stop_distance_abs = atr_sl_mult * atr
-        stop_distance_pct = stop_distance_abs / price * 100.0
+        trade_type = str(sig_meta.get("trade_type", "unknown") or "unknown")
+        market_state = str(sig_meta.get("market_state", "unknown") or "unknown")
+        initial_stop = calc_initial_stop_price(price, atr, side, symbol, None, trade_type=trade_type, market_state=market_state)
+        stop_distance_pct = abs(price - initial_stop) / price * 100.0
+        if stop_distance_pct <= 0:
+            logger.info("[RUNNER] invalid stop distance for %s (price=%.5f stop=%.5f)", symbol, price, initial_stop)
+            return
+        risk_multiplier = self._symbol_risk_multiplier(symbol)
+        eff_risk_per_trade = risk_per_trade * risk_multiplier * trade_risk_mult
+        try:
+            peak_val = float(self.state.data.get("equity_peak") or equity or 0.0)
+        except Exception:
+            peak_val = float(equity or 0.0)
+        try:
+            sized_risk_per_trade, _v25_flags = compute_position_sizing_risk_pct(
+                cfg=config,
+                sig_meta=sig_meta,
+                symbol=symbol,
+                side=side,
+                base_risk_per_trade=eff_risk_per_trade,
+                equity=equity,
+                equity_peak=peak_val,
+            )
+        except Exception:
+            sized_risk_per_trade = eff_risk_per_trade
         notional, qty = self._risk.calc_futures_size_from_risk(
             equity=equity,
             price=price,
             stop_distance_pct=stop_distance_pct,
-            risk_per_trade=risk_per_trade,
+            risk_per_trade=sized_risk_per_trade,
             leverage=leverage,
         )
         if notional <= 0 or qty <= 0:
             logger.info("[RUNNER] position size too small for %s (equity=%.2f, price=%.2f, atr=%.5f)", symbol, equity, price, atr)
             return
 
-        side = "long" if signal == "buy" else "short"
         try:
             if self._broker is None:
                 logger.error("[RUNNER] broker is not initialized, cannot open position for %s", symbol)
@@ -487,12 +698,8 @@ class LiveRunner:
                 logger.exception("[RUNNER] failed to send order error notification for %s", symbol)
             return
 
-        if side == "long":
-            stop_loss = price - atr_sl_mult * atr
-            tp1 = price + atr_tp_mult_1 * atr
-        else:
-            stop_loss = price + atr_sl_mult * atr
-            tp1 = price - atr_tp_mult_1 * atr
+        stop_loss = initial_stop
+        tp1 = calc_tp1_price(price, atr, side, symbol)
 
         pos = PositionState(
             symbol=symbol,
@@ -507,8 +714,17 @@ class LiveRunner:
             tp2=None,
             peak_price=price,
             trailing_stop=None,
+            be_moved=False,
+            tp1_hit=False,
+            trail_active=False,
             pyramid_level=0,
+            trade_type=trade_type,
+            market_state=market_state,
         )
+        pos.tp1 = calc_tp1_price(price, atr, side, symbol, pos)
+        pos.strong_setup = bool(sig_meta.get("strong_setup", False))
+        pos.entry_adx_h = float(sig_meta.get("adx_h", 0.0) or 0.0)
+        pos.entry_drift = float(sig_meta.get("drift", 0.0) or 0.0)
         self._positions[symbol] = pos
         self._update_position_state(symbol, pos)
 
@@ -542,6 +758,160 @@ class LiveRunner:
         except Exception:
             logger.exception("[RUNNER] failed to register trade timestamp for %s", symbol)
 
+
+
+    def _get_entry_cooldown_ts(self, symbol: str, side: str) -> float:
+        return float((self._entry_cooldowns.get(symbol) or {}).get(side, 0.0) or 0.0)
+
+    def _get_stop_streak(self, symbol: str, side: str) -> int:
+        return int((self._stop_loss_streaks.get(symbol) or {}).get(side, 0) or 0)
+
+    def _set_entry_cooldown(self, symbol: str, side: str, until_ts: float, stop_streak: int, reason: str | None = None) -> None:
+        self._entry_cooldowns.setdefault(symbol, {})[side] = float(until_ts)
+        self._stop_loss_streaks.setdefault(symbol, {})[side] = int(stop_streak)
+        try:
+            self.state.set_entry_cooldown(symbol, side, until_ts=until_ts, stop_streak=stop_streak, last_reason=reason)
+        except Exception:
+            logger.exception("[RUNNER] failed to persist entry cooldown for %s %s", symbol, side)
+
+    def _reset_entry_cooldown_streak(self, symbol: str, side: str, keep_until_ts: bool = False) -> None:
+        until_ts = self._get_entry_cooldown_ts(symbol, side) if keep_until_ts else 0.0
+        self._entry_cooldowns.setdefault(symbol, {})[side] = float(until_ts)
+        self._stop_loss_streaks.setdefault(symbol, {})[side] = 0
+        try:
+            self.state.reset_entry_cooldown_streak(symbol, side, keep_until_ts=keep_until_ts)
+        except Exception:
+            logger.exception("[RUNNER] failed to reset cooldown streak for %s %s", symbol, side)
+
+    def _register_stop_loss_cooldown(self, symbol: str, side: str, bar_open_ts_ms: float, pnl: float) -> None:
+        if not bool(getattr(config, "ENTRY_COOLDOWN_AFTER_STOP_ENABLED", True)):
+            return
+        if pnl > 0:
+            if bool(getattr(config, "ENTRY_COOLDOWN_RESET_ON_NON_LOSS_EXIT", True)):
+                self._reset_entry_cooldown_streak(symbol, side, keep_until_ts=False)
+            return
+
+        base_bars = int(getattr(config, "ENTRY_COOLDOWN_AFTER_STOP_BARS", 0) or 0)
+        streak_threshold = int(getattr(config, "ENTRY_COOLDOWN_STREAK_THRESHOLD", 2) or 0)
+        extra_bars = int(getattr(config, "ENTRY_COOLDOWN_STREAK_EXTRA_BARS", 0) or 0)
+        bar_seconds = int(getattr(config, "ENTRY_COOLDOWN_BAR_SECONDS", 15 * 60) or 15 * 60)
+        if base_bars <= 0 or bar_seconds <= 0:
+            return
+
+        new_streak = self._get_stop_streak(symbol, side) + 1
+        cooldown_bars = base_bars
+        if streak_threshold > 0 and new_streak >= streak_threshold:
+            cooldown_bars += extra_bars
+
+        until_ts = float(bar_open_ts_ms) / 1000.0 + cooldown_bars * bar_seconds
+        self._set_entry_cooldown(symbol, side, until_ts=until_ts, stop_streak=new_streak, reason="stop_loss")
+        logger.info(
+            "[RUNNER] entry cooldown set for %s %s: bars=%s streak=%s until_ts=%.0f",
+            symbol,
+            side,
+            cooldown_bars,
+            new_streak,
+            until_ts,
+        )
+
+    def _can_pyramid_position(self, symbol: str, pos: PositionState, price: float, atr: float, signal: str, sig_meta: dict) -> bool:
+        if pos is None or pos.qty <= 0 or atr <= 0 or price <= 0:
+            return False
+        if symbol != "BTCUSDT":
+            return False
+        if not bool(config.get_symbol_param_bool(symbol, "BTC_PYRAMIDING_ENABLED", bool(getattr(config, "BTC_PYRAMIDING_ENABLED", False)))):
+            return False
+        max_adds = int(config.get_symbol_param_int(symbol, "BTC_PYRAMID_MAX_ADDS", int(getattr(config, "BTC_PYRAMID_MAX_ADDS", 1))))
+        if int(getattr(pos, "pyramid_level", 0) or 0) >= max_adds:
+            return False
+        wanted_signal = "buy" if pos.side == "long" else "sell"
+        if signal != wanted_signal:
+            return False
+        if bool(getattr(pos, "trail_active", False)):
+            return False
+        if bool(getattr(pos, "tp1_hit", False)) and not bool(config.get_symbol_param_bool(symbol, "BTC_PYRAMID_ALLOW_AFTER_TP1", bool(getattr(config, "BTC_PYRAMID_ALLOW_AFTER_TP1", True)))):
+            return False
+        allowed = {str(x).lower() for x in (config.get_symbol_param(symbol, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", getattr(config, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", ["continuation", "cont_compression", "impulse"])) or [])}
+        trade_type = str(sig_meta.get("trade_type", "") or "").lower()
+        if allowed and trade_type not in allowed:
+            return False
+        if bool(config.get_symbol_param_bool(symbol, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", bool(getattr(config, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", True)))) and not bool(sig_meta.get("strong_setup", False)):
+            return False
+        adx_h = float(sig_meta.get("adx_h", 0.0) or 0.0)
+        drift = abs(float(sig_meta.get("drift", 0.0) or 0.0))
+        if adx_h < float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_MIN_ADX_H", float(getattr(config, "BTC_PYRAMID_MIN_ADX_H", 24.0)))):
+            return False
+        if drift < float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_MIN_DRIFT", float(getattr(config, "BTC_PYRAMID_MIN_DRIFT", 0.0012)))):
+            return False
+        min_progress_atr = float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_MIN_PROGRESS_ATR", float(getattr(config, "BTC_PYRAMID_MIN_PROGRESS_ATR", 0.45))))
+        progress = (price - float(pos.entry_price)) / atr if pos.side == "long" else (float(pos.entry_price) - price) / atr
+        return progress >= min_progress_atr
+
+    async def _apply_pyramid_addition_live(self, symbol: str, pos: PositionState, price: float, atr: float, equity: float, side: str, sig_meta: dict, bar_index: int) -> bool:
+        if self._broker is None:
+            return False
+        leverage = int(getattr(config, "FUTURES_LEVERAGE_DEFAULT", 5))
+        risk_fraction = float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_RISK_FRACTION", float(getattr(config, "BTC_PYRAMID_RISK_FRACTION", 0.55))))
+        trade_type = str(sig_meta.get("trade_type", getattr(pos, "trade_type", "continuation")) or "continuation")
+        market_state = str(sig_meta.get("market_state", getattr(pos, "market_state", "unknown")) or "unknown")
+        initial_stop = calc_initial_stop_price(price, atr, side, symbol, pos, trade_type=trade_type, market_state=market_state)
+        stop_distance_pct = abs(price - initial_stop) / price * 100.0
+        if stop_distance_pct <= 0:
+            return False
+        risk_multiplier = self._symbol_risk_multiplier(symbol)
+        base_risk_per_trade = float(getattr(config, "RISK_PER_TRADE", 0.01))
+        try:
+            trade_risk_mult = compute_trade_risk_multiplier(sig_meta=sig_meta, side=side, cfg=config, market_state_fallback=market_state, enable_legacy_v812=True)
+        except Exception:
+            trade_risk_mult = 1.0
+        eff_risk_per_trade = base_risk_per_trade * risk_multiplier * trade_risk_mult * max(0.05, risk_fraction)
+        try:
+            peak_val = float(self.state.data.get("equity_peak") or equity or 0.0)
+        except Exception:
+            peak_val = float(equity or 0.0)
+        try:
+            sized_risk_per_trade, _ = compute_position_sizing_risk_pct(cfg=config, sig_meta=sig_meta, symbol=symbol, side=side, base_risk_per_trade=eff_risk_per_trade, equity=equity, equity_peak=peak_val)
+        except Exception:
+            sized_risk_per_trade = eff_risk_per_trade
+        notional, qty = self._risk.calc_futures_size_from_risk(equity=equity, price=price, stop_distance_pct=stop_distance_pct, risk_per_trade=sized_risk_per_trade, leverage=leverage)
+        if notional <= 0 or qty <= 0:
+            return False
+        order_side = "BUY" if side == "long" else "SELL"
+        try:
+            res = await self._broker.create_market_order(symbol=symbol, side=order_side, qty=qty, reduce_only=False)
+            used_qty = float(res.get("_used_qty", qty))
+            qty = used_qty
+            notional = float(qty) * float(price)
+        except Exception as e:
+            logger.exception("[RUNNER] failed to pyramid %s position for %s: %s", side, symbol, e)
+            try:
+                self.notifier.notify_order_error(symbol=symbol, side=side, qty=qty, error=str(e))
+            except Exception:
+                logger.exception("[RUNNER] failed to send pyramid order error notification for %s", symbol)
+            return False
+        old_qty = float(pos.qty)
+        new_qty = old_qty + float(qty)
+        if new_qty <= 0:
+            return False
+        pos.entry_price = ((float(pos.entry_price) * old_qty) + (float(price) * float(qty))) / new_qty
+        pos.qty = new_qty
+        pos.notional = float(pos.entry_price) * float(pos.qty)
+        pos.stop_loss = initial_stop
+        pos.tp1 = calc_tp1_price(float(pos.entry_price), atr, side, symbol, pos)
+        pos.trailing_stop = None
+        pos.trail_active = False
+        pos.be_moved = False
+        pos.peak_price = max(float(getattr(pos, "peak_price", price) or price), float(price)) if side == "long" else min(float(getattr(pos, "peak_price", price) or price), float(price))
+        pos.pyramid_level = int(getattr(pos, "pyramid_level", 0) or 0) + 1
+        pos.trade_type = trade_type
+        pos.market_state = market_state
+        try:
+            pos.open_time = min(float(getattr(pos, "open_time", bar_index) or bar_index), float(bar_index))
+        except Exception:
+            pos.open_time = float(bar_index)
+        self._update_position_state(symbol, pos)
+        logger.info("[RUNNER] PYRAMID %s %s add_qty=%.6f price=%.4f new_qty=%.6f sl=%.4f tp1=%.4f level=%s", side.upper(), symbol, qty, price, pos.qty, pos.stop_loss or 0.0, pos.tp1 or 0.0, pos.pyramid_level)
+        return True
 
     def _update_position_state(self, symbol: str, pos: PositionState | None) -> None:
         """Сохранить позицию в локальный кэш и файл состояния."""
@@ -590,11 +960,12 @@ class LiveRunner:
         )
 
         # Telegram notification about closed position with PnL/ROE
+        pnl = 0.0
+        side = pos.side
         try:
             entry = float(pos.entry_price)
             exit_price = float(price)
             qty_val = float(qty)
-            side = pos.side
             sign = 1.0 if side == "long" else -1.0
             pnl = (exit_price - entry) * qty_val * sign
             roe_pct = None
@@ -634,6 +1005,15 @@ class LiveRunner:
             )
         except Exception as e:  # pragma: no cover
             logger.exception("[RUNNER] failed to send close position notification for %s: %s", symbol, e)
+
+        try:
+            bar_open_ts_ms = float(self._latest_bar_open_time_ms.get(symbol, 0.0) or 0.0)
+            if reason == "stop_loss":
+                self._register_stop_loss_cooldown(symbol, side, bar_open_ts_ms=bar_open_ts_ms or time.time() * 1000.0, pnl=pnl)
+            elif bool(getattr(config, "ENTRY_COOLDOWN_RESET_ON_NON_LOSS_EXIT", True)):
+                self._reset_entry_cooldown_streak(symbol, side, keep_until_ts=False)
+        except Exception:
+            logger.exception("[RUNNER] failed to update cooldown state for %s", symbol)
 
         self._update_position_state(symbol, None)
 
@@ -730,11 +1110,17 @@ class LiveRunner:
             saved_positions = self.state.get_positions()
             self._positions = dict(saved_positions)
             logger.info("[RUNNER] restored %s positions from state", len(self._positions))
+            for sym in self.symbols:
+                for side in ("long", "short"):
+                    cd = self.state.get_entry_cooldown(sym, side)
+                    self._entry_cooldowns.setdefault(sym, {})[side] = float(cd.get("until_ts", 0.0) or 0.0)
+                    self._stop_loss_streaks.setdefault(sym, {})[side] = int(cd.get("stop_streak", 0) or 0)
         except Exception as e:
             logger.exception("[RUNNER] failed to restore positions from state: %s", e)
             self._positions = {}
 
         await self._init_broker()
+        await self._sync_exchange_leverage()
 
         if self._broker is None:
             raise RuntimeError("Broker is not initialized")
@@ -749,6 +1135,15 @@ class LiveRunner:
         await self._preload_history()
         await ws.start()
         logger.info("[RUNNER] WebSocket manager started")
+
+        async def protective_loop() -> None:
+            poll_sec = max(5, int(getattr(config, "LIVE_PROTECTIVE_POLL_SEC", 15) or 15))
+            while True:
+                try:
+                    await self._protect_open_positions_live()
+                except Exception as e:
+                    logger.exception("[RUNNER] protective loop error: %s", e)
+                await asyncio.sleep(poll_sec)
 
         # Heartbeat: периодически шлём сообщение в логи / Telegram
         async def heartbeat_loop() -> None:
@@ -835,6 +1230,7 @@ class LiveRunner:
                 await asyncio.sleep(getattr(config, "EQUITY_NOTIFY_INTERVAL", 600))
 
         hb_task = asyncio.create_task(heartbeat_loop())
+        protective_task = asyncio.create_task(protective_loop())
 
         # Ожидание сигналов, основная работа идёт в колбеках WS.
         try:
@@ -844,6 +1240,7 @@ class LiveRunner:
             logger.info("[RUNNER] cancelled, shutting down...")
         finally:
             hb_task.cancel()
+            protective_task.cancel()
             if self._ws_manager:
                 await self._ws_manager.stop()
             if self._broker is not None:

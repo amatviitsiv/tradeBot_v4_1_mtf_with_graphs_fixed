@@ -35,8 +35,8 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["SMA_TREND"] = close.rolling(sma_period).mean()
 
     # ---------------- EMA fast/slow (старый базовый тренд-фильтр) ----------------
-    ema_fast_period = int(getattr(cfg, "EMA_FAST_PERIOD", 20))
-    ema_slow_period = int(getattr(cfg, "EMA_SLOW_PERIOD", 50))
+    ema_fast_period = int(getattr(cfg, "EMA_FAST_PERIOD", getattr(cfg, "EMA_FAST", 20)))
+    ema_slow_period = int(getattr(cfg, "EMA_SLOW_PERIOD", getattr(cfg, "EMA_SLOW", 50)))
     df["EMA_Fast"] = close.ewm(span=ema_fast_period, adjust=False).mean()
     df["EMA_Slow"] = close.ewm(span=ema_slow_period, adjust=False).mean()
 
