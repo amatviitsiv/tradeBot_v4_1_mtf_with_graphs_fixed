@@ -131,26 +131,43 @@ class Backtester:
             return False
         if bool(getattr(pos, "tp1_hit", False)) and not bool(cfg.get_symbol_param_bool(sym, "BTC_PYRAMID_ALLOW_AFTER_TP1", bool(getattr(cfg, "BTC_PYRAMID_ALLOW_AFTER_TP1", True)))):
             return False
-        allowed = {str(x).lower() for x in (cfg.get_symbol_param(sym, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", getattr(cfg, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", ["continuation", "cont_compression", "impulse"])) or [])}
+        allowed = {str(x).lower() for x in (cfg.get_symbol_param(sym, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", getattr(cfg, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", ["continuation", "cont_compression", "impulse", "liquidity_reversal"])) or [])}
         trade_type = str(sig_meta.get("trade_type", "") or "").lower()
         if allowed and trade_type not in allowed:
             return False
-        if bool(cfg.get_symbol_param_bool(sym, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", bool(getattr(cfg, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", True)))) and not bool(sig_meta.get("strong_setup", False)):
-            return False
         adx_h = float(sig_meta.get("adx_h", 0.0) or 0.0)
         drift = abs(float(sig_meta.get("drift", 0.0) or 0.0))
+        progress = (price - float(pos.entry_price)) / atr if pos.side == "long" else (float(pos.entry_price) - price) / atr
+        if trade_type == "liquidity_reversal":
+            if not bool(cfg.get_symbol_param_bool(sym, "BTC_LIQUIDITY_PYRAMID_ENABLED", True)):
+                return False
+            max_adds = int(cfg.get_symbol_param_int(sym, "BTC_LIQUIDITY_PYRAMID_MAX_ADDS", 1))
+            if int(getattr(pos, "pyramid_level", 0) or 0) >= max_adds:
+                return False
+            if bool(getattr(pos, "tp1_hit", False)) and not bool(cfg.get_symbol_param_bool(sym, "BTC_LIQUIDITY_PYRAMID_ALLOW_AFTER_TP1", True)):
+                return False
+            if adx_h > float(cfg.get_symbol_param_float(sym, "BTC_LIQUIDITY_PYRAMID_MAX_ADX_H", 22.5)):
+                return False
+            if drift > float(cfg.get_symbol_param_float(sym, "BTC_LIQUIDITY_PYRAMID_MAX_DRIFT_PCT", 0.0050)):
+                return False
+            min_progress_atr = float(cfg.get_symbol_param_float(sym, "BTC_LIQUIDITY_PYRAMID_MIN_PROGRESS_ATR", 0.22))
+            return progress >= min_progress_atr
+        if bool(cfg.get_symbol_param_bool(sym, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", bool(getattr(cfg, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", True)))) and not bool(sig_meta.get("strong_setup", False)):
+            return False
         if adx_h < float(cfg.get_symbol_param_float(sym, "BTC_PYRAMID_MIN_ADX_H", float(getattr(cfg, "BTC_PYRAMID_MIN_ADX_H", 24.0)))):
             return False
         if drift < float(cfg.get_symbol_param_float(sym, "BTC_PYRAMID_MIN_DRIFT", float(getattr(cfg, "BTC_PYRAMID_MIN_DRIFT", 0.0012)))):
             return False
         min_progress_atr = float(cfg.get_symbol_param_float(sym, "BTC_PYRAMID_MIN_PROGRESS_ATR", float(getattr(cfg, "BTC_PYRAMID_MIN_PROGRESS_ATR", 0.45))))
-        progress = (price - float(pos.entry_price)) / atr if pos.side == "long" else (float(pos.entry_price) - price) / atr
         return progress >= min_progress_atr
 
     def _apply_pyramid_addition(self, sym: str, pos: Position, price: float, atr: float, equity: float, side: str, sig_meta: Dict[str, Any]) -> Position:
-        risk_fraction = float(cfg.get_symbol_param_float(sym, "BTC_PYRAMID_RISK_FRACTION", float(getattr(cfg, "BTC_PYRAMID_RISK_FRACTION", 0.55))))
-        leverage = int(getattr(cfg, "FUTURES_LEVERAGE_DEFAULT", 5))
         trade_type = str(sig_meta.get("trade_type", getattr(pos, "trade_type", "continuation")) or "continuation")
+        if trade_type == "liquidity_reversal":
+            risk_fraction = float(cfg.get_symbol_param_float(sym, "BTC_LIQUIDITY_PYRAMID_RISK_FRACTION", 0.35))
+        else:
+            risk_fraction = float(cfg.get_symbol_param_float(sym, "BTC_PYRAMID_RISK_FRACTION", float(getattr(cfg, "BTC_PYRAMID_RISK_FRACTION", 0.55))))
+        leverage = int(getattr(cfg, "FUTURES_LEVERAGE_DEFAULT", 5))
         market_state = str(sig_meta.get("market_state", getattr(pos, "market_state", "unknown")) or "unknown")
         initial_stop = calc_initial_stop_price(price, atr, side, sym, pos, trade_type=trade_type, market_state=market_state)
         stop_distance_pct = abs(price - initial_stop) / price * 100.0

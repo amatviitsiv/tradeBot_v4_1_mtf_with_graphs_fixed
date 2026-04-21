@@ -17,7 +17,6 @@ import logging
 from logger_setup import setup_logging
 import signal
 import time
-from contextlib import suppress
 from typing import Dict, List
 
 import pandas as pd
@@ -99,68 +98,6 @@ class LiveRunner:
         broker = await LiveFuturesBroker.create(api_key=api_key, api_secret=api_secret)
         self._broker = broker
         logger.info("[RUNNER] LiveFuturesBroker initialized")
-
-    async def _sync_exchange_leverage(self) -> None:
-        if self._broker is None:
-            return
-        if not bool(getattr(config, "LIVE_SYNC_LEVERAGE_ON_START", True)):
-            return
-        leverage = int(getattr(config, "FUTURES_LEVERAGE_DEFAULT", 5) or 5)
-        retries = max(1, int(getattr(config, "LIVE_SET_LEVERAGE_RETRIES", 3) or 3))
-        for symbol in self.symbols:
-            ok = False
-            last_error = None
-            for _ in range(retries):
-                try:
-                    await self._broker.set_leverage(symbol, leverage)
-                    ok = True
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.exception("[RUNNER] failed to sync leverage for %s: %s", symbol, e)
-                    await asyncio.sleep(1)
-            if ok:
-                logger.info("[RUNNER] leverage synced for %s => %sx", symbol, leverage)
-            elif last_error is not None:
-                logger.error("[RUNNER] leverage sync failed for %s after retries: %s", symbol, last_error)
-        if bool(getattr(config, "LIVE_NOTIFY_LEVERAGE_SYNC", True)):
-            with suppress(Exception):
-                self.notifier.notify_error("leverage_sync", f"Live leverage synced to {leverage}x for {self.symbols}")
-
-    async def _protect_open_positions_live(self) -> None:
-        if self._broker is None or not bool(getattr(config, "LIVE_PROTECTIVE_USE_MARK_PRICE", True)):
-            return
-        for symbol, pos in list(self._positions.items()):
-            if pos is None or float(getattr(pos, "qty", 0.0) or 0.0) <= 0:
-                continue
-            try:
-                mark_price = await self._broker.get_mark_price(symbol)
-            except Exception as e:
-                logger.exception("[RUNNER] failed to get mark price for %s: %s", symbol, e)
-                continue
-            if not mark_price or mark_price <= 0:
-                continue
-            try:
-                if pos.stop_loss is not None:
-                    if pos.side == "long" and mark_price <= pos.stop_loss:
-                        logger.warning("[RUNNER] protective stop by mark price for %s at %.4f (sl=%.4f)", symbol, mark_price, pos.stop_loss)
-                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_stop_mark")
-                        continue
-                    if pos.side == "short" and mark_price >= pos.stop_loss:
-                        logger.warning("[RUNNER] protective stop by mark price for %s at %.4f (sl=%.4f)", symbol, mark_price, pos.stop_loss)
-                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_stop_mark")
-                        continue
-                if pos.trailing_stop is not None:
-                    if pos.side == "long" and mark_price <= pos.trailing_stop:
-                        logger.warning("[RUNNER] protective trailing stop by mark price for %s at %.4f (trail=%.4f)", symbol, mark_price, pos.trailing_stop)
-                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_trailing_mark")
-                        continue
-                    if pos.side == "short" and mark_price >= pos.trailing_stop:
-                        logger.warning("[RUNNER] protective trailing stop by mark price for %s at %.4f (trail=%.4f)", symbol, mark_price, pos.trailing_stop)
-                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_trailing_mark")
-                        continue
-            except Exception as e:
-                logger.exception("[RUNNER] protective close check failed for %s: %s", symbol, e)
 
     async def _preload_history(self) -> None:
         """Подгрузить историю (15m/1h) через REST, чтобы стратегия не ждала часы на прогрев."""
@@ -831,27 +768,44 @@ class LiveRunner:
             return False
         if bool(getattr(pos, "tp1_hit", False)) and not bool(config.get_symbol_param_bool(symbol, "BTC_PYRAMID_ALLOW_AFTER_TP1", bool(getattr(config, "BTC_PYRAMID_ALLOW_AFTER_TP1", True)))):
             return False
-        allowed = {str(x).lower() for x in (config.get_symbol_param(symbol, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", getattr(config, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", ["continuation", "cont_compression", "impulse"])) or [])}
+        allowed = {str(x).lower() for x in (config.get_symbol_param(symbol, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", getattr(config, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", ["continuation", "cont_compression", "impulse", "liquidity_reversal"])) or [])}
         trade_type = str(sig_meta.get("trade_type", "") or "").lower()
         if allowed and trade_type not in allowed:
             return False
-        if bool(config.get_symbol_param_bool(symbol, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", bool(getattr(config, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", True)))) and not bool(sig_meta.get("strong_setup", False)):
-            return False
         adx_h = float(sig_meta.get("adx_h", 0.0) or 0.0)
         drift = abs(float(sig_meta.get("drift", 0.0) or 0.0))
+        progress = (price - float(pos.entry_price)) / atr if pos.side == "long" else (float(pos.entry_price) - price) / atr
+        if trade_type == "liquidity_reversal":
+            if not bool(config.get_symbol_param_bool(symbol, "BTC_LIQUIDITY_PYRAMID_ENABLED", True)):
+                return False
+            max_adds = int(config.get_symbol_param_int(symbol, "BTC_LIQUIDITY_PYRAMID_MAX_ADDS", 1))
+            if int(getattr(pos, "pyramid_level", 0) or 0) >= max_adds:
+                return False
+            if bool(getattr(pos, "tp1_hit", False)) and not bool(config.get_symbol_param_bool(symbol, "BTC_LIQUIDITY_PYRAMID_ALLOW_AFTER_TP1", True)):
+                return False
+            if adx_h > float(config.get_symbol_param_float(symbol, "BTC_LIQUIDITY_PYRAMID_MAX_ADX_H", 22.5)):
+                return False
+            if drift > float(config.get_symbol_param_float(symbol, "BTC_LIQUIDITY_PYRAMID_MAX_DRIFT_PCT", 0.0050)):
+                return False
+            min_progress_atr = float(config.get_symbol_param_float(symbol, "BTC_LIQUIDITY_PYRAMID_MIN_PROGRESS_ATR", 0.22))
+            return progress >= min_progress_atr
+        if bool(config.get_symbol_param_bool(symbol, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", bool(getattr(config, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", True)))) and not bool(sig_meta.get("strong_setup", False)):
+            return False
         if adx_h < float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_MIN_ADX_H", float(getattr(config, "BTC_PYRAMID_MIN_ADX_H", 24.0)))):
             return False
         if drift < float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_MIN_DRIFT", float(getattr(config, "BTC_PYRAMID_MIN_DRIFT", 0.0012)))):
             return False
         min_progress_atr = float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_MIN_PROGRESS_ATR", float(getattr(config, "BTC_PYRAMID_MIN_PROGRESS_ATR", 0.45))))
-        progress = (price - float(pos.entry_price)) / atr if pos.side == "long" else (float(pos.entry_price) - price) / atr
         return progress >= min_progress_atr
 
     async def _apply_pyramid_addition_live(self, symbol: str, pos: PositionState, price: float, atr: float, equity: float, side: str, sig_meta: dict, bar_index: int) -> bool:
         if self._broker is None:
             return False
         leverage = int(getattr(config, "FUTURES_LEVERAGE_DEFAULT", 5))
-        risk_fraction = float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_RISK_FRACTION", float(getattr(config, "BTC_PYRAMID_RISK_FRACTION", 0.55))))
+        if trade_type == "liquidity_reversal":
+            risk_fraction = float(config.get_symbol_param_float(symbol, "BTC_LIQUIDITY_PYRAMID_RISK_FRACTION", 0.35))
+        else:
+            risk_fraction = float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_RISK_FRACTION", float(getattr(config, "BTC_PYRAMID_RISK_FRACTION", 0.55))))
         trade_type = str(sig_meta.get("trade_type", getattr(pos, "trade_type", "continuation")) or "continuation")
         market_state = str(sig_meta.get("market_state", getattr(pos, "market_state", "unknown")) or "unknown")
         initial_stop = calc_initial_stop_price(price, atr, side, symbol, pos, trade_type=trade_type, market_state=market_state)
@@ -1120,7 +1074,6 @@ class LiveRunner:
             self._positions = {}
 
         await self._init_broker()
-        await self._sync_exchange_leverage()
 
         if self._broker is None:
             raise RuntimeError("Broker is not initialized")
@@ -1135,15 +1088,6 @@ class LiveRunner:
         await self._preload_history()
         await ws.start()
         logger.info("[RUNNER] WebSocket manager started")
-
-        async def protective_loop() -> None:
-            poll_sec = max(5, int(getattr(config, "LIVE_PROTECTIVE_POLL_SEC", 15) or 15))
-            while True:
-                try:
-                    await self._protect_open_positions_live()
-                except Exception as e:
-                    logger.exception("[RUNNER] protective loop error: %s", e)
-                await asyncio.sleep(poll_sec)
 
         # Heartbeat: периодически шлём сообщение в логи / Telegram
         async def heartbeat_loop() -> None:
@@ -1230,7 +1174,6 @@ class LiveRunner:
                 await asyncio.sleep(getattr(config, "EQUITY_NOTIFY_INTERVAL", 600))
 
         hb_task = asyncio.create_task(heartbeat_loop())
-        protective_task = asyncio.create_task(protective_loop())
 
         # Ожидание сигналов, основная работа идёт в колбеках WS.
         try:
@@ -1240,7 +1183,6 @@ class LiveRunner:
             logger.info("[RUNNER] cancelled, shutting down...")
         finally:
             hb_task.cancel()
-            protective_task.cancel()
             if self._ws_manager:
                 await self._ws_manager.stop()
             if self._broker is not None:

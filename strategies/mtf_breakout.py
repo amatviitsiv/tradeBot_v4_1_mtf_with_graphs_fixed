@@ -84,7 +84,9 @@ class MTFBreakoutStrategy(BaseStrategy):
         self._current_market_state = "unknown"
         self._current_adx_h = 0.0
         self._current_drift = 0.0
+        self._last_btc_liquidity_reversal_bar_index = -10**9
         self._maybe_reset_alt_trace_file()
+        self._last_btc_liquidity_reversal_bar_index = -10**9
 
     def _apply_directional_setup_scaling(self, symbol: str, base_risk_multiplier: float, adx_h: float, drift: float, volume_meta: dict | None = None, trade_type: str = "", side: str = "", market_state: str = "", trend_quality_meta: dict | None = None) -> tuple[float, dict]:
         return apply_directional_setup_scaling_helper(self, symbol=symbol, base_risk_multiplier=base_risk_multiplier, adx_h=adx_h, drift=drift, volume_meta=volume_meta, trade_type=trade_type, side=side, market_state=market_state, trend_quality_meta=trend_quality_meta)
@@ -264,6 +266,42 @@ class MTFBreakoutStrategy(BaseStrategy):
             tuned *= weak_cont_mult
             flags.update({"btc_stage7_risk_tuned": True, "btc_stage7_tier": "weak_continuation", "btc_stage7_risk_mult": weak_cont_mult})
         return tuned, flags
+
+
+    def _check_btc_liquidity_reversal(self, *, symbol: str, market_state: str, df: pd.DataFrame, recent: pd.DataFrame, range_high: float, range_low: float, atr_ltf: float, adx_h: float, drift: float, bar_index: int) -> tuple[str | None, dict]:
+        if symbol != "BTCUSDT" or not bool(cfg.get_symbol_param_bool(symbol, "BTC_LIQUIDITY_REVERSAL_ENABLED", bool(getattr(cfg, "BTC_LIQUIDITY_REVERSAL_ENABLED", False)))):
+            return None, {"reason": "disabled"}
+        allowed_states = set(cfg.get_symbol_param(symbol, "BTC_LIQUIDITY_REVERSAL_ALLOWED_STATES", getattr(cfg, "BTC_LIQUIDITY_REVERSAL_ALLOWED_STATES", ["range", "flat", "transition"])) or [])
+        if market_state not in allowed_states:
+            return None, {"reason": "market_state_not_allowed", "market_state": market_state}
+        if adx_h > float(cfg.get_symbol_param_float(symbol, "BTC_LIQUIDITY_REVERSAL_MAX_ADX_H", float(getattr(cfg, "BTC_LIQUIDITY_REVERSAL_MAX_ADX_H", 18.5)))):
+            return None, {"reason": "adx_too_high", "adx_h": adx_h}
+        if abs(drift) > float(cfg.get_symbol_param_float(symbol, "BTC_LIQUIDITY_REVERSAL_MAX_DRIFT_PCT", float(getattr(cfg, "BTC_LIQUIDITY_REVERSAL_MAX_DRIFT_PCT", 0.0038)))):
+            return None, {"reason": "drift_too_high", "drift": drift}
+        cooldown_bars = int(cfg.get_symbol_param_int(symbol, "BTC_LIQUIDITY_REVERSAL_COOLDOWN_BARS", int(getattr(cfg, "BTC_LIQUIDITY_REVERSAL_COOLDOWN_BARS", 72))))
+        if bar_index - int(getattr(self, "_last_btc_liquidity_reversal_bar_index", -10**9)) < cooldown_bars:
+            return None, {"reason": "cooldown_active"}
+        max_signals_per_day = int(cfg.get_symbol_param_int(symbol, "BTC_LIQUIDITY_MAX_SIGNALS_PER_DAY", int(getattr(cfg, "BTC_LIQUIDITY_MAX_SIGNALS_PER_DAY", 2))))
+        last_ts = recent.index[-1] if hasattr(recent, "index") and len(recent.index) else None
+        if hasattr(last_ts, "date"):
+            day_key = str(last_ts.date())
+        else:
+            day_key = f"bucket_{bar_index // 96}"
+        daily_counts = getattr(self, "_btc_liquidity_daily_counts", None)
+        if not isinstance(daily_counts, dict):
+            daily_counts = {}
+            self._btc_liquidity_daily_counts = daily_counts
+        if int(daily_counts.get(day_key, 0)) >= max_signals_per_day:
+            return None, {"reason": "daily_limit_reached", "day_key": day_key}
+        ok, meta = check_fakeout_reversal_entry(symbol=symbol, df=df, recent=recent, side="long", range_high=range_high, range_low=range_low, atr_ltf=atr_ltf, adx_h=adx_h)
+        if not ok:
+            return None, meta
+        meta = dict(meta or {})
+        meta["reason"] = "btc_liquidity_reversal"
+        meta["drift"] = drift
+        meta["strong_setup"] = True
+        meta["adx_h"] = adx_h
+        return "buy", meta
 
     def _check_stage10v2_basic_btc_mr(self, *, symbol: str, market_state: str, recent: pd.DataFrame, candle: pd.Series, atr_ltf: float, adx_h: float, drift: float, bar_index: int) -> tuple[str | None, dict]:
         if symbol != "BTCUSDT" or not bool(cfg.get_symbol_param_bool(symbol, "BTC_STAGE10V2_BASIC_MR_ENABLED", bool(getattr(cfg, "BTC_STAGE10V2_BASIC_MR_ENABLED", False)))):
@@ -1394,6 +1432,11 @@ class MTFBreakoutStrategy(BaseStrategy):
         short_trigger = range_low * (1.0 - buf)
 
         bar_index = len(df) - 1
+        liquidity_signal, liquidity_meta = self._check_btc_liquidity_reversal(symbol=symbol, market_state=market_state, df=df, recent=recent, range_high=range_high, range_low=range_low, atr_ltf=atr_ltf, adx_h=adx_h, drift=drift, bar_index=bar_index)
+        if liquidity_signal is not None:
+            self._last_btc_liquidity_reversal_bar_index = bar_index
+            return self._set_signal(liquidity_signal, trade_type="liquidity_reversal", risk_multiplier=float(cfg.get_symbol_param_float(symbol, "BTC_LIQUIDITY_REVERSAL_RISK_MULT", float(getattr(cfg, "BTC_LIQUIDITY_REVERSAL_RISK_MULT", 0.42)))), market_state=market_state, regime=regime, liquidity_meta=liquidity_meta, side="long")
+
         stage10v2_mr_signal, stage10v2_mr_meta = self._check_stage10v2_basic_btc_mr(symbol=symbol, market_state=market_state, recent=recent, candle=last, atr_ltf=atr_ltf, adx_h=adx_h, drift=drift, bar_index=bar_index)
         if stage10v2_mr_signal is not None:
             self._last_btc_stage10v2_mr_bar_index = bar_index

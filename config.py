@@ -41,8 +41,8 @@ STRATEGY_NAME = "mtf_breakout"
 FUTURES_SYMBOLS = ["BTCUSDT"]
 
 # Совместимые legacy-алиасы для старых мест кода.
-BINANCE_API_KEY = "cOzVm76AAqWwFe6vvHcoZ2wB1mNhJg01DJ9GpA5ZXq12nBpGmsJdwMoXTyRVA9Hw"
-BINANCE_API_SECRET = "O4o0oORj7wloy6DfeuWbcOVUy9SfV8z94gSyBQF63kHyQkPPJDXlZqYmuKwmKcfX"
+BINANCE_API_KEY = _env_str("BINANCE_API_KEY")
+BINANCE_API_SECRET = _env_str("BINANCE_API_SECRET")
 API_KEY = BINANCE_API_KEY
 API_SECRET = BINANCE_API_SECRET
 # ===== СПИСОК ПАР ДЛЯ ТОРГОВЛИ =====
@@ -81,7 +81,7 @@ BREAKOUT_BUFFER_PCT = 0.0010     # на сколько выше high/ниже lo
 FUTURES_FEE_RATE = 0.0004
 
 # Риск на сделку (если захочешь считать через стоп)
-RISK_PER_TRADE = 0.026                # 2.2% от equity (BTC-only stage2 selective sizing)
+RISK_PER_TRADE = 0.024                # 2.2% от equity (BTC-only stage2 selective sizing)
 
 # ===== ФЬЮЧЕРСЫ =====
 # Базовое плечо. В коде можно будет делать dynamic_leverage(equity)
@@ -309,7 +309,7 @@ SYMBOL_PARAM_OVERRIDES = {
         "BTC_STAGE7_STRONG_EXIT_EARLY_EXIT_PROGRESS_RELAX_ATR": 0.10,
         "BTC_STAGE7_STRONG_EXIT_EARLY_CUT_LOSS_BONUS_ATR": 0.25,
         "BTC_RANGE_ENGINE_ENABLED": True,
-        "BTC_RANGE_ALLOWED_TYPES": ["mean_reversion", "reclaim_range"],
+        "BTC_RANGE_ALLOWED_TYPES": ["mean_reversion", "reclaim_range", "liquidity_reversal"],
         "BTC_RANGE_ALLOWED_MARKET_STATES": ["range", "flat", "chop", "transition"],
         "BTC_RANGE_MAX_ADX_H": 22.0,
         "BTC_RANGE_MAX_DRIFT_PCT": 0.0048,
@@ -318,6 +318,20 @@ SYMBOL_PARAM_OVERRIDES = {
         "BTC_MR_ANTI_KNIFE_MAX_BODY_ATR": 0.98,
         "BTC_MR_ANTI_KNIFE_MAX_NEG_PROGRESS_ATR": 0.62,
         "BTC_MR_ANTI_KNIFE_REQUIRE_GREEN_CANDLE": True,
+        "BTC_LIQUIDITY_REVERSAL_ENABLED": True,
+        "BTC_LIQUIDITY_REVERSAL_ALLOWED_STATES": ["range", "flat", "transition"],
+        "BTC_LIQUIDITY_REVERSAL_MAX_ADX_H": 22.0,
+        "BTC_LIQUIDITY_REVERSAL_MAX_DRIFT_PCT": 0.0049,
+        "BTC_LIQUIDITY_REVERSAL_RISK_MULT": 0.65,
+        "BTC_LIQUIDITY_REVERSAL_COOLDOWN_BARS": 48,
+        "BTC_LIQUIDITY_MAX_SIGNALS_PER_DAY": 2,
+        "BTC_LIQUIDITY_PYRAMID_ENABLED": True,
+        "BTC_LIQUIDITY_PYRAMID_MAX_ADDS": 1,
+        "BTC_LIQUIDITY_PYRAMID_RISK_FRACTION": 0.35,
+        "BTC_LIQUIDITY_PYRAMID_MIN_PROGRESS_ATR": 0.22,
+        "BTC_LIQUIDITY_PYRAMID_MAX_ADX_H": 22.5,
+        "BTC_LIQUIDITY_PYRAMID_MAX_DRIFT_PCT": 0.0050,
+        "BTC_LIQUIDITY_PYRAMID_ALLOW_AFTER_TP1": True,
         "BTC_STAGE10V2_BASIC_MR_ENABLED": True,
         "BTC_STAGE10V2_BASIC_MR_ALLOWED_STATES": ["range", "flat"],
         "BTC_STAGE10V2_BASIC_MR_MAX_ADX_H": 14.0,
@@ -332,6 +346,11 @@ SYMBOL_PARAM_OVERRIDES = {
         "BTC_STAGE10V2_BASIC_MR_MIN_VOL_RATIO": 1.00,
         "BTC_STAGE10V2_BASIC_MR_RISK_MULT": 0.34,
         "BTC_STAGE10V2_BASIC_MR_COOLDOWN_BARS": 144,
+        "FAKEOUT_PIERCE_ATR": 0.11,
+        "FAKEOUT_MIN_BODY_ATR": 0.18,
+        "FAKEOUT_MIN_VOL_RATIO": 0.86,
+        "FAKEOUT_MAX_ADX": 22.0,
+        "FAKEOUT_RSI_LONG_MAX": 38.0,
         "BTC_RECLAIM_ALLOWED_STATES": ["range", "flat"],
         "BTC_SHORTS_ONLY_STRONG_BEAR": 1,
         "BTC_DISABLE_IMPULSE_SHORT": 1,
@@ -498,12 +517,12 @@ ENTRY_COOLDOWN_BAR_SECONDS = 15 * 60             # M15 = 900 секунд
 
 # ===== Stage5: BTC no-trade / bad-market filter =====
 BTC_NO_TRADE_FILTER_ENABLED = True
-BTC_NO_TRADE_ALLOWED_TYPES = ["impulse", "continuation", "pullback", "mean_reversion", "reclaim_range"]
+BTC_NO_TRADE_ALLOWED_TYPES = ["impulse", "continuation", "pullback", "mean_reversion", "reclaim_range", "liquidity_reversal"]
 BTC_NO_TRADE_BLOCKED_MARKET_STATES = ["range", "flat", "chop"]
 BTC_NO_TRADE_MIN_ADX_H = 23.0
 BTC_NO_TRADE_MIN_DRIFT_PCT = 0.0058
 BTC_RANGE_ENGINE_ENABLED = True
-BTC_RANGE_ALLOWED_TYPES = ["mean_reversion", "reclaim_range"]
+BTC_RANGE_ALLOWED_TYPES = ["mean_reversion", "reclaim_range", "liquidity_reversal"]
 BTC_RANGE_ALLOWED_MARKET_STATES = ["range", "flat", "chop", "transition"]
 BTC_RANGE_MAX_ADX_H = 22.5
 BTC_RANGE_MAX_DRIFT_PCT = 0.0048
@@ -667,12 +686,19 @@ BTC_DISABLE_ALL_SHORTS = True
 BTC_PYRAMIDING_ENABLED = True
 BTC_PYRAMID_MAX_ADDS = 1
 BTC_PYRAMID_RISK_FRACTION = 0.55
-BTC_PYRAMID_ALLOWED_TRADE_TYPES = ["continuation", "cont_compression", "impulse"]
+BTC_PYRAMID_ALLOWED_TRADE_TYPES = ["continuation", "cont_compression", "impulse", "liquidity_reversal"]
 BTC_PYRAMID_REQUIRE_STRONG_SETUP = True
 BTC_PYRAMID_MIN_ADX_H = 24.0
 BTC_PYRAMID_MIN_DRIFT = 0.0012
 BTC_PYRAMID_MIN_PROGRESS_ATR = 0.45
 BTC_PYRAMID_ALLOW_AFTER_TP1 = True
+BTC_LIQUIDITY_PYRAMID_ENABLED = True
+BTC_LIQUIDITY_PYRAMID_MAX_ADDS = 1
+BTC_LIQUIDITY_PYRAMID_RISK_FRACTION = 0.35
+BTC_LIQUIDITY_PYRAMID_MIN_PROGRESS_ATR = 0.22
+BTC_LIQUIDITY_PYRAMID_MAX_ADX_H = 22.5
+BTC_LIQUIDITY_PYRAMID_MAX_DRIFT_PCT = 0.0050
+BTC_LIQUIDITY_PYRAMID_ALLOW_AFTER_TP1 = True
 BTC_SHORT_CONT_MIN_HTF_ADX = 17.0
 BTC_SHORT_CONT_MIN_DRIFT_PCT = 0.004
 BTC_SHORT_CONT_MAX_HTF_RSI = 58.0
@@ -757,8 +783,8 @@ STRATEGY_VERSION = _env_str("STRATEGY_VERSION", "mtf_breakout_regime_range_v1")
 # ===== Telegram-уведомления =====
 # Если TELEGRAM_ENABLED=1 и заданы токен и chat_id, бот будет слать уведомления.
 TELEGRAM_ENABLED = _env_bool("TELEGRAM_ENABLED", True)
-TELEGRAM_BOT_TOKEN = "8269222363:AAF6vM7-ydXHJjBiq42MDK4jWn5sYbIub7w"
-TELEGRAM_CHAT_ID = "351630680"
+TELEGRAM_BOT_TOKEN = _env_str("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = _env_str("TELEGRAM_CHAT_ID")
 
 # ===== Protective layer (Step9) =====
 # Жёсткий лимит по просадке от пика equity (0 = выключено)
@@ -769,13 +795,6 @@ MAX_TRADES_PER_HOUR = _env_int("MAX_TRADES_PER_HOUR", 20)
 
 # Минимальный интервал между повторными входами по одному и тому же символу (анти-луп), сек
 MIN_REOPEN_INTERVAL_SEC = _env_int("MIN_REOPEN_INTERVAL_SEC", 300)
-
-# Live battle mode
-LIVE_SYNC_LEVERAGE_ON_START = True
-LIVE_PROTECTIVE_POLL_SEC = _env_int("LIVE_PROTECTIVE_POLL_SEC", 15)
-LIVE_PROTECTIVE_USE_MARK_PRICE = True
-LIVE_SET_LEVERAGE_RETRIES = _env_int("LIVE_SET_LEVERAGE_RETRIES", 3)
-LIVE_NOTIFY_LEVERAGE_SYNC = True
 
 # Максимально допустимая "тишина" по WebSocket (сек); 0 = не проверять
 WS_STALE_SECONDS = _env_int("WS_STALE_SECONDS", 900)
@@ -874,11 +893,11 @@ ENABLE_FAKEOUT = False
 ENABLE_CONT_COMP = False
 RISK_MULTIPLIER_FAKEOUT = 0.45
 RISK_MULTIPLIER_CONT_COMP = 0.60
-FAKEOUT_PIERCE_ATR = 0.16
-FAKEOUT_MIN_BODY_ATR = 0.28
-FAKEOUT_MIN_VOL_RATIO = 0.90
-FAKEOUT_MAX_ADX = 24.0
-FAKEOUT_RSI_LONG_MAX = 32.0
+FAKEOUT_PIERCE_ATR = 0.14
+FAKEOUT_MIN_BODY_ATR = 0.24
+FAKEOUT_MIN_VOL_RATIO = 0.84
+FAKEOUT_MAX_ADX = 26.0
+FAKEOUT_RSI_LONG_MAX = 35.0
 FAKEOUT_RSI_SHORT_MIN = 68.0
 CONT_COMP_MAX_COMPRESSION_RATIO = 0.82
 CONT_COMP_MAX_ATR_RATIO = 0.90
@@ -1372,6 +1391,14 @@ V26_1_SMART_AGGRESSIVE_MODE = True
 BACKTEST_INCLUDE_TRADE_DIAGNOSTICS = True
 
 # --- Stage10 v2: controlled BTC MR fallback ---
+BTC_LIQUIDITY_REVERSAL_ENABLED = True
+BTC_LIQUIDITY_REVERSAL_ALLOWED_STATES = ["range", "flat", "transition"]
+BTC_LIQUIDITY_REVERSAL_MAX_ADX_H = 22.0
+BTC_LIQUIDITY_REVERSAL_MAX_DRIFT_PCT = 0.0049
+BTC_LIQUIDITY_REVERSAL_RISK_MULT = 0.65
+BTC_LIQUIDITY_REVERSAL_COOLDOWN_BARS = 48
+BTC_LIQUIDITY_MAX_SIGNALS_PER_DAY = 2
+
 BTC_STAGE10V2_BASIC_MR_ENABLED = True
 BTC_STAGE10V2_BASIC_MR_ALLOWED_STATES = ["range", "flat"]
 BTC_STAGE10V2_BASIC_MR_MAX_ADX_H = 14.0

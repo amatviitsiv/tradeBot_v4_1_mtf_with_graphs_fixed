@@ -17,7 +17,7 @@ def _position_profile_from_values(market_state: str = "", trade_type: str = "") 
         return "continuation"
     if market_state in {"range", "transition"}:
         return "range"
-    if trade_type in {"range", "fakeout", "btc_exhaustion", "btc_exhaustion_short", "exhaustion_short"}:
+    if trade_type in {"range", "fakeout", "liquidity_reversal", "btc_exhaustion", "btc_exhaustion_short", "exhaustion_short"}:
         return "range"
     return "trend"
 
