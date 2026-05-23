@@ -14,6 +14,7 @@ import asyncio
 import os
 import json
 import logging
+import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import aiohttp
@@ -49,6 +50,25 @@ class BinanceWSManager:
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._task: Optional[asyncio.Task] = None
         self._stopped = asyncio.Event()
+        self._last_msg_ts: float = 0.0
+        self._raw_msg_count: int = 0
+        self._kline_msg_count: int = 0
+        self._closed_kline_msg_count: int = 0
+        self._last_raw_log_ts: float = 0.0
+        self._last_stream_log_ts: Dict[str, float] = {}
+        # Logs non-closed kline updates at most once per stream per N seconds.
+        # Set WS_KLINE_UPDATE_LOG_SECONDS=0 to disable.
+        try:
+            self._update_log_interval_sec = float(os.getenv("WS_KLINE_UPDATE_LOG_SECONDS", "60") or 0)
+        except Exception:
+            self._update_log_interval_sec = 60.0
+        try:
+            # If no raw WS frame is received for this long, log it and force a reconnect.
+            # Binance kline streams normally send updates frequently, so silence means
+            # the consumer is stuck or the connection is half-open.
+            self._receive_timeout_sec = float(os.getenv("WS_RECEIVE_TIMEOUT_SECONDS", "90") or 0)
+        except Exception:
+            self._receive_timeout_sec = 90.0
 
     # ====== публичные методы ======
 
@@ -105,8 +125,17 @@ class BinanceWSManager:
                     logger.info("[WS] connected to Binance streams")
                     delay = self.reconnect_delay  # сброс backoff после успешного подключения
 
-                    async for msg in ws:
-                        if self._stopped.is_set():
+                    while not self._stopped.is_set():
+                        try:
+                            if self._receive_timeout_sec and self._receive_timeout_sec > 0:
+                                msg = await ws.receive(timeout=self._receive_timeout_sec)
+                            else:
+                                msg = await ws.receive()
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "[WS] receive timeout: no raw frames for %.1fs, forcing reconnect",
+                                self._receive_timeout_sec,
+                            )
                             break
 
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -116,12 +145,23 @@ class BinanceWSManager:
                                 logger.warning("[WS] failed to parse message: %s", e)
                                 continue
                             await self._handle_message(data)
+                        elif msg.type == aiohttp.WSMsgType.BINARY:
+                            try:
+                                data = json.loads(msg.data.decode("utf-8"))
+                            except Exception as e:
+                                logger.warning("[WS] failed to parse binary message: %s", e)
+                                continue
+                            await self._handle_message(data)
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             logger.error("[WS] websocket error: %s", ws.exception())
                             break
-                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSE):
                             logger.info("[WS] websocket closed by server")
                             break
+                        elif msg.type in (aiohttp.WSMsgType.PING, aiohttp.WSMsgType.PONG):
+                            continue
+                        else:
+                            logger.debug("[WS] ignored message type: %s", msg.type)
 
             except asyncio.CancelledError:
                 # нормальное завершение по stop()
@@ -157,46 +197,85 @@ class BinanceWSManager:
         stream_str = "/".join(streams)
         return f"{self.BASE_URL}?streams={stream_str}"
 
-    async def _handle_message(self, payload: Dict[str, Any]) -> None:
-        """Обработка входящего сообщения от multiplex-стрима."""
-        # формат multiplex:
-        # {
-        #   "stream": "btcusdt@kline_15m",
-        #   "data": { "e": "kline", "E": 123456789, "s": "BTCUSDT", "k": {...} }
-        # }
-        if WS_DEBUG:
-            try:
-                logger.debug("[WS][DEBUG] raw msg: %s", payload)
-            except Exception:
-                pass
+    def _normalize_kline_payload(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return Binance kline dict from either raw or multiplex payload.
+
+        Binance multiplex frames look like:
+            {"stream": "btcusdt@kline_15m", "data": {"e": "kline", "k": {...}}}
+        Raw stream frames look like:
+            {"e": "kline", "k": {...}}
+        This helper also tolerates a direct kline dict during tests/fallback.
+        """
+        if not isinstance(payload, dict):
+            return None
 
         data = payload.get("data")
         if data is None:
             data = payload
         if not isinstance(data, dict):
-            return
+            return None
 
-        # интересуют только kline события (в multiplex может прилететь что-то ещё)
         ev = data.get("e")
         if ev is not None and ev != "kline":
-            return
+            return None
 
         k = data.get("k")
         if not isinstance(k, dict):
-            return
+            # Some internal tests/fallbacks may pass the kline dict directly.
+            if {"t", "i", "s"}.issubset(set(data.keys())):
+                k = data
+            else:
+                return None
 
-        # В некоторых ответах symbol есть только на верхнем уровне data["s"]
         if "s" not in k and "s" in data:
             k["s"] = data.get("s")
+        return k
+
+    async def _handle_message(self, payload: Dict[str, Any]) -> None:
+        """Обработка входящего сообщения от multiplex/raw kline stream."""
+        now = time.time()
+        self._last_msg_ts = now
+        self._raw_msg_count += 1
+        if WS_DEBUG:
+            try:
+                logger.debug("[WS][DEBUG] raw msg: %s", payload)
+            except Exception:
+                pass
+        if now - self._last_raw_log_ts >= 60.0:
+            self._last_raw_log_ts = now
+            logger.info("[WS] raw frames received=%s kline=%s closed=%s", self._raw_msg_count, self._kline_msg_count, self._closed_kline_msg_count)
+
+        k = self._normalize_kline_payload(payload)
+        if not isinstance(k, dict):
+            return
+        self._kline_msg_count += 1
 
         interval = k.get("i")
-        symbol = k.get("s") or data.get("s")
+        symbol = k.get("s")
 
-        # Логируем только закрытые свечи — это главный признак, что бот получает данные
+        # Production visibility: log closed candles always, and non-closed updates
+        # periodically so a silent callback/closed-candle issue is visible in live logs.
         try:
-            if k.get("x") and symbol and interval in ("15m", "1h"):
+            self._last_msg_ts = time.time()
+            if symbol and interval in ("15m", "1h"):
                 close_px = k.get("c")
-                logger.info("[WS] kline closed %s %s close=%s", symbol, interval, close_px)
+                is_closed = bool(k.get("x"))
+                if is_closed:
+                    self._closed_kline_msg_count += 1
+                    logger.info(
+                        "[WS] kline CLOSED %s %s open_time=%s close=%s",
+                        symbol, interval, k.get("t"), close_px,
+                    )
+                elif self._update_log_interval_sec > 0:
+                    stream_key = f"{symbol}:{interval}"
+                    now = time.time()
+                    last = self._last_stream_log_ts.get(stream_key, 0.0)
+                    if now - last >= self._update_log_interval_sec:
+                        self._last_stream_log_ts[stream_key] = now
+                        logger.info(
+                            "[WS] kline update %s %s closed=false open_time=%s close=%s",
+                            symbol, interval, k.get("t"), close_px,
+                        )
         except Exception:
             pass
 

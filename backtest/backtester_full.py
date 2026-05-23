@@ -12,12 +12,14 @@ if ROOT not in sys.path:
 
 import config as cfg
 from indicators import compute_indicators
+from timeframe_preload_validator import normalize_ohlcv_frame, validate_mtf_preload
 from strategy import signal_from_indicators
 from execution_policy import compute_trade_risk_multiplier
 from position_sizing_engine import compute_position_sizing_risk_pct
 from strategies import get_active_strategy
 from risk import RiskManager
 from position import PositionState as Position
+
 from position_management import (
     calc_initial_stop_price,
     calc_tp1_price,
@@ -37,6 +39,32 @@ from position_management import (
     mark_tp1_bar,
     should_close_runner_on_stall,
 )
+
+
+
+
+def _attach_signal_quality_to_position(pos: Any, sig_meta: Optional[Dict[str, Any]] = None) -> None:
+    if pos is None or not isinstance(sig_meta, dict):
+        return
+    def _first_float(*values, default=0.0):
+        for value in values:
+            try:
+                if value is not None:
+                    return float(value)
+            except Exception:
+                pass
+        return float(default)
+    pullback_meta = sig_meta.get("pullback_meta") if isinstance(sig_meta.get("pullback_meta"), dict) else {}
+    v52_meta = sig_meta.get("v52_microstructure_meta") if isinstance(sig_meta.get("v52_microstructure_meta"), dict) else {}
+    v60_meta = sig_meta.get("v60_short_meta") if isinstance(sig_meta.get("v60_short_meta"), dict) else {}
+    pos.v52_score = _first_float(sig_meta.get("v52_score"), pullback_meta.get("v52_score"), v52_meta.get("v52_score"))
+    pos.v60_short_score = _first_float(sig_meta.get("v60_short_score"), v60_meta.get("v60_short_score"), v60_meta.get("score"))
+    pos.v62_rank_score = _first_float(sig_meta.get("v62_rank_score"), pullback_meta.get("v62_rank_score"), v52_meta.get("v62_rank_score"))
+    pos.v62_short_rank_score = _first_float(sig_meta.get("v62_short_rank_score"), v60_meta.get("v62_short_rank_score"))
+    if str(getattr(pos, "side", "") or "").lower() == "short":
+        pos.v84_quality_score = max(float(pos.v60_short_score or 0.0), float(pos.v62_short_rank_score or 0.0))
+    else:
+        pos.v84_quality_score = max(float(pos.v52_score or 0.0), float(pos.v62_rank_score or 0.0))
 
 
 class Backtester:
@@ -63,6 +91,102 @@ class Backtester:
         self.closed_trades: List[Dict[str, Any]] = []
         self.partial_closes: List[Dict[str, Any]] = []
         self.trade_realized_pnl: Dict[str, float] = {}
+        self.sizing_audit: List[Dict[str, Any]] = []
+
+
+    def _record_sizing_audit(
+        self,
+        *,
+        year_bar: int,
+        symbol: str,
+        side: str,
+        trade_type: str,
+        price: float,
+        stop_distance_pct: float,
+        equity: float,
+        leverage: int,
+        base_risk_per_trade: float,
+        symbol_risk_multiplier: float,
+        trade_risk_multiplier: float,
+        sized_risk_per_trade: float,
+        notional: float,
+        qty: float,
+        sig_meta: Dict[str, Any] | None = None,
+        is_pyramid: bool = False,
+    ) -> None:
+        try:
+            if not bool(getattr(cfg, "V55_1_SIZING_AUDIT_ENABLED", False)):
+                return
+            sig_meta = sig_meta or {}
+            risk_amount = float(equity) * float(sized_risk_per_trade)
+            desired_notional_by_risk = risk_amount * 100.0 / float(stop_distance_pct) if float(stop_distance_pct) > 0 else 0.0
+            max_notional_by_leverage = float(equity) * float(leverage)
+            capped_by_leverage = bool(desired_notional_by_risk > max_notional_by_leverage + 1e-9)
+            effective_stop_risk_pct = (float(notional) * (float(stop_distance_pct) / 100.0) / float(equity)) if float(equity) > 0 else 0.0
+            row = {
+                "bar": int(year_bar),
+                "symbol": str(symbol),
+                "side": str(side),
+                "trade_type": str(trade_type),
+                "is_pyramid": bool(is_pyramid),
+                "price": float(price),
+                "stop_pct": float(stop_distance_pct),
+                "equity": float(equity),
+                "leverage": int(leverage),
+                "base_risk": float(base_risk_per_trade),
+                "symbol_mult": float(symbol_risk_multiplier),
+                "trade_mult": float(trade_risk_multiplier),
+                "sized_risk": float(sized_risk_per_trade),
+                "desired_notional_by_risk": float(desired_notional_by_risk),
+                "max_notional_by_leverage": float(max_notional_by_leverage),
+                "notional": float(notional),
+                "qty": float(qty),
+                "capped_by_leverage": capped_by_leverage,
+                "effective_stop_risk_pct": float(effective_stop_risk_pct),
+                "risk_multiplier_meta": float(sig_meta.get("risk_multiplier", 1.0) or 1.0),
+                "v55_scaled": bool(sig_meta.get("v55_scaled", False)),
+                "v55_score": float(sig_meta.get("v55_score", 0.0) or 0.0),
+                "v55_mult": float(sig_meta.get("v55_mult", 0.0) or 0.0),
+                "v55_after": float(sig_meta.get("v55_risk_mult_after", sig_meta.get("execution_risk_multiplier", 0.0)) or 0.0),
+            }
+            self.sizing_audit.append(row)
+            if bool(getattr(cfg, "V55_1_PRINT_EACH_ENTRY_AUDIT", False)):
+                print(
+                    "[SIZING_AUDIT] "
+                    f"bar={row['bar']} {row['symbol']} {row['side']} {row['trade_type']} "
+                    f"base={row['base_risk']:.4f} sym_mult={row['symbol_mult']:.3f} "
+                    f"trade_mult={row['trade_mult']:.3f} sized={row['sized_risk']:.4f} "
+                    f"stop={row['stop_pct']:.3f}% notional={row['notional']:.2f} "
+                    f"desired={row['desired_notional_by_risk']:.2f} maxLev={row['max_notional_by_leverage']:.2f} "
+                    f"capLev={row['capped_by_leverage']} effRisk={row['effective_stop_risk_pct']:.4f} "
+                    f"v55_scaled={row['v55_scaled']} v55_score={row['v55_score']:.3f}"
+                )
+        except Exception as exc:
+            if bool(getattr(cfg, "V55_1_PRINT_AUDIT_ERRORS", True)):
+                print(f"[SIZING_AUDIT_ERROR] {exc}")
+
+    def _sizing_audit_summary_rows(self) -> List[str]:
+        rows = self.sizing_audit or []
+        if not rows:
+            return []
+        total = len(rows)
+        capped = sum(1 for r in rows if bool(r.get("capped_by_leverage")))
+        scaled = sum(1 for r in rows if bool(r.get("v55_scaled")))
+        avg_sized = sum(float(r.get("sized_risk", 0.0)) for r in rows) / total
+        avg_eff = sum(float(r.get("effective_stop_risk_pct", 0.0)) for r in rows) / total
+        avg_stop = sum(float(r.get("stop_pct", 0.0)) for r in rows) / total
+        avg_notional = sum(float(r.get("notional", 0.0)) for r in rows) / total
+        max_notional = max(float(r.get("notional", 0.0)) for r in rows)
+        return [
+            f"entries={total}",
+            f"v55_scaled={scaled}",
+            f"leverage_capped={capped}",
+            f"avg_sized_risk={avg_sized:.4f}",
+            f"avg_effective_stop_risk={avg_eff:.4f}",
+            f"avg_stop_pct={avg_stop:.3f}",
+            f"avg_notional={avg_notional:.2f}",
+            f"max_notional={max_notional:.2f}",
+        ]
 
     def _trade_key(self, sym: str, pos: Position) -> str:
         return f"{sym}|{str(pos.side).lower()}|{int(float(getattr(pos, 'open_time', 0) or 0))}"
@@ -170,6 +294,17 @@ class Backtester:
         leverage = int(getattr(cfg, "FUTURES_LEVERAGE_DEFAULT", 5))
         market_state = str(sig_meta.get("market_state", getattr(pos, "market_state", "unknown")) or "unknown")
         initial_stop = calc_initial_stop_price(price, atr, side, sym, pos, trade_type=trade_type, market_state=market_state)
+        if bool(getattr(cfg, "V45_USE_STRUCTURAL_STOP_IN_BACKTEST", False)) and trade_type == "pullback":
+            try:
+                v45_stop = sig_meta.get("v45_struct_stop_price")
+                if v45_stop is None and isinstance(sig_meta.get("pullback_meta"), dict):
+                    v45_stop = sig_meta.get("pullback_meta", {}).get("v45_struct_stop_price")
+                if v45_stop is not None:
+                    v45_stop = float(v45_stop)
+                    if (side == "long" and v45_stop < price) or (side == "short" and v45_stop > price):
+                        initial_stop = v45_stop
+            except Exception:
+                pass
         stop_distance_pct = abs(price - initial_stop) / price * 100.0
         if stop_distance_pct <= 0:
             return pos
@@ -188,6 +323,24 @@ class Backtester:
         notional, qty = self.risk.calc_futures_size_from_risk(equity=equity, price=price, stop_distance_pct=stop_distance_pct, risk_per_trade=sized_risk_per_trade, leverage=leverage)
         if notional <= 0 or qty <= 0:
             return pos
+        self._record_sizing_audit(
+            year_bar=int(float(getattr(pos, "open_time", 0) or 0)),
+            symbol=sym,
+            side=side,
+            trade_type=trade_type,
+            price=price,
+            stop_distance_pct=stop_distance_pct,
+            equity=equity,
+            leverage=leverage,
+            base_risk_per_trade=base_risk_per_trade,
+            symbol_risk_multiplier=risk_multiplier,
+            trade_risk_multiplier=trade_risk_mult,
+            sized_risk_per_trade=sized_risk_per_trade,
+            notional=notional,
+            qty=qty,
+            sig_meta=sig_meta,
+            is_pyramid=True,
+        )
         old_qty = float(pos.qty)
         new_qty = old_qty + float(qty)
         if new_qty <= 0:
@@ -204,6 +357,7 @@ class Backtester:
         pos.pyramid_level = int(getattr(pos, "pyramid_level", 0) or 0) + 1
         pos.trade_type = trade_type
         pos.market_state = market_state
+        _attach_signal_quality_to_position(pos, sig_meta)
         return pos
 
     # ------------------------------------------------------------------
@@ -446,8 +600,129 @@ class Backtester:
             out[sym] = prepared
         return self._attach_btc_regime_columns(out)
 
+
+    def _asset_selection_score(self, sym: str, df_slice: pd.DataFrame) -> float:
+        """V29: lightweight per-bar asset ranking for multi-symbol tests.
+
+        This does not create signals by itself. It only decides which symbols
+        are worth asking for a signal first when a portfolio group is tested.
+        """
+        try:
+            if df_slice is None or df_slice.empty:
+                return -1.0
+            row = df_slice.iloc[-1]
+            close = float(row.get("close", 0.0) or 0.0)
+            if close <= 0:
+                return -1.0
+            adx = float(row.get("HTF_ADX", row.get("ADX", 0.0)) or 0.0)
+            atr = float(row.get("HTF_ATR", row.get("ATR", 0.0)) or 0.0)
+            ema20 = float(row.get("HTF_EMA20", row.get("EMA20", close)) or close)
+            ema50 = float(row.get("HTF_EMA50", row.get("EMA50", close)) or close)
+            atr_pct = atr / close if close > 0 else 0.0
+            drift = abs(ema20 - ema50) / close if close > 0 else 0.0
+            # Prefer active, directional, liquid-volatility symbols.
+            score = (adx / 50.0) + (drift * 80.0) + (atr_pct * 35.0)
+            if sym == str(getattr(cfg, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")):
+                score += float(getattr(cfg, "V29_ASSET_SELECTION_BTC_BONUS", 0.10))
+            if sym == "ETHUSDT":
+                score += float(getattr(cfg, "V29_ASSET_SELECTION_ETH_BONUS", 0.05))
+            return float(score)
+        except Exception:
+            return -1.0
+
+    def _rank_symbols_for_entry(self, symbols: list[str], df_slices: Dict[str, pd.DataFrame]) -> list[str]:
+        if not bool(getattr(cfg, "V29_ASSET_SELECTION_ENABLED", False)):
+            return list(symbols)
+        if len(symbols) <= 1:
+            return list(symbols)
+        ranked = []
+        disabled = set(getattr(cfg, "V32_DISABLED_SYMBOLS", []) or []) if bool(getattr(cfg, "V32_SMART_ROTATION_ENABLED", False)) else set()
+        for sym in symbols:
+            if sym in disabled:
+                continue
+            score = self._asset_selection_score(sym, df_slices.get(sym))
+            ranked.append((score, sym))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        if bool(getattr(cfg, "V32_SMART_ROTATION_ENABLED", False)):
+            top_n = int(getattr(cfg, "V32_ROTATION_TOP_N", getattr(cfg, "V29_ASSET_SELECTION_TOP_N", len(symbols))) or len(symbols))
+            min_score = float(getattr(cfg, "V32_ROTATION_MIN_SCORE", getattr(cfg, "V29_ASSET_SELECTION_MIN_SCORE", -1.0)))
+        else:
+            top_n = int(getattr(cfg, "V29_ASSET_SELECTION_TOP_N", len(symbols)) or len(symbols))
+            min_score = float(getattr(cfg, "V29_ASSET_SELECTION_MIN_SCORE", -1.0))
+        selected = [sym for score, sym in ranked if score >= min_score]
+        if top_n > 0:
+            selected = selected[:top_n]
+        # If every score is filtered out, fall back to the best symbol instead of making a dead portfolio run.
+        if not selected and ranked:
+            selected = [ranked[0][1]]
+        return selected
+
+    # ------------------------------------------------------------------
+    def _reset_strategy_runtime_state(self) -> None:
+        """V31: isolate every backtest run from singleton strategy state.
+
+        The active strategy is a process-wide singleton. During batch tests we
+        create many Backtester instances for different symbol groups/years, but
+        the strategy object itself used to keep per-symbol cooldowns and last-bar
+        markers from previous runs. That can make portfolio groups look dead
+        (0 trades) even when the same symbols trade in isolated runs.
+        """
+        try:
+            strategy = get_active_strategy()
+        except Exception:
+            return
+
+        # Known mutable runtime attributes. Keep learned/config/static fields intact.
+        for attr in (
+            "_last_eth_liquidity_bar_by_symbol",
+            "_last_alt_trend_bar_by_symbol",
+            "_last_micro_range_bar_by_symbol",
+            "_last_btc_range_engine_bar_index",
+            "_last_btc_liquidity_reversal_bar_index",
+            "_last_btc_stage10v2_mr_bar_index",
+            "_btc_range_debug_no_signal_logs",
+        ):
+            try:
+                if hasattr(strategy, attr):
+                    current = getattr(strategy, attr)
+                    if isinstance(current, dict):
+                        setattr(strategy, attr, {})
+                    elif isinstance(current, int):
+                        setattr(strategy, attr, -10**9 if "bar_index" in attr else 0)
+                    else:
+                        setattr(strategy, attr, None)
+            except Exception:
+                pass
+
+        # Reset transient context/meta.
+        try:
+            strategy.last_signal_meta = {"signal": None, "trade_type": None, "risk_multiplier": 1.0}
+        except Exception:
+            pass
+        try:
+            if hasattr(strategy, "reset_v60_1_short_debug"):
+                strategy.reset_v60_1_short_debug()
+        except Exception:
+            pass
+        for attr in ("_current_symbol", "_current_regime", "_current_market_state", "_current_adx_h", "_current_drift"):
+            try:
+                if hasattr(strategy, attr):
+                    setattr(strategy, attr, None)
+            except Exception:
+                pass
+
+    def _short_debug_summary_rows(self) -> list[str]:
+        try:
+            strategy = get_active_strategy()
+            if hasattr(strategy, "v60_1_short_debug_summary_rows"):
+                return list(strategy.v60_1_short_debug_summary_rows())
+        except Exception:
+            pass
+        return []
+
     # ------------------------------------------------------------------
     def run(self) -> Dict[str, float]:
+        self._reset_strategy_runtime_state()
         self.closed_trades = []
         self.partial_closes = []
         self.trade_realized_pnl = {}
@@ -676,7 +951,8 @@ class Backtester:
             can_open_more = open_count < eff_max_positions
 
             # --- открытие новых позиций по сигналам ---
-            for sym in symbols:
+            entry_symbols = self._rank_symbols_for_entry(symbols, df_slices)
+            for sym in entry_symbols:
                 if not can_open_more:
                     break
                 if positions[sym] is not None:
@@ -708,6 +984,17 @@ class Backtester:
                 trade_type = str(sig_meta.get("trade_type", "unknown") or "unknown")
                 market_state = str(sig_meta.get("market_state", "unknown") or "unknown")
                 initial_stop = calc_initial_stop_price(price, atr, side, sym, None, trade_type=trade_type, market_state=market_state)
+                if bool(getattr(cfg, "V45_USE_STRUCTURAL_STOP_IN_BACKTEST", False)) and trade_type == "pullback":
+                    try:
+                        v45_stop = sig_meta.get("v45_struct_stop_price")
+                        if v45_stop is None and isinstance(sig_meta.get("pullback_meta"), dict):
+                            v45_stop = sig_meta.get("pullback_meta", {}).get("v45_struct_stop_price")
+                        if v45_stop is not None:
+                            v45_stop = float(v45_stop)
+                            if (side == "long" and v45_stop < price) or (side == "short" and v45_stop > price):
+                                initial_stop = v45_stop
+                    except Exception:
+                        pass
                 stop_distance_pct = abs(price - initial_stop) / price * 100.0
                 if stop_distance_pct <= 0:
                     continue
@@ -746,6 +1033,24 @@ class Backtester:
                 )
                 if notional <= 0 or qty <= 0:
                     continue
+                self._record_sizing_audit(
+                    year_bar=i,
+                    symbol=sym,
+                    side=side,
+                    trade_type=trade_type,
+                    price=price,
+                    stop_distance_pct=stop_distance_pct,
+                    equity=equity,
+                    leverage=leverage,
+                    base_risk_per_trade=risk_per_trade,
+                    symbol_risk_multiplier=risk_multiplier,
+                    trade_risk_multiplier=trade_risk_mult,
+                    sized_risk_per_trade=sized_risk_per_trade,
+                    notional=notional,
+                    qty=qty,
+                    sig_meta=sig_meta,
+                    is_pyramid=False,
+                )
 
                 stop_loss = initial_stop
                 tp1 = calc_tp1_price(price, atr, side, sym, None)
@@ -771,6 +1076,7 @@ class Backtester:
                     market_state=market_state,
                 )
                 positions[sym].tp1 = calc_tp1_price(price, atr, side, sym, positions[sym])
+                _attach_signal_quality_to_position(positions[sym], sig_meta)
                 open_count += 1
                 can_open_more = open_count < eff_max_positions
 
@@ -822,6 +1128,12 @@ class Backtester:
         print(f"Partial close PnL: {stats['partial_close_pnl']:.4f} USDT")
         if stats["total_trades"] > 0:
             print(f"Net AvgTrade (with partials): {stats['avg_trade']:.4f} USDT")
+        if bool(getattr(cfg, "V55_1_SIZING_AUDIT_ENABLED", False)) and bool(getattr(cfg, "V72_KEEP_BACKTEST_DIAGNOSTICS", False)):
+            audit_rows = self._sizing_audit_summary_rows()
+            print("Sizing audit: " + ("; ".join(audit_rows) if audit_rows else "n/a"))
+        if bool(getattr(cfg, "V60_1_SHORT_DEBUG_ENABLED", False)) and bool(getattr(cfg, "V72_KEEP_BACKTEST_DIAGNOSTICS", False)):
+            short_rows = self._short_debug_summary_rows()
+            print("Short debug: " + ("; ".join(short_rows) if short_rows else "n/a"))
 
         return {
             "total_pnl": float(total_pnl),
@@ -829,6 +1141,8 @@ class Backtester:
             "max_drawdown": float(max_dd),
             "equity_curve": equity_curve,
             "trade_stats": stats,
+            "sizing_audit_rows": self._sizing_audit_summary_rows(),
+            "short_debug_rows": self._short_debug_summary_rows(),
         }
 
     # ------------------------------------------------------------------
@@ -911,7 +1225,7 @@ def _load_csv_for_batch(path: str) -> pd.DataFrame:
     if "open_time" in df.columns:
         df["open_time"] = pd.to_datetime(df["open_time"])
         df = df.sort_values("open_time").reset_index(drop=True)
-    return df
+    return normalize_ohlcv_frame(df)
 
 
 def load_mtf_symbol_from_dir(symbol: str, data_dir: str) -> pd.DataFrame:
@@ -920,6 +1234,17 @@ def load_mtf_symbol_from_dir(symbol: str, data_dir: str) -> pd.DataFrame:
 
     df_15m = _load_csv_for_batch(path_15m)
     df_1h = _load_csv_for_batch(path_h1)
+
+    ok_preload, preload_reason = validate_mtf_preload(
+        df_15m,
+        df_1h,
+        min_15m=int(getattr(cfg, "V89_BACKTEST_MIN_15M_ROWS", 220)),
+        min_1h=int(getattr(cfg, "V89_BACKTEST_MIN_1H_ROWS", 80)),
+    )
+    if not ok_preload:
+        raise ValueError(f"{symbol}: invalid MTF preload: {preload_reason}")
+
+    # V71 cleanup: external liquidity/funding feature attach removed; active engine is OHLCV-only.
 
     for need in ("open", "high", "low", "close", "volume"):
         if need not in df_15m.columns:
@@ -986,6 +1311,12 @@ def _format_result_block(year: str, symbols: list[str], history: int, max_len: i
         lines.append("TradeType stats: " + ("; ".join(trade_type_rows) if trade_type_rows else "n/a"))
         lines.append("ExitReason stats: " + ("; ".join(exit_reason_rows) if exit_reason_rows else "n/a"))
         lines.append("TradeType->Exit stats: " + ("; ".join(trade_type_exit_rows) if trade_type_exit_rows else "n/a"))
+    if bool(getattr(cfg, "V55_1_SIZING_AUDIT_ENABLED", False)) and bool(getattr(cfg, "V72_KEEP_BACKTEST_DIAGNOSTICS", False)):
+        audit_rows = result.get("sizing_audit_rows", []) or []
+        lines.append("Sizing audit: " + ("; ".join(audit_rows) if audit_rows else "n/a"))
+    if bool(getattr(cfg, "V60_1_SHORT_DEBUG_ENABLED", False)) and bool(getattr(cfg, "V72_KEEP_BACKTEST_DIAGNOSTICS", False)):
+        short_rows = result.get("short_debug_rows", []) or []
+        lines.append("Short debug: " + ("; ".join(short_rows) if short_rows else "n/a"))
     lines.append("")
     return "\n".join(lines)
 
@@ -1002,6 +1333,8 @@ def run_yearly_batch_backtests(project_root: Optional[str] = None, out_filename:
         ("2024", os.path.join(project_root, "data_2024")),
         ("2025", os.path.join(project_root, "data_2025")),
     ]
+    # v39 production backtest: BTC pullback scale only.
+    # Add other groups manually only for diagnostics; strategy will ignore disabled symbols.
     symbol_groups = [
         ["BTCUSDT"],
     ]
