@@ -7,6 +7,7 @@ They provide one place to inspect which trade types and stages are active.
 ENTRY_TRADE_TYPE_PATHS = {
     "mean_reversion": "check_v52_mean_reversion_entry",
     "fakeout": "check_fakeout_reversal_entry",
+    "liquidity_reversal": "check_fakeout_reversal_entry",
     "range": "range_signal",
     "btc_exhaustion": "check_btc_exhaustion_short",
     "impulse": "check_impulse_breakout",
@@ -27,6 +28,7 @@ SIGNAL_FLOW_STAGE_MAP = {
         "check_v52_mean_reversion_entry",
         "range_signal",
         "check_fakeout_reversal_entry",
+        "_check_btc_liquidity_reversal",
         "check_btc_exhaustion_short",
     ],
     "directional_entries": [

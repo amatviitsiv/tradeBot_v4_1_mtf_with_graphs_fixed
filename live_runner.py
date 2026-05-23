@@ -17,8 +17,7 @@ import logging
 from logger_setup import setup_logging
 import signal
 import time
-from contextlib import suppress
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 
@@ -35,6 +34,8 @@ from strategies import get_active_strategy
 from risk import RiskManager
 from position import PositionState
 from indicators import compute_indicators  # type: ignore
+from execution_guard import ExecutionGuard
+from timeframe_preload_validator import normalize_ohlcv_frame, validate_mtf_preload
 from position_management import (
     calc_tp1_price,
     maybe_move_to_break_even,
@@ -80,14 +81,28 @@ class LiveRunner:
         self._trade_timestamps: List[float] = []
         # время последнего открытия по символу (анти-луп)
         self._last_open_time: Dict[str, float] = {}
-        # время последней полученной свечи по символу (watchdog WS)
+        # время последней полученной закрытой свечи по символу (legacy watchdog WS)
         self._last_kline_ts: Dict[str, float] = {}
+        # время последней закрытой свечи по symbol/timeframe для production watchdog
+        self._last_closed_kline_ts: Dict[str, Dict[str, float]] = {}
+        # REST fallback remembers which closed candle was already injected so
+        # a silent WS cannot spam duplicate strategy evaluations.
+        self._last_rest_fallback_open_time: Dict[str, Dict[str, int]] = {}
+        # Last closed candle open_time that was actually processed by the live strategy.
+        # This prevents both REST fallback and WS from re-processing preload/current bars.
+        self._last_processed_closed_open_time: Dict[str, Dict[str, int]] = {}
         # лимит сделок в час (0 = без лимита)
         self._max_trades_per_hour: int = int(getattr(config, "MAX_TRADES_PER_HOUR", 0) or 0)
         # cooldown после убыточных stop-loss по symbol + direction
         self._entry_cooldowns: Dict[str, Dict[str, float]] = {}
         self._stop_loss_streaks: Dict[str, Dict[str, int]] = {}
         self._latest_bar_open_time_ms: Dict[str, float] = {}
+        self._execution_guard = ExecutionGuard(
+            min_order_interval_sec=float(getattr(config, "V89_MIN_ORDER_INTERVAL_SEC", 20.0)),
+            max_signal_age_sec=float(getattr(config, "V89_MAX_SIGNAL_AGE_SEC", 20 * 60.0)),
+        )
+        self._exchange_position_cache: Dict[str, float] = {}
+        self._exchange_position_cache_ts: float = 0.0
     async def _init_broker(self) -> None:
         """Инициализация брокера и проверка API ключей."""
         api_key = getattr(config, "BINANCE_API_KEY", "") or getattr(config, "API_KEY", "")
@@ -99,68 +114,6 @@ class LiveRunner:
         broker = await LiveFuturesBroker.create(api_key=api_key, api_secret=api_secret)
         self._broker = broker
         logger.info("[RUNNER] LiveFuturesBroker initialized")
-
-    async def _sync_exchange_leverage(self) -> None:
-        if self._broker is None:
-            return
-        if not bool(getattr(config, "LIVE_SYNC_LEVERAGE_ON_START", True)):
-            return
-        leverage = int(getattr(config, "FUTURES_LEVERAGE_DEFAULT", 5) or 5)
-        retries = max(1, int(getattr(config, "LIVE_SET_LEVERAGE_RETRIES", 3) or 3))
-        for symbol in self.symbols:
-            ok = False
-            last_error = None
-            for _ in range(retries):
-                try:
-                    await self._broker.set_leverage(symbol, leverage)
-                    ok = True
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.exception("[RUNNER] failed to sync leverage for %s: %s", symbol, e)
-                    await asyncio.sleep(1)
-            if ok:
-                logger.info("[RUNNER] leverage synced for %s => %sx", symbol, leverage)
-            elif last_error is not None:
-                logger.error("[RUNNER] leverage sync failed for %s after retries: %s", symbol, last_error)
-        if bool(getattr(config, "LIVE_NOTIFY_LEVERAGE_SYNC", True)):
-            with suppress(Exception):
-                self.notifier.notify_error("leverage_sync", f"Live leverage synced to {leverage}x for {self.symbols}")
-
-    async def _protect_open_positions_live(self) -> None:
-        if self._broker is None or not bool(getattr(config, "LIVE_PROTECTIVE_USE_MARK_PRICE", True)):
-            return
-        for symbol, pos in list(self._positions.items()):
-            if pos is None or float(getattr(pos, "qty", 0.0) or 0.0) <= 0:
-                continue
-            try:
-                mark_price = await self._broker.get_mark_price(symbol)
-            except Exception as e:
-                logger.exception("[RUNNER] failed to get mark price for %s: %s", symbol, e)
-                continue
-            if not mark_price or mark_price <= 0:
-                continue
-            try:
-                if pos.stop_loss is not None:
-                    if pos.side == "long" and mark_price <= pos.stop_loss:
-                        logger.warning("[RUNNER] protective stop by mark price for %s at %.4f (sl=%.4f)", symbol, mark_price, pos.stop_loss)
-                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_stop_mark")
-                        continue
-                    if pos.side == "short" and mark_price >= pos.stop_loss:
-                        logger.warning("[RUNNER] protective stop by mark price for %s at %.4f (sl=%.4f)", symbol, mark_price, pos.stop_loss)
-                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_stop_mark")
-                        continue
-                if pos.trailing_stop is not None:
-                    if pos.side == "long" and mark_price <= pos.trailing_stop:
-                        logger.warning("[RUNNER] protective trailing stop by mark price for %s at %.4f (trail=%.4f)", symbol, mark_price, pos.trailing_stop)
-                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_trailing_mark")
-                        continue
-                    if pos.side == "short" and mark_price >= pos.trailing_stop:
-                        logger.warning("[RUNNER] protective trailing stop by mark price for %s at %.4f (trail=%.4f)", symbol, mark_price, pos.trailing_stop)
-                        await self._close_position_live(symbol, pos, float(mark_price), reason="protective_trailing_mark")
-                        continue
-            except Exception as e:
-                logger.exception("[RUNNER] protective close check failed for %s: %s", symbol, e)
 
     async def _preload_history(self) -> None:
         """Подгрузить историю (15m/1h) через REST, чтобы стратегия не ждала часы на прогрев."""
@@ -177,8 +130,15 @@ class LiveRunner:
             raw = await self._broker.client.futures_klines(symbol=symbol, interval=interval, limit=limit)
             # raw: [ [open_time, open, high, low, close, volume, close_time, qav, trades, tbbav, tbqav, ignore], ... ]
             rows = []
+            now_ms = int(time.time() * 1000)
             for r in raw:
                 try:
+                    close_time = int(r[6])
+                    # Binance REST returns the currently forming candle as the last row.
+                    # Live strategy must preload only CLOSED candles; otherwise REST fallback
+                    # sees the unfinished bar open_time and treats the next real close as duplicate.
+                    if close_time > now_ms:
+                        continue
                     rows.append({
                         "open_time": int(r[0]),
                         "open": float(r[1]),
@@ -188,8 +148,8 @@ class LiveRunner:
                         "volume": float(r[5]),
                     })
                 except Exception:
-                    return
-            df = pd.DataFrame(rows)
+                    return pd.DataFrame()
+            df = normalize_ohlcv_frame(pd.DataFrame(rows))
             return df
 
         logger.info("[RUNNER] preloading history via REST: 15m=%d, 1h=%d (per symbol)", limit_15, limit_1h)
@@ -197,11 +157,27 @@ class LiveRunner:
             try:
                 df15 = await fetch_df(sym, "15m", limit_15)
                 df1h = await fetch_df(sym, "1h", limit_1h)
+                ok, reason = validate_mtf_preload(
+                    df15,
+                    df1h,
+                    min_15m=int(getattr(config, "V89_MIN_PRELOAD_15M_ROWS", 220)),
+                    min_1h=int(getattr(config, "V89_MIN_PRELOAD_1H_ROWS", 80)),
+                )
+                if not ok:
+                    logger.warning("[RUNNER] preload validation failed for %s: %s (15m=%d 1h=%d)", sym, reason, len(df15), len(df1h))
                 if not df15.empty:
                     self._data_15m[sym] = df15
+                    try:
+                        self._last_processed_closed_open_time.setdefault(sym, {})["15m"] = int(df15["open_time"].iloc[-1])
+                    except Exception:
+                        pass
                 if not df1h.empty:
                     self._data_1h[sym] = df1h
-                logger.info("[RUNNER] preload %s: 15m=%d 1h=%d", sym, len(df15), len(df1h))
+                    try:
+                        self._last_processed_closed_open_time.setdefault(sym, {})["1h"] = int(df1h["open_time"].iloc[-1])
+                    except Exception:
+                        pass
+                logger.info("[RUNNER] preload %s: 15m=%d 1h=%d validation=%s", sym, len(df15), len(df1h), reason)
             except Exception as e:
                 logger.exception("[RUNNER] preload failed for %s: %s", sym, e)
 
@@ -216,14 +192,29 @@ class LiveRunner:
         symbol = k.get("s")
         if not symbol:
             return
+        try:
+            open_time = int(k["t"])
+        except Exception:
+            return
+        last_processed = self._last_processed_closed_open_time.setdefault(symbol, {}).get("15m")
+        if last_processed is not None and open_time <= int(last_processed):
+            # Duplicate or historical/preload candle. Mark liveness, but do not rerun strategy.
+            self._last_closed_kline_ts.setdefault(symbol, {})["15m"] = time.time()
+            logger.info("[RUNNER] duplicate/old closed candle skipped %s 15m open_time=%s last_processed=%s", symbol, open_time, last_processed)
+            return
         # отметим время последней полученной свечи для watchdog
         try:
-            self._last_kline_ts[symbol] = time.time()
+            now_ts = time.time()
+            self._last_kline_ts[symbol] = now_ts
+            self._last_closed_kline_ts.setdefault(symbol, {})["15m"] = now_ts
+            self._last_processed_closed_open_time.setdefault(symbol, {})["15m"] = open_time
+            self._last_rest_fallback_open_time.setdefault(symbol, {})["15m"] = open_time
+            logger.info("[RUNNER] closed candle received %s 15m open_time=%s close=%s", symbol, open_time, k.get("c"))
         except Exception:
             pass
         df = self._data_15m.get(symbol)
         row = {
-            "open_time": int(k["t"]),
+            "open_time": open_time,
             "open": float(k["o"]),
             "high": float(k["h"]),
             "low": float(k["l"]),
@@ -234,7 +225,7 @@ class LiveRunner:
             df = pd.DataFrame([row])
         else:
             df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        self._data_15m[symbol] = df
+        self._data_15m[symbol] = normalize_ohlcv_frame(df)
 
         await self._run_strategy_if_ready(symbol)
 
@@ -245,12 +236,26 @@ class LiveRunner:
         if not symbol:
             return
         try:
-            self._last_kline_ts[symbol] = time.time()
+            open_time = int(k["t"])
+        except Exception:
+            return
+        last_processed = self._last_processed_closed_open_time.setdefault(symbol, {}).get("1h")
+        if last_processed is not None and open_time <= int(last_processed):
+            self._last_closed_kline_ts.setdefault(symbol, {})["1h"] = time.time()
+            logger.info("[RUNNER] duplicate/old closed candle skipped %s 1h open_time=%s last_processed=%s", symbol, open_time, last_processed)
+            return
+        try:
+            now_ts = time.time()
+            self._last_kline_ts[symbol] = now_ts
+            self._last_closed_kline_ts.setdefault(symbol, {})["1h"] = now_ts
+            self._last_processed_closed_open_time.setdefault(symbol, {})["1h"] = open_time
+            self._last_rest_fallback_open_time.setdefault(symbol, {})["1h"] = open_time
+            logger.info("[RUNNER] closed candle received %s 1h open_time=%s close=%s", symbol, open_time, k.get("c"))
         except Exception:
             pass
         df = self._data_1h.get(symbol)
         row = {
-            "open_time": int(k["t"]),
+            "open_time": open_time,
             "open": float(k["o"]),
             "high": float(k["h"]),
             "low": float(k["l"]),
@@ -261,8 +266,91 @@ class LiveRunner:
             df = pd.DataFrame([row])
         else:
             df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        self._data_1h[symbol] = df
+        self._data_1h[symbol] = normalize_ohlcv_frame(df)
 
+
+    async def _inject_latest_closed_kline_from_rest(self, symbol: str, interval: str) -> bool:
+        """Fetch the latest closed kline via REST and feed it into the normal WS handler.
+
+        This is a live-infra fallback only. It does not change alpha logic; it
+        simply prevents a half-open/silent WS from stopping candle processing.
+        """
+        if self._broker is None:
+            return False
+        if interval not in ("15m", "1h"):
+            return False
+        try:
+            raw = await self._broker.client.futures_klines(symbol=symbol, interval=interval, limit=3)
+        except Exception as e:
+            logger.warning("[RUNNER] REST kline fallback failed %s %s: %s", symbol, interval, e)
+            return False
+        if not raw:
+            return False
+        now_ms = int(time.time() * 1000)
+        selected = None
+        for r in reversed(raw):
+            try:
+                close_time = int(r[6])
+                if close_time <= now_ms:
+                    selected = r
+                    break
+            except Exception:
+                continue
+        if selected is None:
+            return False
+        try:
+            open_time = int(selected[0])
+        except Exception:
+            return False
+        already = self._last_rest_fallback_open_time.setdefault(symbol, {}).get(interval)
+        if already == open_time:
+            return False
+        last_processed = self._last_processed_closed_open_time.setdefault(symbol, {}).get(interval)
+        if last_processed is not None and open_time <= int(last_processed):
+            return False
+        k = {
+            "s": symbol,
+            "i": interval,
+            "t": open_time,
+            "o": str(selected[1]),
+            "h": str(selected[2]),
+            "l": str(selected[3]),
+            "c": str(selected[4]),
+            "v": str(selected[5]),
+            "x": True,
+        }
+        self._last_rest_fallback_open_time.setdefault(symbol, {})[interval] = open_time
+        logger.warning(
+            "[RUNNER] REST fallback injected closed candle %s %s open_time=%s close=%s",
+            symbol, interval, open_time, selected[4],
+        )
+        if interval == "15m":
+            await self._on_kline_15m(k)
+        else:
+            await self._on_kline_1h(k)
+        return True
+
+
+    async def _refresh_exchange_position_cache(self) -> Dict[str, float]:
+        if self._broker is None:
+            return {}
+        now = time.time()
+        ttl = float(getattr(config, "V89_EXCHANGE_POSITION_CACHE_TTL_SEC", 10.0))
+        if self._exchange_position_cache and now - self._exchange_position_cache_ts < ttl:
+            return self._exchange_position_cache
+        out: Dict[str, float] = {}
+        try:
+            for p in await self._broker.get_positions():
+                sym = str(p.get("symbol", ""))
+                if not sym:
+                    continue
+                out[sym] = float(p.get("positionAmt", 0.0) or 0.0)
+        except Exception as e:
+            logger.warning("[RUNNER] exchange position sync unavailable: %s", e)
+            return self._exchange_position_cache
+        self._exchange_position_cache = out
+        self._exchange_position_cache_ts = now
+        return out
 
     def _attach_btc_regime_columns(self, df_15_idx: pd.DataFrame) -> pd.DataFrame:
         btc_symbol = str(getattr(config, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT"))
@@ -314,6 +402,69 @@ class LiveRunner:
             pass
         return max(0.0, float(getattr(config, 'BASE_POSITION_RISK_MULTIPLIER', 1.0)))
 
+
+    def _asset_selection_live_score(self, symbol: str) -> float:
+        try:
+            df15 = self._data_15m.get(symbol)
+            df1h = self._data_1h.get(symbol)
+            if df15 is None or df15.empty:
+                return -1.0
+            close = float(df15.iloc[-1].get("close", 0.0) or 0.0)
+            if close <= 0:
+                return -1.0
+            if df1h is not None and len(df1h) >= 50:
+                ind = compute_indicators(df1h.copy())
+                row = ind.iloc[-1]
+                adx = float(row.get("ADX", 0.0) or 0.0)
+                atr = float(row.get("ATR", 0.0) or 0.0)
+                ema20 = float(row.get("EMA20", close) or close)
+                ema50 = float(row.get("EMA50", close) or close)
+            else:
+                ind = compute_indicators(df15.copy())
+                row = ind.iloc[-1]
+                adx = float(row.get("ADX", 0.0) or 0.0)
+                atr = float(row.get("ATR", 0.0) or 0.0)
+                ema20 = float(row.get("EMA20", close) or close)
+                ema50 = float(row.get("EMA50", close) or close)
+            atr_pct = atr / close if close > 0 else 0.0
+            drift = abs(ema20 - ema50) / close if close > 0 else 0.0
+            score = (adx / 50.0) + (drift * 80.0) + (atr_pct * 35.0)
+            if symbol == str(getattr(config, "BTC_REGIME_FILTER_SYMBOL", "BTCUSDT")):
+                score += float(getattr(config, "V29_ASSET_SELECTION_BTC_BONUS", 0.10))
+            if symbol == "ETHUSDT":
+                score += float(getattr(config, "V29_ASSET_SELECTION_ETH_BONUS", 0.05))
+            return float(score)
+        except Exception:
+            return -1.0
+
+    def _is_symbol_selected_for_new_entry(self, symbol: str) -> bool:
+        if not bool(getattr(config, "V29_ASSET_SELECTION_ENABLED", False)):
+            return True
+        if len(getattr(self, "symbols", []) or []) <= 1:
+            return True
+        if bool(getattr(config, "V32_SMART_ROTATION_ENABLED", False)) and symbol in set(getattr(config, "V32_DISABLED_SYMBOLS", []) or []):
+            return False
+        if bool(getattr(config, "V32_SMART_ROTATION_ENABLED", False)):
+            top_n = int(getattr(config, "V32_ROTATION_TOP_N", getattr(config, "V29_ASSET_SELECTION_TOP_N", len(self.symbols))) or len(self.symbols))
+            min_score = float(getattr(config, "V32_ROTATION_MIN_SCORE", getattr(config, "V29_ASSET_SELECTION_MIN_SCORE", -1.0)))
+            disabled = set(getattr(config, "V32_DISABLED_SYMBOLS", []) or [])
+        else:
+            top_n = int(getattr(config, "V29_ASSET_SELECTION_TOP_N", len(self.symbols)) or len(self.symbols))
+            min_score = float(getattr(config, "V29_ASSET_SELECTION_MIN_SCORE", -1.0))
+            disabled = set()
+        ranked = []
+        for sym in self.symbols:
+            if sym in disabled:
+                continue
+            score = self._asset_selection_live_score(sym)
+            if score >= min_score:
+                ranked.append((score, sym))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        selected = {sym for _, sym in ranked[:max(1, top_n)]}
+        if not selected and ranked:
+            selected = {ranked[0][1]}
+        return symbol in selected
+
     async def _run_strategy_if_ready(self, symbol: str) -> None:
         """Запускается при закрытии M15 свечи.
 
@@ -331,9 +482,15 @@ class LiveRunner:
         if df_15.empty or df_1h.empty:
             return
 
-        # Минимальный прогрев данных (как в бэктесте примерно)
-        if len(df_15) < 200 or len(df_1h) < 50:
-            logger.debug("[RUNNER] not enough data yet for %s (len_15m=%s, len_1h=%s)", symbol, len(df_15), len(df_1h))
+        # Минимальный прогрев и валидация данных (как в бэктесте примерно)
+        ok_preload, preload_reason = validate_mtf_preload(
+            df_15,
+            df_1h,
+            min_15m=int(getattr(config, "V89_MIN_READY_15M_ROWS", 200)),
+            min_1h=int(getattr(config, "V89_MIN_READY_1H_ROWS", 50)),
+        )
+        if not ok_preload:
+            logger.debug("[RUNNER] not enough/invalid MTF data for %s: %s (len_15m=%s, len_1h=%s)", symbol, preload_reason, len(df_15), len(df_1h))
             return
 
         try:
@@ -557,6 +714,20 @@ class LiveRunner:
         if signal not in {"buy", "sell"}:
             return
 
+        signal_bar_open_time = row.get("open_time", None)
+        guard_result = self._execution_guard.validate_signal_freshness(symbol=symbol, signal=signal, bar_open_time=signal_bar_open_time)
+        if not guard_result.ok:
+            logger.info("[RUNNER] execution guard rejected %s signal for %s: %s", signal, symbol, guard_result.reason)
+            return
+        guard_result = self._execution_guard.prevent_duplicate_signal_bar(symbol=symbol, signal=signal, bar_open_time=signal_bar_open_time)
+        if not guard_result.ok:
+            logger.info("[RUNNER] execution guard rejected duplicate signal for %s: %s", symbol, guard_result.reason)
+            return
+
+        if not self._is_symbol_selected_for_new_entry(symbol):
+            logger.info("[RUNNER] V29 asset selection skipped new entry for %s", symbol)
+            return
+
         side = "long" if signal == "buy" else "short"
 
         # cooldown после stop-loss по тому же symbol + direction
@@ -642,6 +813,17 @@ class LiveRunner:
         trade_type = str(sig_meta.get("trade_type", "unknown") or "unknown")
         market_state = str(sig_meta.get("market_state", "unknown") or "unknown")
         initial_stop = calc_initial_stop_price(price, atr, side, symbol, None, trade_type=trade_type, market_state=market_state)
+        if bool(getattr(config, "V45_USE_STRUCTURAL_STOP_IN_LIVE", False)) and trade_type == "pullback":
+            try:
+                v45_stop = sig_meta.get("v45_struct_stop_price")
+                if v45_stop is None and isinstance(sig_meta.get("pullback_meta"), dict):
+                    v45_stop = sig_meta.get("pullback_meta", {}).get("v45_struct_stop_price")
+                if v45_stop is not None:
+                    v45_stop = float(v45_stop)
+                    if (side == "long" and v45_stop < price) or (side == "short" and v45_stop > price):
+                        initial_stop = v45_stop
+            except Exception:
+                pass
         stop_distance_pct = abs(price - initial_stop) / price * 100.0
         if stop_distance_pct <= 0:
             logger.info("[RUNNER] invalid stop distance for %s (price=%.5f stop=%.5f)", symbol, price, initial_stop)
@@ -680,7 +862,21 @@ class LiveRunner:
                 logger.error("[RUNNER] broker is not initialized, cannot open position for %s", symbol)
                 return
 
+            if bool(getattr(config, "V89_EXCHANGE_POSITION_SYNC_ENABLED", True)):
+                exchange_positions = await self._refresh_exchange_position_cache()
+                sync_guard = self._execution_guard.validate_local_exchange_position_sync(
+                    symbol=symbol,
+                    local_position_exists=symbol in self._positions and self._positions.get(symbol) is not None,
+                    exchange_positions=exchange_positions,
+                )
+                if not sync_guard.ok:
+                    logger.error("[RUNNER] execution guard blocked open for %s: %s", symbol, sync_guard.reason)
+                    return
             order_side = "BUY" if side == "long" else "SELL"
+            order_guard = self._execution_guard.prevent_order_burst(symbol=symbol, side=order_side, reduce_only=False)
+            if not order_guard.ok:
+                logger.warning("[RUNNER] execution guard blocked order for %s: %s", symbol, order_guard.reason)
+                return
             res = await self._broker.create_market_order(
                 symbol=symbol,
                 side=order_side,
@@ -831,30 +1027,58 @@ class LiveRunner:
             return False
         if bool(getattr(pos, "tp1_hit", False)) and not bool(config.get_symbol_param_bool(symbol, "BTC_PYRAMID_ALLOW_AFTER_TP1", bool(getattr(config, "BTC_PYRAMID_ALLOW_AFTER_TP1", True)))):
             return False
-        allowed = {str(x).lower() for x in (config.get_symbol_param(symbol, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", getattr(config, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", ["continuation", "cont_compression", "impulse"])) or [])}
+        allowed = {str(x).lower() for x in (config.get_symbol_param(symbol, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", getattr(config, "BTC_PYRAMID_ALLOWED_TRADE_TYPES", ["continuation", "cont_compression", "impulse", "liquidity_reversal"])) or [])}
         trade_type = str(sig_meta.get("trade_type", "") or "").lower()
         if allowed and trade_type not in allowed:
             return False
-        if bool(config.get_symbol_param_bool(symbol, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", bool(getattr(config, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", True)))) and not bool(sig_meta.get("strong_setup", False)):
-            return False
         adx_h = float(sig_meta.get("adx_h", 0.0) or 0.0)
         drift = abs(float(sig_meta.get("drift", 0.0) or 0.0))
+        progress = (price - float(pos.entry_price)) / atr if pos.side == "long" else (float(pos.entry_price) - price) / atr
+        if trade_type == "liquidity_reversal":
+            if not bool(config.get_symbol_param_bool(symbol, "BTC_LIQUIDITY_PYRAMID_ENABLED", True)):
+                return False
+            max_adds = int(config.get_symbol_param_int(symbol, "BTC_LIQUIDITY_PYRAMID_MAX_ADDS", 1))
+            if int(getattr(pos, "pyramid_level", 0) or 0) >= max_adds:
+                return False
+            if bool(getattr(pos, "tp1_hit", False)) and not bool(config.get_symbol_param_bool(symbol, "BTC_LIQUIDITY_PYRAMID_ALLOW_AFTER_TP1", True)):
+                return False
+            if adx_h > float(config.get_symbol_param_float(symbol, "BTC_LIQUIDITY_PYRAMID_MAX_ADX_H", 22.5)):
+                return False
+            if drift > float(config.get_symbol_param_float(symbol, "BTC_LIQUIDITY_PYRAMID_MAX_DRIFT_PCT", 0.0050)):
+                return False
+            min_progress_atr = float(config.get_symbol_param_float(symbol, "BTC_LIQUIDITY_PYRAMID_MIN_PROGRESS_ATR", 0.22))
+            return progress >= min_progress_atr
+        if bool(config.get_symbol_param_bool(symbol, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", bool(getattr(config, "BTC_PYRAMID_REQUIRE_STRONG_SETUP", True)))) and not bool(sig_meta.get("strong_setup", False)):
+            return False
         if adx_h < float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_MIN_ADX_H", float(getattr(config, "BTC_PYRAMID_MIN_ADX_H", 24.0)))):
             return False
         if drift < float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_MIN_DRIFT", float(getattr(config, "BTC_PYRAMID_MIN_DRIFT", 0.0012)))):
             return False
         min_progress_atr = float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_MIN_PROGRESS_ATR", float(getattr(config, "BTC_PYRAMID_MIN_PROGRESS_ATR", 0.45))))
-        progress = (price - float(pos.entry_price)) / atr if pos.side == "long" else (float(pos.entry_price) - price) / atr
         return progress >= min_progress_atr
 
     async def _apply_pyramid_addition_live(self, symbol: str, pos: PositionState, price: float, atr: float, equity: float, side: str, sig_meta: dict, bar_index: int) -> bool:
         if self._broker is None:
             return False
         leverage = int(getattr(config, "FUTURES_LEVERAGE_DEFAULT", 5))
-        risk_fraction = float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_RISK_FRACTION", float(getattr(config, "BTC_PYRAMID_RISK_FRACTION", 0.55))))
         trade_type = str(sig_meta.get("trade_type", getattr(pos, "trade_type", "continuation")) or "continuation")
         market_state = str(sig_meta.get("market_state", getattr(pos, "market_state", "unknown")) or "unknown")
+        if trade_type == "liquidity_reversal":
+            risk_fraction = float(config.get_symbol_param_float(symbol, "BTC_LIQUIDITY_PYRAMID_RISK_FRACTION", 0.35))
+        else:
+            risk_fraction = float(config.get_symbol_param_float(symbol, "BTC_PYRAMID_RISK_FRACTION", float(getattr(config, "BTC_PYRAMID_RISK_FRACTION", 0.55))))
         initial_stop = calc_initial_stop_price(price, atr, side, symbol, pos, trade_type=trade_type, market_state=market_state)
+        if bool(getattr(config, "V45_USE_STRUCTURAL_STOP_IN_LIVE", False)) and trade_type == "pullback":
+            try:
+                v45_stop = sig_meta.get("v45_struct_stop_price")
+                if v45_stop is None and isinstance(sig_meta.get("pullback_meta"), dict):
+                    v45_stop = sig_meta.get("pullback_meta", {}).get("v45_struct_stop_price")
+                if v45_stop is not None:
+                    v45_stop = float(v45_stop)
+                    if (side == "long" and v45_stop < price) or (side == "short" and v45_stop > price):
+                        initial_stop = v45_stop
+            except Exception:
+                pass
         stop_distance_pct = abs(price - initial_stop) / price * 100.0
         if stop_distance_pct <= 0:
             return False
@@ -1120,7 +1344,6 @@ class LiveRunner:
             self._positions = {}
 
         await self._init_broker()
-        await self._sync_exchange_leverage()
 
         if self._broker is None:
             raise RuntimeError("Broker is not initialized")
@@ -1135,15 +1358,6 @@ class LiveRunner:
         await self._preload_history()
         await ws.start()
         logger.info("[RUNNER] WebSocket manager started")
-
-        async def protective_loop() -> None:
-            poll_sec = max(5, int(getattr(config, "LIVE_PROTECTIVE_POLL_SEC", 15) or 15))
-            while True:
-                try:
-                    await self._protect_open_positions_live()
-                except Exception as e:
-                    logger.exception("[RUNNER] protective loop error: %s", e)
-                await asyncio.sleep(poll_sec)
 
         # Heartbeat: периодически шлём сообщение в логи / Telegram
         async def heartbeat_loop() -> None:
@@ -1229,8 +1443,54 @@ class LiveRunner:
                     logger.exception("[RUNNER] heartbeat error: %s", e)
                 await asyncio.sleep(getattr(config, "EQUITY_NOTIFY_INTERVAL", 600))
 
-        hb_task = asyncio.create_task(heartbeat_loop())
-        protective_task = asyncio.create_task(protective_loop())
+        async def ws_monitor_loop() -> None:
+            """Fast live watchdog for WebSocket candle delivery.
+
+            Heartbeat notifications may run every 10 minutes, which is too slow
+            to notice missing 15m/1h candles. This loop only logs/warns and does
+            not change trading logic.
+            """
+            interval = float(getattr(config, "V89_2_WS_MONITOR_INTERVAL_SEC", 60.0) or 60.0)
+            stale_15m = float(getattr(config, "V89_2_WS_STALE_15M_SEC", 20 * 60.0) or 0.0)
+            stale_1h = float(getattr(config, "V89_2_WS_STALE_1H_SEC", 75 * 60.0) or 0.0)
+            while True:
+                try:
+                    now_ts = time.time()
+                    rest_poll_enabled = bool(getattr(config, "V89_4_REST_KLINE_POLL_ENABLED", True))
+                    for sym in self.symbols:
+                        tf_map = self._last_closed_kline_ts.get(sym, {})
+                        for tf, limit in (("15m", stale_15m), ("1h", stale_1h)):
+                            if limit <= 0:
+                                continue
+                            last = tf_map.get(tf)
+                            if last is None:
+                                # During startup, preload is valid but no closed WS candle may have arrived yet.
+                                logger.info("[RUNNER] WS monitor: waiting first closed %s candle for %s", tf, sym)
+                                if bool(getattr(config, "V89_3_REST_KLINE_FALLBACK_ENABLED", True)):
+                                    await self._inject_latest_closed_kline_from_rest(sym, tf)
+                                continue
+                            lag = now_ts - last
+                            if lag > limit:
+                                logger.warning(
+                                    "[RUNNER] WS stale %s %s: last closed candle %.1fs ago (> %.1fs)",
+                                    sym, tf, lag, limit,
+                                )
+                                if bool(getattr(config, "V89_3_REST_KLINE_FALLBACK_ENABLED", True)):
+                                    await self._inject_latest_closed_kline_from_rest(sym, tf)
+                            elif rest_poll_enabled:
+                                # v89.4: actively poll REST every monitor interval and inject only
+                                # if a newer closed candle exists. This prevents a silent WS parser/
+                                # callback issue from delaying 15m processing until the stale timer.
+                                await self._inject_latest_closed_kline_from_rest(sym, tf)
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.exception("[RUNNER] ws_monitor error: %s", e)
+                    await asyncio.sleep(interval)
+
+        hb_task = asyncio.create_task(heartbeat_loop(), name="heartbeat-loop")
+        ws_mon_task = asyncio.create_task(ws_monitor_loop(), name="ws-monitor-loop")
 
         # Ожидание сигналов, основная работа идёт в колбеках WS.
         try:
@@ -1240,7 +1500,7 @@ class LiveRunner:
             logger.info("[RUNNER] cancelled, shutting down...")
         finally:
             hb_task.cancel()
-            protective_task.cancel()
+            ws_mon_task.cancel()
             if self._ws_manager:
                 await self._ws_manager.stop()
             if self._broker is not None:
@@ -1259,14 +1519,17 @@ def main() -> None:
     setup_logging()
     runner = LiveRunner()
 
-    loop = asyncio.get_event_loop()
+    # Python 3.12+/3.13: get_event_loop() without an active loop is deprecated.
+    # Create and own the loop explicitly so WS/reconnect behavior is deterministic.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
     # Корректная обработка SIGINT/SIGTERM
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, loop.stop)
-        except NotImplementedError:
-            # Windows
+        except (NotImplementedError, RuntimeError):
+            # Windows / non-main thread
             pass
 
     try:
@@ -1280,6 +1543,7 @@ def main() -> None:
         except Exception:
             pass
         loop.close()
+        asyncio.set_event_loop(None)
 
 
 if __name__ == "__main__":

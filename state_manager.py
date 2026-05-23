@@ -4,6 +4,7 @@ import logging
 from typing import Dict, Optional, Any
 
 from position import PositionState
+from state_safety import validate_position_state, validate_position_map
 import config
 
 logger = logging.getLogger(__name__)
@@ -90,13 +91,26 @@ class StateManager:
         out: Dict[str, PositionState] = {}
         for sym, p in positions.items():
             try:
-                out[sym] = PositionState.from_dict(p)
+                pos = PositionState.from_dict(p)
+                result = validate_position_state(pos, repair=True)
+                if result.ok:
+                    out[sym] = pos
+                    if result.repaired:
+                        logger.warning("[STATE] repaired persisted position %s: %s", sym, result.summary())
+                else:
+                    logger.error("[STATE] dropping invalid persisted position %s: %s", sym, result.summary())
             except Exception as e:
                 logger.error("[STATE] bad position for %s: %s", sym, e)
         return out
 
     def set_position(self, symbol: str, pos: PositionState) -> None:
-        """Сохраняет/обновляет позицию по символу."""
+        """Сохраняет/обновляет позицию по символу after safety validation."""
+        result = validate_position_state(pos, repair=True)
+        if not result.ok:
+            logger.error("[STATE] refusing to save invalid position %s: %s", symbol, result.summary())
+            return
+        if result.repaired:
+            logger.warning("[STATE] repaired position before save %s: %s", symbol, result.summary())
         self.data.setdefault("positions", {})
         self.data["positions"][symbol] = pos.to_dict()
         self.save()
